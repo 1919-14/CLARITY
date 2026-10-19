@@ -1,2 +1,79 @@
-# CLARITY
-An autonomous black-box discovery system that learns hidden behaviour through active experimentation. It combines competing hypotheses, uncertainty-driven experiment selection, human-in-the-loop research, Nodus Compute-powered parallel evaluation, with budget management, ranked hypotheses, evidence-backed conclusions, and reproducible benchmarks.
+# CLARITY — Autonomous Black-Box Scientist
+
+CLARITY aims to discover an unknown system's behavior through **active experimentation**. It maintains competing explanations, chooses informative experiments, observes the black box, and updates hypotheses under explicit query and compute budgets.
+
+> **Status:** These documents describe intended MVP scope, not proof that features are implemented. Check the code, tests, and provider evidence before claiming implementation.
+
+## Problem
+
+When a system's internal rule is unknown, a researcher must choose which input to try next. Random or passive sampling can waste a limited query budget. CLARITY aims to maintain plausible hypotheses and select experiments that help distinguish them.
+
+## Intended capabilities
+
+- Generate, fit, evaluate, and rank competing hypotheses.
+- Choose experiments using prediction disagreement and defensible uncertainty estimates.
+- Query a black-box oracle and update hypotheses from observations.
+- Use Nodus Compute for genuine remote parallel evaluation.
+- Enforce per-run query/resource limits and track usage honestly.
+- Support researcher actions: add, pin/unpin, exclude/restore, and re-evaluate hypotheses.
+- Persist runs, observations, evaluations, revisions, usage, and audit events.
+- Produce evidence-backed ranked reports and reproducible active-versus-random benchmarks.
+
+## Technology stack
+
+| Area | Technology |
+|---|---|
+| Backend/API | Python, Flask |
+| Research interface | React |
+| Persistence | MySQL |
+| Remote parallel execution | Nodus Compute SDK/service, after verifying actual SDK capabilities |
+| Automated checks | GitHub Actions, backend tests, frontend checks/build |
+| Initial progress updates | REST and polling; streaming only if justified |
+
+Exact libraries, Nodus SDK capabilities, schema migration tooling, and deployment target remain subject to implementation verification.
+
+## High-level workflow
+
+1. Researcher configures a run, oracle interface, query budget, and resource limits.
+2. CLARITY generates candidate hypotheses and evaluates them against permitted observations.
+3. The planner proposes valid candidate experiments and scores their information value.
+4. The budget manager checks limits before work is scheduled.
+5. The oracle returns an observation; the discovery engine sees only permitted inputs and outputs.
+6. Candidate evaluations and rankings are updated.
+7. The run stops when a configured limit or documented stopping condition is reached.
+8. A report presents ranked hypotheses, evidence, measured metrics, usage, stop reason, and limitations.
+9. A separate evaluator may use hidden ground truth for benchmark metrics. The discovery agent must not access it.
+
+## Architecture at a glance
+
+- **React:** run configuration, progress, hypothesis/evidence views, researcher actions, reports, benchmarks.
+- **Flask:** validation, run lifecycle, orchestration, researcher actions, reporting, persistence access.
+- **Discovery engine:** hypothesis generation/fitting/ranking, experiment generation, active selection, stopping logic.
+- **Oracle adapter:** narrow interface for querying the unknown system.
+- **Nodus adapter:** remote task submission/results, timeouts, and failures behind a testable boundary.
+- **Budget/usage services:** query/evaluation limits, concurrency/runtime controls, cost-state tracking.
+- **MySQL:** runs, observations, hypotheses/revisions, evaluations, usage, audit events.
+- **Evaluator:** isolated access to reference answers and controlled comparisons.
+
+## Scientific integrity
+
+- Keep the oracle, discovery engine, and evaluator separate; ground truth belongs only to the evaluator.
+- Pinning is a researcher preference, not proof of correctness.
+- Exclusion is reversible and must not delete history.
+- Missing metrics are unavailable, not zero.
+- Estimated cost is not a provider-confirmed charge; account balance and per-run budget are distinct.
+- A mocked Nodus test does not prove remote execution.
+- Do not claim discovery succeeded without independent evidence.
+- Never fabricate accuracy, confidence, speedup, savings, or benchmark outcomes.
+
+## Documentation
+
+- [Master project context](context.md)
+- [Architecture](docs/architecture.md)
+- [Development guide](docs/development.md)
+- [Decision record](docs/decisions.md)
+- [GitHub Issues](https://github.com/1919-14/CLARITY/issues)
+
+## Development status
+
+The current focus is establishing authoritative documentation before substantial implementation. The backlog defines intended scope; verify repository code and tests before describing functionality as available. Contributions should follow the issue-first branch/PR workflow in the development guide and report actual verification results.
