@@ -1,0 +1,66 @@
+import os
+from flask import Flask, jsonify
+from flask_cors import CORS
+from .config import config_by_name, Config
+
+
+def create_app(config_name=None):
+    """Application factory for the CLARITY Flask backend."""
+    app = Flask(__name__)
+
+    if config_name is None:
+        config_name = os.environ.get("FLASK_ENV", "development")
+
+    config_class = config_by_name.get(config_name, Config)
+    app.config.from_object(config_class)
+
+    # Fail safely in production if a secure SECRET_KEY is not explicitly provided in environment
+    if config_name == "production":
+        secret_key = os.environ.get("SECRET_KEY")
+        if not secret_key or secret_key == "dev-clarity-secret-key-change-in-production":
+            raise ValueError(
+                "A secure SECRET_KEY environment variable must be explicitly configured in production mode."
+            )
+        app.config["SECRET_KEY"] = secret_key
+
+    # Configure CORS with explicit allowed origins without unnecessary credentials support
+    cors_origins = app.config.get("CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": cors_origins}},
+        supports_credentials=False,
+    )
+
+    # Register blueprints
+    from .routes.health import health_bp
+
+    app.register_blueprint(health_bp, url_prefix="/api")
+
+    # Error handlers returning consistent JSON payloads
+    @app.errorhandler(404)
+    def not_found_error(error):
+        return (
+            jsonify(
+                {
+                    "error": "Not Found",
+                    "message": "The requested resource was not found.",
+                    "status_code": 404,
+                }
+            ),
+            404,
+        )
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        return (
+            jsonify(
+                {
+                    "error": "Internal Server Error",
+                    "message": "An unexpected server error occurred.",
+                    "status_code": 500,
+                }
+            ),
+            500,
+        )
+
+    return app
