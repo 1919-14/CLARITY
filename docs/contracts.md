@@ -2,7 +2,7 @@
 
 **Document Version:** 1.0.0 (Issue #4 Baseline)  
 **Status:** Confirmed Baseline  
-**Code Reference:** [backend/app/domain/contracts.py](file:///c:/Users/HP/Downloads/CLARITY/backend/app/domain/contracts.py)
+**Code Reference:** [backend/app/domain/contracts.py](../backend/app/domain/contracts.py)
 
 ---
 
@@ -168,7 +168,7 @@ Calculated by `BenchmarkEvaluator` from reference ground truth:
 
 ## 3. Local Deterministic Simulator (`PolynomialLocalOracle`)
 
-Available in [backend/app/adapters/oracle/local_simulator.py](file:///c:/Users/HP/Downloads/CLARITY/backend/app/adapters/oracle/local_simulator.py):
+Available in [backend/app/adapters/oracle/local_simulator.py](../backend/app/adapters/oracle/local_simulator.py):
 * **Class:** `PolynomialLocalOracle(OracleInterface)`
 * **Function:** $y = 0.5x^3 - 1.0x^2 - 2.0x + 3.0$
 * **Valid Domain:** $x \in [-10.0, 10.0]$
