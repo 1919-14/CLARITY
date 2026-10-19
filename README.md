@@ -74,6 +74,51 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 - [Decision record](docs/decisions.md)
 - [GitHub Issues](https://github.com/1919-14/CLARITY/issues)
 
+## Quickstart and Local Setup
+
+### Backend (Python 3.11+)
+
+1. Create and activate a virtual environment:
+   ```bash
+   python -m venv venv
+   # On Windows:
+   .\venv\Scripts\activate
+   # On macOS/Linux:
+   source venv/bin/activate
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r backend/requirements.txt
+   ```
+3. Run backend tests:
+   ```bash
+   cd backend
+   python -m pytest -q
+   ```
+4. Start development server:
+   ```bash
+   python backend/run.py
+   ```
+   Verify health endpoint at `http://127.0.0.1:5000/api/health`.
+
+### Frontend (Node.js 20+)
+
+1. Install dependencies:
+   ```bash
+   cd frontend
+   npm ci
+   ```
+2. Run lint and production build:
+   ```bash
+   npm run lint
+   npm run build
+   ```
+3. Start development server:
+   ```bash
+   npm run dev
+   ```
+   Open `http://localhost:5173` in your browser.
+
 ## Development status
 
-The current focus is establishing authoritative documentation before substantial implementation. The backlog defines intended scope; verify repository code and tests before describing functionality as available. Contributions should follow the issue-first branch/PR workflow in the development guide and report actual verification results.
+The application skeleton and automated CI checks (Issue #3) are in place. The Flask backend, React status interface, and GitHub Actions CI workflow are established. Next phase focuses on domain contracts, the discovery engine, and the first vertical slice.
