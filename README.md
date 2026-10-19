@@ -90,15 +90,16 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    ```bash
    pip install -r backend/requirements.txt
    ```
-3. Run backend tests:
+3. Run backend tests (from repository root):
    ```bash
-   cd backend
-   python -m pytest -q
+   python -m pytest backend/tests -q
    ```
-4. Start development server:
+   *(Or navigate into `backend` and run `python -m pytest -q`)*
+4. Start development server (from repository root):
    ```bash
    python backend/run.py
    ```
+   *(Or from within `backend/`, run `python run.py`)*
    Verify health endpoint at `http://127.0.0.1:5000/api/health`.
 
 ### Frontend (Node.js 20+)

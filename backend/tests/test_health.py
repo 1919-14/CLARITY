@@ -1,4 +1,7 @@
+import os
+import pytest
 from datetime import datetime
+from app import create_app
 
 
 def test_app_initialization_in_testing_mode(app):
@@ -39,10 +42,32 @@ def test_404_not_found_returns_structured_json(client):
     assert data["status_code"] == 404
 
 
-def test_cors_headers_on_health_endpoint(client):
-    """Verify CORS headers are returned for allowed origins."""
+def test_cors_headers_without_credentials(client):
+    """Verify CORS headers are returned for allowed origins and credentials are not enabled."""
     origin = "http://localhost:5173"
     response = client.get("/api/health", headers={"Origin": origin})
 
     assert response.status_code == 200
     assert response.headers.get("Access-Control-Allow-Origin") == origin
+    # Ensure supports_credentials is not enabled
+    assert response.headers.get("Access-Control-Allow-Credentials") is None
+
+
+def test_production_config_fails_without_secret_key(monkeypatch):
+    """Verify production mode fails safely if SECRET_KEY is missing or uses dev default."""
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    with pytest.raises(ValueError, match="A secure SECRET_KEY"):
+        create_app("production")
+
+    monkeypatch.setenv("SECRET_KEY", "dev-clarity-secret-key-change-in-production")
+    with pytest.raises(ValueError, match="A secure SECRET_KEY"):
+        create_app("production")
+
+
+def test_production_config_succeeds_with_valid_secret(monkeypatch):
+    """Verify production mode succeeds when a valid SECRET_KEY is supplied."""
+    monkeypatch.setenv("SECRET_KEY", "super-secret-production-key-xyz-987")
+    prod_app = create_app("production")
+    assert prod_app is not None
+    assert prod_app.config["ENV_NAME"] == "production"
+    assert prod_app.config["SECRET_KEY"] == "super-secret-production-key-xyz-987"

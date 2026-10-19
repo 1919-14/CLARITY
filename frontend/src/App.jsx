@@ -199,34 +199,61 @@ function App() {
         <section className="glass-card" aria-labelledby="foundation-card-title">
           <div className="card-header">
             <h2 id="foundation-card-title" className="card-title">
-              System Foundation
+              System Architecture & Status
             </h2>
-            <span className="status-pill healthy">MVP Skeleton</span>
+            <span className="status-pill healthy">Issue #3 Baseline</span>
           </div>
 
+          <div className="section-subtitle implemented">
+            <span>&bull;</span> Implemented in Foundation Skeleton
+          </div>
           <div className="info-list">
             <div className="info-item">
-              <span className="info-icon">&bull;</span>
+              <span className="info-icon" style={{ color: 'var(--accent-emerald)' }}>✓</span>
               <div>
-                <strong>Flask Application Factory:</strong> Modular backend service with testing/development configurations and structured JSON responses.
+                <strong>Flask Application Factory:</strong> Modular backend service with test/dev environments, strict production key enforcement, and predictable JSON health API.
+                <span className="badge-tag implemented">Active</span>
               </div>
             </div>
             <div className="info-item">
-              <span className="info-icon">&bull;</span>
+              <span className="info-icon" style={{ color: 'var(--accent-emerald)' }}>✓</span>
               <div>
-                <strong>Trust Isolation:</strong> Complete separation between Oracle (black box), Discovery Engine, and Ground-Truth Evaluator.
+                <strong>Research Dashboard Skeleton:</strong> Configurable client with real-time connectivity monitoring, latency measurement, and error diagnostics.
+                <span className="badge-tag implemented">Active</span>
               </div>
             </div>
             <div className="info-item">
-              <span className="info-icon">&bull;</span>
+              <span className="info-icon" style={{ color: 'var(--accent-emerald)' }}>✓</span>
               <div>
-                <strong>Nodus Remote Compute:</strong> Adapter-bounded parallel evaluation of candidate hypotheses without coupling tests to external credentials.
+                <strong>Automated CI Verification:</strong> GitHub Actions pipeline enforcing syntax validity, pytest suite, frontend linting, and production builds.
+                <span className="badge-tag implemented">Active</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="section-subtitle planned">
+            <span>&bull;</span> Target Capabilities (Upcoming Issues)
+          </div>
+          <div className="info-list">
+            <div className="info-item">
+              <span className="info-icon" style={{ color: 'var(--accent-amber)' }}>⏳</span>
+              <div>
+                <strong>Trust Isolation:</strong> Complete structural separation between Oracle (black box), Discovery Engine, and Ground-Truth Evaluator.
+                <span className="badge-tag planned">Planned</span>
               </div>
             </div>
             <div className="info-item">
-              <span className="info-icon">&bull;</span>
+              <span className="info-icon" style={{ color: 'var(--accent-amber)' }}>⏳</span>
               <div>
-                <strong>Honest Accounting:</strong> Per-run query and compute limits strictly enforced before scheduling experiments.
+                <strong>Nodus Remote Compute:</strong> Adapter-bounded remote task submission and parallel evaluation of candidate hypotheses.
+                <span className="badge-tag planned">Planned</span>
+              </div>
+            </div>
+            <div className="info-item">
+              <span className="info-icon" style={{ color: 'var(--accent-amber)' }}>⏳</span>
+              <div>
+                <strong>Active Discovery & Limits:</strong> Uncertainty-driven experiment planning with strict query and spend limit enforcement.
+                <span className="badge-tag planned">Planned</span>
               </div>
             </div>
           </div>

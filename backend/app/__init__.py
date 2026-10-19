@@ -14,12 +14,21 @@ def create_app(config_name=None):
     config_class = config_by_name.get(config_name, Config)
     app.config.from_object(config_class)
 
-    # Configure CORS for API routes
+    # Fail safely in production if a secure SECRET_KEY is not explicitly provided in environment
+    if config_name == "production":
+        secret_key = os.environ.get("SECRET_KEY")
+        if not secret_key or secret_key == "dev-clarity-secret-key-change-in-production":
+            raise ValueError(
+                "A secure SECRET_KEY environment variable must be explicitly configured in production mode."
+            )
+        app.config["SECRET_KEY"] = secret_key
+
+    # Configure CORS with explicit allowed origins without unnecessary credentials support
     cors_origins = app.config.get("CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])
     CORS(
         app,
         resources={r"/api/*": {"origins": cors_origins}},
-        supports_credentials=True,
+        supports_credentials=False,
     )
 
     # Register blueprints
