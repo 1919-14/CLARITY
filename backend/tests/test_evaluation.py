@@ -862,3 +862,131 @@ def test_evaluation_module_does_not_import_oracle_or_evaluator():
         [sys.executable, "-c", program], cwd=backend_dir, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+# ==============================================================================
+# 6. Overflow regression tests (Refs #6 robustness fix)
+# ==============================================================================
+
+# The largest finite float.  Any Python int significantly larger overflows to
+# inf when passed to float(), which on CPython raises OverflowError rather than
+# silently returning inf.
+_HUGE_INT = 10 ** 400  # well beyond sys.float_info.max (~1.8e308)
+_MAX_FLOAT = 1.7976931348623157e308  # sys.float_info.max
+
+
+def test_select_samples_excludes_overflow_input_with_reason_code():
+    """A Python int that overflows float() is excluded as 'input_overflow', not raised."""
+    obs = Observation(
+        observation_id="obs-huge-in",
+        input_id="inp-huge-in",
+        input_values={"x": _HUGE_INT},
+        output_values={"y": 1.0},
+        status=ObservationStatus.SUCCESS,
+        sequence_number=1,
+    )
+    selection = select_samples(["obs-huge-in"], {"obs-huge-in": obs}, "x", "y")
+    assert selection.accepted_count == 0
+    assert selection.exclusion_codes.get("input_overflow", 0) == 1
+
+
+def test_select_samples_excludes_overflow_output_with_reason_code():
+    """A Python int output that overflows float() is excluded as 'output_overflow'."""
+    obs = Observation(
+        observation_id="obs-huge-out",
+        input_id="inp-huge-out",
+        input_values={"x": 1.0},
+        output_values={"y": _HUGE_INT},
+        status=ObservationStatus.SUCCESS,
+        sequence_number=1,
+    )
+    selection = select_samples(["obs-huge-out"], {"obs-huge-out": obs}, "x", "y")
+    assert selection.accepted_count == 0
+    assert selection.exclusion_codes.get("output_overflow", 0) == 1
+
+
+def test_select_samples_overflow_is_isolated_from_valid_observations():
+    """A single overflowing observation is excluded; valid ones are still accepted."""
+    obs_valid = success_observation("obs-0", 1.0, 2.0)
+    obs_bad = Observation(
+        observation_id="obs-bad",
+        input_id="inp-bad",
+        input_values={"x": _HUGE_INT},
+        output_values={"y": 1.0},
+        status=ObservationStatus.SUCCESS,
+        sequence_number=2,
+    )
+    selection = select_samples(
+        ["obs-0", "obs-bad"],
+        {"obs-0": obs_valid, "obs-bad": obs_bad},
+        "x",
+        "y",
+    )
+    assert selection.accepted_count == 1
+    assert selection.samples[0].observation_id == "obs-0"
+    assert selection.exclusion_codes.get("input_overflow", 0) == 1
+
+
+def test_mae_rejects_overflow_arithmetic():
+    """MAE returns ERROR_NON_FINITE_METRIC when subtraction overflows, not a raw exception."""
+    # Two large-but-finite floats whose difference overflows to inf.
+    value, error = mean_absolute_error([_MAX_FLOAT], [-_MAX_FLOAT])
+    assert value is None
+    assert error is not None
+    assert error.code == ERROR_NON_FINITE_METRIC
+
+
+def test_rmse_rejects_overflow_arithmetic():
+    """RMSE returns ERROR_NON_FINITE_METRIC when squaring overflows, not a raw exception."""
+    value, error = root_mean_squared_error([_MAX_FLOAT], [-_MAX_FLOAT])
+    assert value is None
+    assert error is not None
+    assert error.code == ERROR_NON_FINITE_METRIC
+
+
+def test_evaluate_many_still_isolates_when_overflow_candidate_present():
+    """evaluate_many() completes all candidates even when one triggers a metric overflow.
+
+    Candidate A has a single valid training point producing valid metrics.
+    Candidate B is evaluated with an observation whose output overflows float(),
+    leaving it with no valid training samples and a fitting failure.
+    The results list must contain exactly two entries, one COMPLETED and one FAILED,
+    in the original request order.
+    """
+    # Valid training data for candidate A.
+    obs_a0 = success_observation("obs-a0", -1.0, truth(-1.0))
+    obs_a1 = success_observation("obs-a1", 0.0, truth(0.0))
+    obs_a2 = success_observation("obs-a2", 1.0, truth(1.0))
+    obs_a3 = success_observation("obs-a3", 2.0, truth(2.0))
+    obs_a4 = success_observation("obs-a4", -2.0, truth(-2.0))
+
+    # Overflowing observation for candidate B.
+    obs_b0 = Observation(
+        observation_id="obs-b0",
+        input_id="inp-b0",
+        input_values={"x": _HUGE_INT},
+        output_values={"y": 1.0},
+        status=ObservationStatus.SUCCESS,
+        sequence_number=1,
+    )
+
+    observations = {
+        "obs-a0": obs_a0, "obs-a1": obs_a1, "obs-a2": obs_a2,
+        "obs-a3": obs_a3, "obs-a4": obs_a4,
+        "obs-b0": obs_b0,
+    }
+
+    cand_a = polynomial_candidate(degree=3, hypothesis_id="hyp-a")
+    cand_b = polynomial_candidate(degree=1, hypothesis_id="hyp-b")
+
+    request_a = make_request(cand_a, ["obs-a0", "obs-a1", "obs-a2", "obs-a3", "obs-a4"])
+    request_b = make_request(cand_b, ["obs-b0"])
+
+    pipeline = EvaluationPipeline()
+    results = pipeline.evaluate_many([request_a, request_b], observations)
+
+    assert len(results) == 2
+    assert results[0].hypothesis_id == "hyp-a"
+    assert results[0].status == EvaluationStatus.COMPLETED
+    assert results[1].hypothesis_id == "hyp-b"
+    assert results[1].status == EvaluationStatus.FAILED

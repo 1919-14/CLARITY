@@ -119,18 +119,34 @@ def _validate_metric_pairs(
                     ),
                     details={"index": index, "argument": label},
                 )
-            if not math.isfinite(float(value)):
+            try:
+                converted = float(value)
+            except OverflowError:
+                return None, None, StructuredError(
+                    code=ERROR_NON_FINITE_METRIC_INPUT,
+                    message=(
+                        f"Metric {label} value at index {index} overflows float; "
+                        "refusing to report a metric."
+                    ),
+                    details={"index": index, "argument": label},
+                )
+            if not math.isfinite(converted):
                 return None, None, StructuredError(
                     code=ERROR_NON_FINITE_METRIC_INPUT,
                     message=f"Metric {label} value at index {index} must be finite.",
                     details={"index": index, "argument": label},
                 )
 
-    return (
-        [float(value) for value in actual_values],
-        [float(value) for value in predicted_values],
-        None,
-    )
+    try:
+        floated_actuals = [float(value) for value in actual_values]
+        floated_predictions = [float(value) for value in predicted_values]
+    except OverflowError:
+        return None, None, StructuredError(
+            code=ERROR_NON_FINITE_METRIC_INPUT,
+            message="A metric value overflows float; refusing to report a metric.",
+            details={},
+        )
+    return floated_actuals, floated_predictions, None
 
 
 def mean_absolute_error(
@@ -141,10 +157,17 @@ def mean_absolute_error(
     if error is not None:
         return None, error
 
-    differences = [
-        abs(actual - predicted)
-        for actual, predicted in zip(actual_values, predicted_values)
-    ]
+    try:
+        differences = [
+            abs(actual - predicted)
+            for actual, predicted in zip(actual_values, predicted_values)
+        ]
+    except OverflowError:
+        return None, StructuredError(
+            code=ERROR_NON_FINITE_METRIC,
+            message="Absolute error overflows float; refusing to report a metric.",
+            details={"sample_count": len(actual_values)},
+        )
     if any(not math.isfinite(difference) for difference in differences):
         return None, StructuredError(
             code=ERROR_NON_FINITE_METRIC,
@@ -169,10 +192,17 @@ def root_mean_squared_error(
     if error is not None:
         return None, error
 
-    squared_errors = [
-        (actual - predicted) ** 2
-        for actual, predicted in zip(actual_values, predicted_values)
-    ]
+    try:
+        squared_errors = [
+            (actual - predicted) ** 2
+            for actual, predicted in zip(actual_values, predicted_values)
+        ]
+    except OverflowError:
+        return None, StructuredError(
+            code=ERROR_NON_FINITE_METRIC,
+            message="Squared error overflows float; refusing to report a metric.",
+            details={"sample_count": len(actual_values)},
+        )
     if any(not math.isfinite(value) for value in squared_errors):
         return None, StructuredError(
             code=ERROR_NON_FINITE_METRIC,
@@ -292,7 +322,11 @@ def select_samples(
         if isinstance(raw_input, bool) or not isinstance(raw_input, (int, float)):
             codes["invalid_input_type"] += 1
             continue
-        numeric_input = float(raw_input)
+        try:
+            numeric_input = float(raw_input)
+        except OverflowError:
+            codes["input_overflow"] += 1
+            continue
         if not math.isfinite(numeric_input):
             codes["non_finite_input"] += 1
             continue
@@ -308,7 +342,11 @@ def select_samples(
         if isinstance(raw_output, bool) or not isinstance(raw_output, (int, float)):
             codes["invalid_output_type"] += 1
             continue
-        numeric_output = float(raw_output)
+        try:
+            numeric_output = float(raw_output)
+        except OverflowError:
+            codes["output_overflow"] += 1
+            continue
         if not math.isfinite(numeric_output):
             codes["non_finite_output"] += 1
             continue
