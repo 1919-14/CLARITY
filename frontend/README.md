@@ -71,6 +71,9 @@ The application will be accessible at `http://localhost:5173`.
 # Code style and linting (oxlint)
 npm run lint
 
+# Automated unit tests (Node test runner)
+npm test
+
 # Production build bundle check
 npm run build
 ```

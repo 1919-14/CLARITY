@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { api, ApiError } from '../api/client';
+import { validateRunConfig } from './validation';
 
 const DOMAIN_OPTIONS = [
   { id: '1d_polynomial', label: '1D Bounded Polynomial (Scalar x -> y)' },
@@ -14,10 +15,10 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
   const [name, setName] = useState('Polynomial Discovery Test');
   const [domain, setDomain] = useState('1d_polynomial');
   const [executionMode, setExecutionMode] = useState('local');
-  const [maxQueries, setMaxQueries] = useState(15);
-  const [maxEvaluations, setMaxEvaluations] = useState(50);
-  const [maxConcurrency, setMaxConcurrency] = useState(4);
-  const [maxRuntimeSeconds, setMaxRuntimeSeconds] = useState(300);
+  const [maxQueries, setMaxQueries] = useState('15');
+  const [maxEvaluations, setMaxEvaluations] = useState('50');
+  const [maxConcurrency, setMaxConcurrency] = useState('4');
+  const [maxRuntimeSeconds, setMaxRuntimeSeconds] = useState('300');
   const [spendCeiling, setSpendCeiling] = useState('');
 
   const [validationErrors, setValidationErrors] = useState({});
@@ -26,63 +27,36 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
 
   if (!isOpen) return null;
 
-  const validate = () => {
-    const errors = {};
-
-    if (!name.trim()) {
-      errors.name = 'Run name or description is required.';
-    }
-
-    const q = parseInt(maxQueries, 10);
-    if (isNaN(q) || q < 1 || q > 500) {
-      errors.maxQueries = 'Query budget must be an integer between 1 and 500.';
-    }
-
-    const e = parseInt(maxEvaluations, 10);
-    if (isNaN(e) || e < 1 || e > 2000) {
-      errors.maxEvaluations = 'Evaluation limit must be an integer between 1 and 2000.';
-    }
-
-    const c = parseInt(maxConcurrency, 10);
-    if (isNaN(c) || c < 1 || c > 32) {
-      errors.maxConcurrency = 'Concurrency must be between 1 and 32 tasks.';
-    }
-
-    const r = parseInt(maxRuntimeSeconds, 10);
-    if (isNaN(r) || r < 10 || r > 3600) {
-      errors.maxRuntimeSeconds = 'Run duration limit must be between 10 and 3600 seconds.';
-    }
-
-    if (spendCeiling !== '' && spendCeiling !== null) {
-      const s = parseFloat(spendCeiling);
-      if (isNaN(s) || s < 0) {
-        errors.spendCeiling = 'Spend limit must be a positive number if specified.';
-      }
-    }
-
-    setValidationErrors(errors);
-    return Object.keys(errors).length === 0;
-  };
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     setSubmissionError(null);
 
-    if (!validate()) {
+    const validation = validateRunConfig({
+      name,
+      maxQueries,
+      maxEvaluations,
+      maxConcurrency,
+      maxRuntimeSeconds,
+      spendCeiling,
+    });
+
+    if (!validation.isValid) {
+      setValidationErrors(validation.errors);
       return;
     }
 
+    setValidationErrors({});
     setIsSubmitting(true);
 
     const payload = {
       name: name.trim(),
       domain: domain,
       execution_mode: executionMode,
-      max_oracle_queries: parseInt(maxQueries, 10),
-      max_evaluation_tasks: parseInt(maxEvaluations, 10),
-      max_concurrency: parseInt(maxConcurrency, 10),
-      max_runtime_seconds: parseInt(maxRuntimeSeconds, 10),
-      spend_ceiling_usd: spendCeiling ? parseFloat(spendCeiling) : null,
+      max_oracle_queries: Number(maxQueries),
+      max_evaluation_tasks: Number(maxEvaluations),
+      max_concurrency: Number(maxConcurrency),
+      max_runtime_seconds: Number(maxRuntimeSeconds),
+      spend_ceiling_usd: spendCeiling !== '' ? Number(spendCeiling) : null,
     };
 
     try {
@@ -176,16 +150,15 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
               <label htmlFor="run-queries">Oracle Query Budget <span className="req">*</span></label>
               <input
                 id="run-queries"
-                type="number"
-                min="1"
-                max="500"
+                type="text"
+                inputMode="numeric"
                 className={`input-field ${validationErrors.maxQueries ? 'is-invalid' : ''}`}
                 value={maxQueries}
                 onChange={(e) => setMaxQueries(e.target.value)}
                 disabled={isSubmitting}
                 required
               />
-              <span className="field-hint">Max queries submitted to the black-box oracle.</span>
+              <span className="field-hint">Max integer queries submitted to the black-box oracle (1-500).</span>
               {validationErrors.maxQueries && <p className="field-error">{validationErrors.maxQueries}</p>}
             </div>
 
@@ -193,16 +166,15 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
               <label htmlFor="run-evals">Evaluation Tasks Limit <span className="req">*</span></label>
               <input
                 id="run-evals"
-                type="number"
-                min="1"
-                max="2000"
+                type="text"
+                inputMode="numeric"
                 className={`input-field ${validationErrors.maxEvaluations ? 'is-invalid' : ''}`}
                 value={maxEvaluations}
                 onChange={(e) => setMaxEvaluations(e.target.value)}
                 disabled={isSubmitting}
                 required
               />
-              <span className="field-hint">Upper ceiling of candidate evaluations.</span>
+              <span className="field-hint">Upper whole integer ceiling of candidate evaluations (1-2000).</span>
               {validationErrors.maxEvaluations && <p className="field-error">{validationErrors.maxEvaluations}</p>}
             </div>
 
@@ -210,15 +182,14 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
               <label htmlFor="run-concurrency">Max Concurrent Tasks</label>
               <input
                 id="run-concurrency"
-                type="number"
-                min="1"
-                max="32"
+                type="text"
+                inputMode="numeric"
                 className={`input-field ${validationErrors.maxConcurrency ? 'is-invalid' : ''}`}
                 value={maxConcurrency}
                 onChange={(e) => setMaxConcurrency(e.target.value)}
                 disabled={isSubmitting}
               />
-              <span className="field-hint">Simultaneous worker/task allocations.</span>
+              <span className="field-hint">Simultaneous worker/task allocations (1-32).</span>
               {validationErrors.maxConcurrency && <p className="field-error">{validationErrors.maxConcurrency}</p>}
             </div>
 
@@ -226,15 +197,14 @@ export function RunConfigModal({ isOpen, onClose, onRunCreated }) {
               <label htmlFor="run-runtime">Duration Limit (Seconds)</label>
               <input
                 id="run-runtime"
-                type="number"
-                min="10"
-                max="3600"
+                type="text"
+                inputMode="numeric"
                 className={`input-field ${validationErrors.maxRuntimeSeconds ? 'is-invalid' : ''}`}
                 value={maxRuntimeSeconds}
                 onChange={(e) => setMaxRuntimeSeconds(e.target.value)}
                 disabled={isSubmitting}
               />
-              <span className="field-hint">Automatic cutoff timer for execution.</span>
+              <span className="field-hint">Automatic cutoff timer for execution (10-3600).</span>
               {validationErrors.maxRuntimeSeconds && <p className="field-error">{validationErrors.maxRuntimeSeconds}</p>}
             </div>
           </div>

@@ -101,13 +101,21 @@ export function RunDetailModal({ run, onClose, onCancelRun, onNavigateHypotheses
               <div className="metric-cell">
                 <span className="metric-label">Oracle Queries Used</span>
                 <span className="metric-value">
-                  {progress.queries_executed ?? usage.queries_executed ?? '0'} / {config.max_oracle_queries ?? run.max_queries ?? '—'}
+                  {(progress.queries_executed ?? usage.queries_executed) != null ? (
+                    `${progress.queries_executed ?? usage.queries_executed} / ${config.max_oracle_queries ?? run.max_queries ?? '—'}`
+                  ) : (
+                    <span className="text-muted">Unavailable</span>
+                  )}
                 </span>
               </div>
               <div className="metric-cell">
                 <span className="metric-label">Evaluations Completed</span>
                 <span className="metric-value">
-                  {progress.evaluations_completed ?? usage.evaluations_completed ?? '0'} / {config.max_evaluation_tasks ?? run.max_evaluations ?? '—'}
+                  {(progress.evaluations_completed ?? usage.evaluations_completed) != null ? (
+                    `${progress.evaluations_completed ?? usage.evaluations_completed} / ${config.max_evaluation_tasks ?? run.max_evaluations ?? '—'}`
+                  ) : (
+                    <span className="text-muted">Unavailable</span>
+                  )}
                 </span>
               </div>
               <div className="metric-cell">

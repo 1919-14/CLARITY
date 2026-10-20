@@ -252,9 +252,9 @@ function App() {
                     const usage = run.usage || {};
                     const progress = run.progress || {};
                     const config = run.config || {};
-                    const queriesUsed = progress.queries_executed ?? usage.queries_executed ?? 0;
+                    const queriesUsed = progress.queries_executed ?? usage.queries_executed;
                     const maxQueries = config.max_oracle_queries ?? run.max_queries ?? '—';
-                    const evalsDone = progress.evaluations_completed ?? usage.evaluations_completed ?? 0;
+                    const evalsDone = progress.evaluations_completed ?? usage.evaluations_completed;
                     const maxEvals = config.max_evaluation_tasks ?? run.max_evaluations ?? '—';
 
                     return (
@@ -280,10 +280,18 @@ function App() {
                           </span>
                         </td>
                         <td>
-                          <span className="num-emphasis">{queriesUsed}</span> / {maxQueries}
+                          {queriesUsed != null ? (
+                            <><span className="num-emphasis">{queriesUsed}</span> / {maxQueries}</>
+                          ) : (
+                            <span className="text-muted">Unavailable</span>
+                          )}
                         </td>
                         <td>
-                          <span className="num-emphasis">{evalsDone}</span> / {maxEvals}
+                          {evalsDone != null ? (
+                            <><span className="num-emphasis">{evalsDone}</span> / {maxEvals}</>
+                          ) : (
+                            <span className="text-muted">Unavailable</span>
+                          )}
                         </td>
                         <td>
                           {usage.settled_cost_usd != null ? (
