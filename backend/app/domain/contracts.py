@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 
@@ -206,6 +206,12 @@ class Observation:
 class EvaluationStatus(str, Enum):
     PENDING = "pending"
     COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class FittingStatus(str, Enum):
+    """Outcome of fitting a candidate's parameters to training observations."""
+    SUCCESS = "success"
     FAILED = "failed"
 
 
@@ -443,17 +449,39 @@ class EvaluationRequest:
 
 @dataclass(frozen=True)
 class EvaluationResult:
-    """Result of evaluating a hypothesis candidate against observations.
-    
+    """Standardized result of fitting and evaluating a candidate hypothesis.
+
     Fields:
       evaluation_id: Unique evaluation execution identifier.
-      hypothesis_id: ID of evaluated candidate.
-      status: Completed, pending, or failed.
-      metrics: Measured predictive metrics (e.g. {"mae": 0.05, "rmse": 0.08}).
-      sample_count: Number of observations evaluated on.
-      held_out_metrics: Metrics computed on held-out test data if provided.
-      error: Error details if status is FAILED.
+      hypothesis_id: Stable ID of the evaluated candidate.
+      status: COMPLETED or FAILED (PENDING reserved for queued work).
+      metrics: Training metrics for accepted training observations. An empty
+        mapping means no metrics are available; it never means zero error.
+      sample_count: Accepted training observations used for fitting.
+      held_out_metrics: Metrics on held-out observations, absent when held-out
+        evaluation was not possible.
+      error: Structured primary failure explanation for FAILED results.
       evaluated_at: UTC ISO-8601 timestamp.
+      model_family: Registered family identifier of the candidate.
+      fitting_status: Whether fitting succeeded, failed, or was not attempted.
+      fitting_method: Fitting method actually used.
+      fitting_config: Fitting configuration that affected the fit.
+      fitted_specification: Fitted canonical model specification. Present only
+        for successful fitting; the original candidate is never mutated.
+      complexity: Complexity of the fitted model when available.
+      held_out_sample_count: Accepted held-out observations used for metrics.
+      observation_counts: Requested/accepted/excluded counts per partition.
+      exclusion_codes: Aggregated exclusion reason codes and counts.
+      metric_definitions: Metric name to definition/version text.
+      metric_version: Version identifier for the metric implementations.
+      dataset_ids: Dataset identifier and partition observation IDs.
+      request_id: EvaluationRequest that produced this result, when available.
+      warnings: Non-fatal structured warnings (for example unavailable held-out
+        metrics or an exactly determined fit).
+
+    Absent metrics mean "unavailable", never zero. A FAILED result carries no
+    fitted specification and no metrics, so an unfitted or failed candidate
+    cannot look favorable.
     """
     hypothesis_id: str
     status: EvaluationStatus = EvaluationStatus.COMPLETED
@@ -463,10 +491,29 @@ class EvaluationResult:
     held_out_metrics: Optional[Dict[str, Optional[float]]] = None
     error: Optional[StructuredError] = None
     evaluated_at: str = field(default_factory=utc_now_iso)
+    model_family: Optional[str] = None
+    fitting_status: Optional[FittingStatus] = None
+    fitting_method: Optional[str] = None
+    fitting_config: Optional[Mapping[str, Any]] = None
+    fitted_specification: Optional[Mapping[str, Any]] = None
+    complexity: Optional[int] = None
+    held_out_sample_count: Optional[int] = None
+    observation_counts: Optional[Mapping[str, int]] = None
+    exclusion_codes: Optional[Mapping[str, int]] = None
+    metric_definitions: Optional[Mapping[str, str]] = None
+    metric_version: Optional[str] = None
+    dataset_ids: Optional[Mapping[str, Any]] = None
+    request_id: Optional[str] = None
+    warnings: Optional[Tuple[StructuredError, ...]] = None
 
     def __post_init__(self):
         if self.status != EvaluationStatus.COMPLETED and self.error is None:
             raise ValueError("Failed or non-completed evaluation requires error explanation.")
+        if self.fitting_status is not None and not isinstance(self.fitting_status, FittingStatus):
+            raise ValueError(
+                "EvaluationResult fitting_status must be a FittingStatus, "
+                f"got {type(self.fitting_status).__name__}."
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -481,6 +528,34 @@ class EvaluationResult:
             data["held_out_metrics"] = self.held_out_metrics
         if self.error is not None:
             data["error"] = self.error.to_dict()
+        if self.model_family is not None:
+            data["model_family"] = self.model_family
+        if self.fitting_status is not None:
+            data["fitting_status"] = self.fitting_status.value
+        if self.fitting_method is not None:
+            data["fitting_method"] = self.fitting_method
+        if self.fitting_config is not None:
+            data["fitting_config"] = thaw_payload(self.fitting_config)
+        if self.fitted_specification is not None:
+            data["fitted_specification"] = thaw_payload(self.fitted_specification)
+        if self.complexity is not None:
+            data["complexity"] = self.complexity
+        if self.held_out_sample_count is not None:
+            data["held_out_sample_count"] = self.held_out_sample_count
+        if self.observation_counts is not None:
+            data["observation_counts"] = thaw_payload(self.observation_counts)
+        if self.exclusion_codes is not None:
+            data["exclusion_codes"] = thaw_payload(self.exclusion_codes)
+        if self.metric_definitions is not None:
+            data["metric_definitions"] = thaw_payload(self.metric_definitions)
+        if self.metric_version is not None:
+            data["metric_version"] = self.metric_version
+        if self.dataset_ids is not None:
+            data["dataset_ids"] = thaw_payload(self.dataset_ids)
+        if self.request_id is not None:
+            data["request_id"] = self.request_id
+        if self.warnings is not None:
+            data["warnings"] = [warning.to_dict() for warning in self.warnings]
         return data
 
 

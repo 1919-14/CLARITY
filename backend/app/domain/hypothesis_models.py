@@ -35,6 +35,7 @@ HARD_MAX_POLYNOMIAL_DEGREE = 12
 
 # Structured error codes. Reused by the candidate generator.
 ERROR_UNKNOWN_MODEL_FAMILY = "UNKNOWN_MODEL_FAMILY"
+ERROR_UNSUPPORTED_MODEL_FAMILY = "UNSUPPORTED_MODEL_FAMILY"
 ERROR_INVALID_SPECIFICATION = "INVALID_MODEL_SPECIFICATION"
 ERROR_MISSING_PARAMETER = "MISSING_PARAMETER"
 ERROR_INVALID_PARAMETER_TYPE = "INVALID_PARAMETER_TYPE"
@@ -186,6 +187,23 @@ class HypothesisModelFamily(ABC):
         """Validate a specification; return None when valid."""
         return self.parse_specification(specification)[1]
 
+    def numeric_task_variables(
+        self, specification: Mapping[str, Any]
+    ) -> Tuple[Optional[Tuple[str, str]], Optional[StructuredError]]:
+        """Declare the input/output variable names for scalar numeric prediction.
+
+        Families that are not scalar numeric tasks return a structured error
+        instead of guessing, so evaluation never assumes a task shape it cannot
+        support. Model-neutral orchestration only needs these two names.
+        """
+        return None, StructuredError(
+            code=ERROR_UNSUPPORTED_MODEL_FAMILY,
+            message=(
+                f"Family '{self.family_id}' does not declare numeric scalar task variables."
+            ),
+            details={"family": self.family_id},
+        )
+
 
 class PolynomialFamily(HypothesisModelFamily):
     """Bounded polynomial family covering constant, linear, and higher degrees.
@@ -237,6 +255,14 @@ class PolynomialFamily(HypothesisModelFamily):
     @property
     def output_variable(self) -> str:
         return self._output_variable
+
+    def numeric_task_variables(
+        self, specification: Mapping[str, Any]
+    ) -> Tuple[Optional[Tuple[str, str]], Optional[StructuredError]]:
+        model, error = self.parse_specification(specification)
+        if error is not None:
+            return None, error
+        return (model.input_variable, model.output_variable), None
 
     def parse_specification(
         self, specification: Mapping[str, Any]
