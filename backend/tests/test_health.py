@@ -65,9 +65,11 @@ def test_production_config_fails_without_secret_key(monkeypatch):
 
 
 def test_production_config_succeeds_with_valid_secret(monkeypatch):
-    """Verify production mode succeeds when a valid SECRET_KEY is supplied."""
+    """Verify production mode succeeds when valid SECRET_KEY and DATABASE_URL are supplied."""
     monkeypatch.setenv("SECRET_KEY", "super-secret-production-key-xyz-987")
+    monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://clarity_user:secret@localhost:3306/clarity_prod")
     prod_app = create_app("production")
     assert prod_app is not None
     assert prod_app.config["ENV_NAME"] == "production"
     assert prod_app.config["SECRET_KEY"] == "super-secret-production-key-xyz-987"
+    assert prod_app.config["SQLALCHEMY_DATABASE_URI"] == "mysql+pymysql://clarity_user:secret@localhost:3306/clarity_prod"

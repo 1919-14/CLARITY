@@ -14,7 +14,7 @@ def create_app(config_name=None):
     config_class = config_by_name.get(config_name, Config)
     app.config.from_object(config_class)
 
-    # Fail safely in production if a secure SECRET_KEY is not explicitly provided in environment
+    # Fail safely in production if a secure SECRET_KEY and DATABASE_URL are not explicitly provided
     if config_name == "production":
         secret_key = os.environ.get("SECRET_KEY")
         if not secret_key or secret_key == "dev-clarity-secret-key-change-in-production":
@@ -22,6 +22,18 @@ def create_app(config_name=None):
                 "A secure SECRET_KEY environment variable must be explicitly configured in production mode."
             )
         app.config["SECRET_KEY"] = secret_key
+
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            raise ValueError(
+                "A valid DATABASE_URL environment variable must be explicitly configured in production mode."
+            )
+        if database_url.startswith("sqlite"):
+            raise ValueError(
+                "SQLite database URI cannot be used in production environment. "
+                "A production database (e.g., MySQL) URL must be configured."
+            )
+        app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 
     # Configure CORS with explicit allowed origins without unnecessary credentials support
     cors_origins = app.config.get("CORS_ORIGINS", ["http://localhost:5173", "http://127.0.0.1:5173"])
