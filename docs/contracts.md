@@ -415,3 +415,46 @@ Model fitting/optimization (#6), ranking and evidence tracking (#7), the discove
 loop (#8), experiment generation/selection (#9, #10), oracle querying, MySQL
 persistence (#18), Flask routes (#19), Nodus integration (#12), and React UI
 (#21, #22).
+
+---
+
+## 5. Candidate Experiment Generation (Issue #9)
+
+**Code references:**
+- [backend/app/domain/experiment_generator.py](../backend/app/domain/experiment_generator.py) — `CandidateExperiment`, `NumericalDomainBounds`, `ExperimentGenerationConfig`, `CandidateExperimentGenerator`
+- [backend/tests/test_experiment_generation.py](../backend/tests/test_experiment_generation.py) — comprehensive unit test suite
+
+### 5.1 Representation and Interface
+`CandidateExperiment` encapsulates a candidate input point evaluated before oracle query submission:
+```json
+{
+  "candidate_id": "cand-exp-0a1b2c3d4e",
+  "input_data": {
+    "input_id": "inp-9f8e7d6c5b",
+    "domain": "1d_polynomial",
+    "values": {"x": 2.5},
+    "metadata": {"strategy": "grid", "grid_index": 2}
+  },
+  "status": "eligible",
+  "strategy": "grid",
+  "created_at": "2026-10-21T00:00:00.000000+00:00",
+  "generation_metadata": {"strategy": "grid", "point": 2.5}
+}
+```
+
+### 5.2 Supported Domain Bounds
+- `NumericalDomainBounds`: Specifies continuous box constraints for independent variables (e.g. `variable_name="x"`, `min_val=-10.0`, `max_val=10.0`).
+- Validates that values are finite real numbers within inclusive bounds; rejects booleans, strings, NaNs, and infinities.
+
+### 5.3 Strategies
+1. **`grid`:** Generates evenly spaced deterministic test points across `[min_val, max_val]`.
+2. **`uniform_random`:** Seeded uniform draws within domain bounds; exactly reproducible across runs when `seed` is fixed.
+3. **`stratified_random`:** Splits the domain into equal intervals and samples within each stratum to ensure broad spatial coverage.
+
+### 5.4 Deduplication and Exclusion
+- **Canonical Key:** Deduplicates candidates using `(("variable_name", round(value, 6)), ...)`.
+- **Exclusion of Queried Inputs:** Automatically filters out previously observed inputs within a configurable float `tolerance` (default `1e-5`).
+- **Structured Error Handling:** Raises `CandidateExperimentGenerationError` with `EMPTY_CANDIDATE_POOL` or `UNDERSIZED_CANDIDATE_POOL` if no valid candidate points remain.
+
+### 5.5 Scientific Isolation Guarantee
+The experiment generator imports only domain contracts; it has zero dependencies on `app.adapters.oracle` or `app.evaluator` and does not access ground truth.

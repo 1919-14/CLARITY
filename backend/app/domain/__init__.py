@@ -37,6 +37,16 @@ from .candidate_generator import (
     HypothesisGenerationConfig,
     generate_candidates,
 )
+from .experiment_generator import (
+    CandidateExperiment,
+    CandidateExperimentStatus,
+    ExperimentGenerationStrategy,
+    NumericalDomainBounds,
+    ExperimentGenerationConfig,
+    CandidateExperimentGenerationError,
+    CandidateExperimentGenerator,
+    generate_candidate_experiments,
+)
 
 __all__ = [
     "StructuredError",
@@ -70,4 +80,12 @@ __all__ = [
     "CandidateGenerator",
     "CandidateGenerationError",
     "generate_candidates",
+    "CandidateExperiment",
+    "CandidateExperimentStatus",
+    "ExperimentGenerationStrategy",
+    "NumericalDomainBounds",
+    "ExperimentGenerationConfig",
+    "CandidateExperimentGenerationError",
+    "CandidateExperimentGenerator",
+    "generate_candidate_experiments",
 ]
