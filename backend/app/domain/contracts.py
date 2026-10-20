@@ -9,10 +9,12 @@ Defines schemas and domain objects for:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from types import MappingProxyType
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 
@@ -207,40 +209,188 @@ class EvaluationStatus(str, Enum):
     FAILED = "failed"
 
 
+class FittingStatus(str, Enum):
+    """Outcome of fitting a candidate's parameters to training observations."""
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class HypothesisStatus(str, Enum):
+    """Lifecycle state of a candidate explanation.
+
+    CANDIDATE covers the generated/proposed state: the hypothesis has a
+    specification but has not been evaluated against observations. EVALUATED is
+    set by downstream evaluation services (Issue #6) once a result exists; the
+    generator must never set it.
+    """
+    CANDIDATE = "candidate"
+    EVALUATED = "evaluated"
+
+
+class HypothesisOrigin(str, Enum):
+    """Where a candidate explanation came from."""
+    SYSTEM_GENERATED = "system_generated"
+    RESEARCHER_PROPOSED = "researcher_proposed"
+    REFINED = "refined"
+
+
+@dataclass(frozen=True)
+class HypothesisProvenance:
+    """Structured description of a candidate's origin.
+
+    Fields:
+      origin: One of HypothesisOrigin.
+      generator: Generator identifier. Required for SYSTEM_GENERATED and rejected
+        for RESEARCHER_PROPOSED so a researcher submission cannot claim to be
+        produced by the generator.
+      generator_version: Generator version string, when applicable.
+      parent_hypothesis_id: Parent candidate ID. Required for REFINED candidates.
+      note: Optional short non-sensitive note (for example a researcher rationale).
+
+    Configuration and seed details live in the hypothesis's generation_metadata
+    rather than being duplicated here.
+    """
+    origin: HypothesisOrigin
+    generator: Optional[str] = None
+    generator_version: Optional[str] = None
+    parent_hypothesis_id: Optional[str] = None
+    note: Optional[str] = None
+
+    def __post_init__(self):
+        if not isinstance(self.origin, HypothesisOrigin):
+            raise ValueError(
+                f"HypothesisProvenance origin must be a HypothesisOrigin, got {type(self.origin).__name__}."
+            )
+        if self.origin == HypothesisOrigin.SYSTEM_GENERATED and not self.generator:
+            raise ValueError("SYSTEM_GENERATED provenance requires a non-empty generator identifier.")
+        if self.origin == HypothesisOrigin.REFINED and not self.parent_hypothesis_id:
+            raise ValueError("REFINED provenance requires a parent_hypothesis_id.")
+        if self.origin == HypothesisOrigin.RESEARCHER_PROPOSED and self.generator is not None:
+            raise ValueError(
+                "RESEARCHER_PROPOSED provenance must not claim a generator; "
+                "record the submission source in note instead."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"origin": self.origin.value}
+        if self.generator is not None:
+            data["generator"] = self.generator
+        if self.generator_version is not None:
+            data["generator_version"] = self.generator_version
+        if self.parent_hypothesis_id is not None:
+            data["parent_hypothesis_id"] = self.parent_hypothesis_id
+        if self.note is not None:
+            data["note"] = self.note
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HypothesisProvenance":
+        origin = data["origin"]
+        return cls(
+            origin=origin if isinstance(origin, HypothesisOrigin) else HypothesisOrigin(origin),
+            generator=data.get("generator"),
+            generator_version=data.get("generator_version"),
+            parent_hypothesis_id=data.get("parent_hypothesis_id"),
+            note=data.get("note"),
+        )
+
+
 @dataclass(frozen=True)
 class HypothesisRepresentation:
     """Scientific description of a candidate explanation.
-    
+
     Fields:
-      hypothesis_id: Unique candidate identifier.
-      model_family: Family tag (e.g. "polynomial", "piecewise_linear", "boolean_dnf").
-      formula: Mathematical or symbolic representation string (e.g. "y = 0.5x^3 - 2x + 1").
-      parameters: Estimated model parameters / weights.
-      complexity: Defined complexity score (e.g. polynomial degree, number of free terms).
-      revision: Revision sequence number for tracked revisions.
+      hypothesis_id: Unique, stable candidate identifier.
+      model_family: Registered family identifier (e.g. "polynomial").
+      formula: Human-readable summary of the model (e.g. "y = 3.0 - 2.0*x").
+      parameters: Machine-readable model specification in the canonical shape
+        defined by the registered model family (see docs/contracts.md).
+      complexity: Defined complexity score (e.g. number of polynomial coefficients).
+      revision: Revision sequence number, incremented only on specification changes.
       created_at: UTC ISO-8601 timestamp.
+      status: Lifecycle state; generated candidates are CANDIDATE, not EVALUATED.
+      provenance: Structured origin information (see HypothesisProvenance).
+      generation_metadata: Generator name/version, seed, and configuration.
+      fitting_metadata: Optional output reserved for downstream fitting services.
+      uncertainty_metadata: Optional output reserved for downstream uncertainty work.
+
+    Absent optional fields mean "not computed yet". They are never defaulted to
+    zero error, perfect confidence, or a completed evaluation.
+
+    `parameters`, `generation_metadata`, `fitting_metadata`, and
+    `uncertainty_metadata` are checked by verify_no_ground_truth_leakage() and
+    stored as immutable snapshots: nested dicts become read-only mappings and
+    sequences become tuples, so later mutation of the caller's objects cannot
+    change validated data and in-place edits raise. Use to_dict() for a mutable
+    plain-JSON copy. This is a data-integrity convention, not a security boundary.
     """
     model_family: str
     formula: str
-    parameters: Dict[str, Any]
+    parameters: Mapping[str, Any]
     hypothesis_id: str = field(default_factory=lambda: generate_id("hyp"))
     complexity: int = 1
     revision: int = 1
     created_at: str = field(default_factory=utc_now_iso)
+    status: HypothesisStatus = HypothesisStatus.CANDIDATE
+    provenance: Optional[HypothesisProvenance] = None
+    generation_metadata: Optional[Mapping[str, Any]] = None
+    fitting_metadata: Optional[Mapping[str, Any]] = None
+    uncertainty_metadata: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self):
+        if not isinstance(self.model_family, str) or not self.model_family:
+            raise ValueError("Hypothesis model_family must be a non-empty string.")
+        if not isinstance(self.formula, str) or not self.formula:
+            raise ValueError("Hypothesis formula (human-readable summary) must be a non-empty string.")
+        if not isinstance(self.parameters, Mapping):
+            raise ValueError("Hypothesis parameters must be a mapping specification.")
+        if not isinstance(self.status, HypothesisStatus):
+            raise ValueError(
+                f"Hypothesis status must be a HypothesisStatus, got {type(self.status).__name__}."
+            )
+        if self.provenance is not None and not isinstance(self.provenance, HypothesisProvenance):
+            raise ValueError("Hypothesis provenance must be a HypothesisProvenance instance.")
+        for field_name, payload in (
+            ("parameters", self.parameters),
+            ("generation_metadata", self.generation_metadata),
+            ("fitting_metadata", self.fitting_metadata),
+            ("uncertainty_metadata", self.uncertainty_metadata),
+        ):
+            if payload is not None:
+                verify_no_ground_truth_leakage(payload)
+
+        # Freeze after validation so the checked payload cannot drift afterwards.
+        object.__setattr__(self, "parameters", freeze_payload(self.parameters))
+        for field_name in ("generation_metadata", "fitting_metadata", "uncertainty_metadata"):
+            payload = getattr(self, field_name)
+            if payload is not None:
+                object.__setattr__(self, field_name, freeze_payload(payload))
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "hypothesis_id": self.hypothesis_id,
             "model_family": self.model_family,
             "formula": self.formula,
-            "parameters": self.parameters,
+            "parameters": thaw_payload(self.parameters),
             "complexity": self.complexity,
             "revision": self.revision,
             "created_at": self.created_at,
+            "status": self.status.value,
         }
+        if self.provenance is not None:
+            data["provenance"] = self.provenance.to_dict()
+        if self.generation_metadata is not None:
+            data["generation_metadata"] = thaw_payload(self.generation_metadata)
+        if self.fitting_metadata is not None:
+            data["fitting_metadata"] = thaw_payload(self.fitting_metadata)
+        if self.uncertainty_metadata is not None:
+            data["uncertainty_metadata"] = thaw_payload(self.uncertainty_metadata)
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HypothesisRepresentation":
+        provenance_data = data.get("provenance")
+        status = data.get("status", HypothesisStatus.CANDIDATE.value)
         return cls(
             hypothesis_id=data.get("hypothesis_id", generate_id("hyp")),
             model_family=data["model_family"],
@@ -249,6 +399,17 @@ class HypothesisRepresentation:
             complexity=data.get("complexity", 1),
             revision=data.get("revision", 1),
             created_at=data.get("created_at", utc_now_iso()),
+            status=status if isinstance(status, HypothesisStatus) else HypothesisStatus(status),
+            provenance=(
+                provenance_data
+                if isinstance(provenance_data, HypothesisProvenance)
+                else HypothesisProvenance.from_dict(provenance_data)
+                if provenance_data is not None
+                else None
+            ),
+            generation_metadata=data.get("generation_metadata"),
+            fitting_metadata=data.get("fitting_metadata"),
+            uncertainty_metadata=data.get("uncertainty_metadata"),
         )
 
 
@@ -288,17 +449,39 @@ class EvaluationRequest:
 
 @dataclass(frozen=True)
 class EvaluationResult:
-    """Result of evaluating a hypothesis candidate against observations.
-    
+    """Standardized result of fitting and evaluating a candidate hypothesis.
+
     Fields:
       evaluation_id: Unique evaluation execution identifier.
-      hypothesis_id: ID of evaluated candidate.
-      status: Completed, pending, or failed.
-      metrics: Measured predictive metrics (e.g. {"mae": 0.05, "rmse": 0.08}).
-      sample_count: Number of observations evaluated on.
-      held_out_metrics: Metrics computed on held-out test data if provided.
-      error: Error details if status is FAILED.
+      hypothesis_id: Stable ID of the evaluated candidate.
+      status: COMPLETED or FAILED (PENDING reserved for queued work).
+      metrics: Training metrics for accepted training observations. An empty
+        mapping means no metrics are available; it never means zero error.
+      sample_count: Accepted training observations used for fitting.
+      held_out_metrics: Metrics on held-out observations, absent when held-out
+        evaluation was not possible.
+      error: Structured primary failure explanation for FAILED results.
       evaluated_at: UTC ISO-8601 timestamp.
+      model_family: Registered family identifier of the candidate.
+      fitting_status: Whether fitting succeeded, failed, or was not attempted.
+      fitting_method: Fitting method actually used.
+      fitting_config: Fitting configuration that affected the fit.
+      fitted_specification: Fitted canonical model specification. Present only
+        for successful fitting; the original candidate is never mutated.
+      complexity: Complexity of the fitted model when available.
+      held_out_sample_count: Accepted held-out observations used for metrics.
+      observation_counts: Requested/accepted/excluded counts per partition.
+      exclusion_codes: Aggregated exclusion reason codes and counts.
+      metric_definitions: Metric name to definition/version text.
+      metric_version: Version identifier for the metric implementations.
+      dataset_ids: Dataset identifier and partition observation IDs.
+      request_id: EvaluationRequest that produced this result, when available.
+      warnings: Non-fatal structured warnings (for example unavailable held-out
+        metrics or an exactly determined fit).
+
+    Absent metrics mean "unavailable", never zero. A FAILED result carries no
+    fitted specification and no metrics, so an unfitted or failed candidate
+    cannot look favorable.
     """
     hypothesis_id: str
     status: EvaluationStatus = EvaluationStatus.COMPLETED
@@ -308,10 +491,51 @@ class EvaluationResult:
     held_out_metrics: Optional[Dict[str, Optional[float]]] = None
     error: Optional[StructuredError] = None
     evaluated_at: str = field(default_factory=utc_now_iso)
+    model_family: Optional[str] = None
+    fitting_status: Optional[FittingStatus] = None
+    fitting_method: Optional[str] = None
+    fitting_config: Optional[Mapping[str, Any]] = None
+    fitted_specification: Optional[Mapping[str, Any]] = None
+    complexity: Optional[int] = None
+    held_out_sample_count: Optional[int] = None
+    observation_counts: Optional[Mapping[str, int]] = None
+    exclusion_codes: Optional[Mapping[str, int]] = None
+    metric_definitions: Optional[Mapping[str, str]] = None
+    metric_version: Optional[str] = None
+    dataset_ids: Optional[Mapping[str, Any]] = None
+    request_id: Optional[str] = None
+    warnings: Optional[Tuple[StructuredError, ...]] = None
 
     def __post_init__(self):
         if self.status != EvaluationStatus.COMPLETED and self.error is None:
             raise ValueError("Failed or non-completed evaluation requires error explanation.")
+        if self.fitting_status is not None and not isinstance(self.fitting_status, FittingStatus):
+            raise ValueError(
+                "EvaluationResult fitting_status must be a FittingStatus, "
+                f"got {type(self.fitting_status).__name__}."
+            )
+        # Guard against contradictory pipeline-result combinations.
+        # These checks apply only when fitting_status is explicitly set
+        # (i.e. the result came from the evaluation pipeline, not a
+        # legacy/generic construction without fitting metadata).
+        if self.fitting_status is not None:
+            if (
+                self.status == EvaluationStatus.COMPLETED
+                and self.fitting_status == FittingStatus.FAILED
+            ):
+                raise ValueError(
+                    "EvaluationResult cannot be COMPLETED with a FAILED fitting_status; "
+                    "a failed fit must produce a FAILED evaluation status."
+                )
+            if (
+                self.status == EvaluationStatus.COMPLETED
+                and self.fitting_status == FittingStatus.SUCCESS
+                and self.fitted_specification is None
+            ):
+                raise ValueError(
+                    "EvaluationResult with status=COMPLETED and fitting_status=SUCCESS "
+                    "must include a fitted_specification."
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -326,6 +550,34 @@ class EvaluationResult:
             data["held_out_metrics"] = self.held_out_metrics
         if self.error is not None:
             data["error"] = self.error.to_dict()
+        if self.model_family is not None:
+            data["model_family"] = self.model_family
+        if self.fitting_status is not None:
+            data["fitting_status"] = self.fitting_status.value
+        if self.fitting_method is not None:
+            data["fitting_method"] = self.fitting_method
+        if self.fitting_config is not None:
+            data["fitting_config"] = thaw_payload(self.fitting_config)
+        if self.fitted_specification is not None:
+            data["fitted_specification"] = thaw_payload(self.fitted_specification)
+        if self.complexity is not None:
+            data["complexity"] = self.complexity
+        if self.held_out_sample_count is not None:
+            data["held_out_sample_count"] = self.held_out_sample_count
+        if self.observation_counts is not None:
+            data["observation_counts"] = thaw_payload(self.observation_counts)
+        if self.exclusion_codes is not None:
+            data["exclusion_codes"] = thaw_payload(self.exclusion_codes)
+        if self.metric_definitions is not None:
+            data["metric_definitions"] = thaw_payload(self.metric_definitions)
+        if self.metric_version is not None:
+            data["metric_version"] = self.metric_version
+        if self.dataset_ids is not None:
+            data["dataset_ids"] = thaw_payload(self.dataset_ids)
+        if self.request_id is not None:
+            data["request_id"] = self.request_id
+        if self.warnings is not None:
+            data["warnings"] = [warning.to_dict() for warning in self.warnings]
         return data
 
 
@@ -436,21 +688,55 @@ LEAKAGE_DENYLIST_PREFIXES = (
 )
 
 
-def verify_no_ground_truth_leakage(payload: Dict[str, Any]) -> None:
+def verify_no_ground_truth_leakage(payload: Mapping[str, Any]) -> None:
     """Recursively verify that no evaluator-only or ground-truth keys exist in payload.
-    
+
+    Accepts any mapping, including the read-only snapshots stored on hypotheses.
+
     Raises:
-      ValueError if any forbidden key is detected in the dictionary.
+      ValueError if any forbidden key is detected or a key is not a string.
     """
     for key, value in payload.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"Ground-truth leakage check requires string keys, got {type(key).__name__}."
+            )
         for prefix in LEAKAGE_DENYLIST_PREFIXES:
             if key.startswith(prefix):
                 raise ValueError(
                     f"Ground-truth leakage detected: key '{key}' is forbidden in discovery payloads."
                 )
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             verify_no_ground_truth_leakage(value)
-        elif isinstance(value, list):
+        elif isinstance(value, (list, tuple)):
             for item in value:
-                if isinstance(item, dict):
+                if isinstance(item, Mapping):
                     verify_no_ground_truth_leakage(item)
+
+
+def freeze_payload(payload: Any) -> Any:
+    """Recursively copy a JSON-like payload into an immutable snapshot.
+
+    Mappings become read-only ``MappingProxyType`` views and sequences become
+    tuples, so later mutation of the caller's dict/list cannot change stored
+    domain data and in-place edits of the snapshot fail immediately.
+
+    This is a data-integrity convention inside the domain model, not a security
+    boundary: it prevents accidental aliasing after validation runs.
+    """
+    if isinstance(payload, Mapping):
+        return MappingProxyType({key: freeze_payload(value) for key, value in payload.items()})
+    if isinstance(payload, (list, tuple)):
+        return tuple(freeze_payload(item) for item in payload)
+    return payload
+
+
+def thaw_payload(payload: Any) -> Any:
+    """Recursively convert a frozen snapshot back into plain dict/list values."""
+    if isinstance(payload, Mapping):
+        return {key: thaw_payload(value) for key, value in payload.items()}
+    if isinstance(payload, tuple):
+        return [thaw_payload(item) for item in payload]
+    if isinstance(payload, list):
+        return [thaw_payload(item) for item in payload]
+    return payload

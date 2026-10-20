@@ -4,6 +4,8 @@
 
 This is the intended MVP architecture, not a claim that components are already implemented. Preserve clear boundaries between discovery logic, UI, persistence, oracle access, and provider-specific execution. Keep hidden truth away from the discovery engine, enforce limits before scheduling work, and make the system testable without live services for every unit test.
 
+The concrete field definitions, validation rules, structured errors, and serialization guardrails for oracle, experiment, observation, hypothesis, evaluation, and benchmark data live in [contracts.md](contracts.md).
+
 ## Logical architecture
 
 ```mermaid
@@ -93,7 +95,7 @@ Separate provider account balance from per-run limits. Run limits may include or
 Persist runs/configuration, observations, hypotheses and revisions, evaluation results, experiment selections where useful, budget/usage records, audit events, and benchmark definitions/results. Use relationships and transactions appropriately. Preserve meaningful history. Table names, ORM, migration tooling, and indexes are implementation choices.
 
 ### Reporting and metrics
-Build reports from persisted evidence. Show the top 3–5 candidates where available, representation, fit/held-out error, defined complexity, evidence, defensible uncertainty, usage, stop reason, and limitations. Missing metrics are unavailable, not zero. Record metric definitions and benchmark versions.
+Build reports from persisted evidence. Show the top 3–5 candidates where available, representation, fit/held-out error, defined complexity, evidence, defensible uncertainty, usage, stop reason, and limitations. Missing metrics are unavailable, not zero. Record metric definitions and benchmark versions. MAE and RMSE definitions, aggregation, and failure semantics are specified in [contracts.md](contracts.md) section 5.
 
 ### Evaluator and benchmark runner
 The evaluator is separate from discovery. It may access hidden rules/labels to calculate benchmark metrics, but these must not enter agent-facing inputs or ordinary discovery API responses. Compare active selection and random/passive selection under equivalent task/oracle family, candidate procedure, query budget, held-out evaluation, and documented seeds/repeated trials.
@@ -119,6 +121,7 @@ The evaluator is separate from discovery. It may access hidden rules/labels to c
 
 ## Data isolation and failure rules
 
+- Fitting consumes training observations only. Held-out observations are used for metrics after the fit and must never reach the fitter, determine the fitting method, or influence degree selection (Issue #6; see [contracts.md](contracts.md) section 5).
 - Keep evaluator-only fields out of discovery objects and serializers.
 - Never put secret rules in shared configuration, logs, debug messages, frontend bundles, or reports.
 - Use explicit API serialization allowlists.

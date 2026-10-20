@@ -122,11 +122,63 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Rationale:** Explicit verification reduces untested assumptions and late integration failures.
 
+## D-013 — Bounded polynomial family is the first hypothesis family
+
+**Status:** Confirmed (Issue #5)
+
+**Decision:** One registered `polynomial` family covers constant, linear, and higher-degree models (degrees 0 through a configurable maximum, default 3, hard ceiling 12). Specifications use ascending coefficients `c0..c_degree`, require a non-zero leading coefficient for degree >= 1, and define complexity as `degree + 1`. Prediction is an explicit Horner evaluation over validated numeric coefficients.
+
+**Rationale:** The family is small, testable, analytically checkable, and matches the deterministic scalar `x -> y` local oracle. A registry keeps further families addable without changing candidate generation or the discovery loop.
+
+**Trade-off:** Narrower than unrestricted symbolic discovery. Higher-degree models with zero leading terms are rejected rather than silently treated as lower degree, so the declared degree and complexity stay honest.
+
+**Rejected alternatives:** Expression strings with `eval`/`exec` or an expression parser (unsafe and unverifiable); arbitrary user code; separate constant/linear/quadratic classes (duplicate logic).
+
+**Validation:** `backend/tests/test_hypotheses.py`; contract details in [contracts.md](contracts.md) section 4.
+
+## D-014 — Generated candidates are initialized, not fitted
+
+**Status:** Confirmed (Issue #5)
+
+**Decision:** Candidate generation produces one deterministic monomial baseline per allowed degree plus seeded uniform coefficient draws until the requested unique count is reached. Candidates carry `status = candidate`, `system_generated` provenance, and generation metadata (generator, version, seed, configuration, initialization, sequence index). Duplicates are canonical-specification equality within one batch. An unreachable requested count raises `ATTEMPT_BUDGET_EXHAUSTED`, which reports bounded-sampling failure rather than a proven empty candidate space.
+
+**Rationale:** Generated candidates need valid, explicit parameters to make predictions, but fitting belongs to Issue #6. Seeded initialization makes batches reproducible without implying fit quality.
+
+**Trade-off:** Initial coefficients carry no evidence about the hidden system; generation must never be read as accuracy, confidence, or ranking. Duplicate detection covers canonical equality only, not general symbolic equivalence.
+
+**Validation:** `backend/tests/test_hypotheses.py` (reproducibility, limits, exhaustion, isolation); [contracts.md](contracts.md) section 4.
+
+## D-015 — Ordinary least squares for polynomial fitting
+
+**Status:** Confirmed (Issue #6)
+
+**Decision:** Fit the polynomial family by ordinary least squares using a dependency-free Householder QR solve on the Vandermonde matrix, in a scaled input variable that is converted back to the original basis. Require at least `degree + 1` training observations, allow exactly determined fits with an explicit warning, and fail rank-deficient, degenerate, or non-finite fits with structured errors instead of reducing degree or inventing coefficients.
+
+**Rationale:** Least squares is the defensible, deterministic objective for numeric polynomial candidates. QR avoids the conditioning loss of normal equations, and scaling keeps degrees up to the hard ceiling usable without adding numpy.
+
+**Trade-off:** A fit is a best fit to the supplied training data, not proof of the hidden rule. Rank detection is relative and threshold-based (`rank_tolerance`), so borderline cases are documented rather than silently clamped. Multi-output and robust/weighted objectives are out of scope.
+
+**Rejected alternatives:** Normal equations (worse conditioning), gradient methods (nondeterministic/extra configuration), silently reducing degree (dishonest complexity), and adding numpy solely for this solve.
+
+**Validation:** `backend/tests/test_evaluation.py` (exact recovery, overdetermined fit, insufficient/rank-deficient/degenerate failures); [contracts.md](contracts.md) section 5.
+
+## D-016 — Evaluation pipeline keeps training and held-out data separate
+
+**Status:** Confirmed (Issue #6)
+
+**Decision:** `fit_candidate` accepts only training samples, and `EvaluationPipeline` fits once, then predicts on training and held-out partitions with the same fitted specification. Held-out outputs are used only for metrics. Failed fits produce `status=failed` with no metrics and no fitted specification. Per-candidate failures are isolated by `evaluate_many`.
+
+**Rationale:** Held-out data must test generalization, never influence parameters, degree, method, or selection. Standardized results with counts, exclusions, metric definitions, and dataset IDs make later ranking and reporting auditable.
+
+**Trade-off:** No automatic train/held-out splitting, no ranking on held-out scores, and one scalar output variable per candidate. Partial metric availability is represented as absent, never zero.
+
+**Validation:** Leakage invariants A/B/E and failure-isolation tests in `backend/tests/test_evaluation.py`.
+
 ## Open decisions
 
-1. First hypothesis representation/model family.
+1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
 2. First deterministic oracle input domain/output type.
-3. Candidate fitting objective, ranking formula, complexity proxy.
+3. ~~Candidate fitting objective.~~ Resolved for the polynomial family by D-015. Ranking formula remains open; complexity proxy is `degree + 1` (D-013).
 4. Disagreement and uncertainty score.
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.
