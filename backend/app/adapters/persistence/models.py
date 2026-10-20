@@ -1,0 +1,325 @@
+"""SQLAlchemy relational entity models for CLARITY.
+
+Persists:
+- Discovery runs (lifecycle status, limits, execution mode, stop reason)
+- Hypotheses & Hypothesis Revisions (scientific provenance, formula, complexity, pinning)
+- Observations (input, output, status, sequences, noise)
+- Candidate Experiments (proposed inputs, selection rationale, observation link)
+- Hypothesis Evaluations (metrics, sample counts, held-out validation, exact revision & dataset reference)
+- Compute Tasks (Nodus task tracking, execution status, timings, errors)
+- Usage & Budgets (queries executed, evaluations scheduled, cost states, budget exhaustion)
+- Audit Events (researcher actions: pin, exclude, restore, re-evaluate)
+- Benchmark Results (Hit@1/3/5, MRR, held-out errors, baseline comparison)
+- Reports (top candidate rankings, summary artifact references)
+"""
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+from sqlalchemy import (
+    Column,
+    String,
+    Integer,
+    Float,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    JSON,
+    Text,
+    UniqueConstraint,
+    Index,
+)
+from sqlalchemy.orm import relationship
+from .database import Base
+
+
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+class RunModel(Base):
+    """Discovery run record tracking run lifecycle, limits, and terminal status."""
+
+    __tablename__ = "runs"
+
+    run_id = Column(String(64), primary_key=True)
+    name = Column(String(255), nullable=False)
+    domain = Column(String(64), nullable=False, default="default")
+    status = Column(String(32), nullable=False, default="pending")  # pending, running, completed, budget_exhausted, cancelled, failed
+    execution_mode = Column(String(32), nullable=False, default="local")  # local, nodus_remote
+    sampling_strategy = Column(String(64), nullable=False, default="active_disagreement")
+    stop_reason = Column(String(255), nullable=True)
+    
+    # Configured run-level limits
+    max_queries = Column(Integer, nullable=True)
+    max_evaluations = Column(Integer, nullable=True)
+    max_runtime_seconds = Column(Integer, nullable=True)
+    spend_ceiling_usd = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Relationships preserving history
+    hypotheses = relationship("HypothesisModel", back_populates="run", cascade="all, delete-orphan")
+    observations = relationship("ObservationModel", back_populates="run", cascade="all, delete-orphan")
+    experiments = relationship("CandidateExperimentModel", back_populates="run", cascade="all, delete-orphan")
+    tasks = relationship("ComputeTaskModel", back_populates="run", cascade="all, delete-orphan")
+    usage_records = relationship("UsageRecordModel", back_populates="run", cascade="all, delete-orphan")
+    audit_events = relationship("AuditEventModel", back_populates="run", cascade="all, delete-orphan")
+    reports = relationship("ReportModel", back_populates="run", cascade="all, delete-orphan")
+    benchmark_results = relationship("BenchmarkResultModel", back_populates="run", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_runs_status", "status"),
+        Index("idx_runs_created_at", "created_at"),
+    )
+
+
+class HypothesisModel(Base):
+    """Stable candidate hypothesis entity belonging to a discovery run."""
+
+    __tablename__ = "hypotheses"
+
+    hypothesis_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    model_family = Column(String(64), nullable=False)
+    current_revision = Column(Integer, nullable=False, default=1)
+    
+    # Scientific & Researcher UI flags
+    is_pinned = Column(Boolean, nullable=False, default=False)
+    is_excluded = Column(Boolean, nullable=False, default=False)
+    
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="hypotheses")
+    revisions = relationship("HypothesisRevisionModel", back_populates="hypothesis", cascade="all, delete-orphan", order_by="HypothesisRevisionModel.revision_number")
+
+    __table_args__ = (
+        Index("idx_hypotheses_run_state", "run_id", "is_excluded", "is_pinned"),
+    )
+
+
+class HypothesisRevisionModel(Base):
+    """Immutable hypothesis revision capturing mathematical/symbolic definitions over time."""
+
+    __tablename__ = "hypothesis_revisions"
+
+    revision_id = Column(String(64), primary_key=True)
+    hypothesis_id = Column(String(64), ForeignKey("hypotheses.hypothesis_id", ondelete="RESTRICT"), nullable=False)
+    revision_number = Column(Integer, nullable=False)
+    formula = Column(Text, nullable=False)
+    parameters = Column(JSON, nullable=False)  # Weights/coefficients dictionary
+    complexity = Column(Integer, nullable=False, default=1)
+    creation_source = Column(String(64), nullable=False, default="generator")  # generator, researcher, refit
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    hypothesis = relationship("HypothesisModel", back_populates="revisions")
+    evaluations = relationship("EvaluationResultModel", back_populates="revision", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("hypothesis_id", "revision_number", name="uq_hypothesis_revision_number"),
+        Index("idx_revisions_hyp_rev", "hypothesis_id", "revision_number"),
+    )
+
+
+class ObservationModel(Base):
+    """Observable record returned by an oracle query."""
+
+    __tablename__ = "observations"
+
+    observation_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    input_id = Column(String(64), nullable=False)
+    input_values = Column(JSON, nullable=False)
+    output_values = Column(JSON, nullable=True)  # Null if query failed or was invalid
+    status = Column(String(32), nullable=False, default="success")  # success, invalid_input, oracle_failure, budget_exceeded
+    sequence_number = Column(Integer, nullable=False)  # 1-indexed sequence order within the run
+    is_held_out = Column(Boolean, nullable=False, default=False)
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    noise_metadata = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="observations")
+    experiment = relationship("CandidateExperimentModel", back_populates="observation", uselist=False)
+
+    __table_args__ = (
+        Index("idx_observations_run_seq", "run_id", "sequence_number"),
+        Index("idx_observations_run_heldout", "run_id", "is_held_out"),
+    )
+
+
+class CandidateExperimentModel(Base):
+    """Proposed candidate experiment input evaluated by active learning policies."""
+
+    __tablename__ = "candidate_experiments"
+
+    experiment_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    proposed_input = Column(JSON, nullable=False)
+    selection_rationale = Column(JSON, nullable=True)  # Disagreement score, candidate predictions, strategy
+    execution_status = Column(String(32), nullable=False, default="proposed")  # proposed, scheduled, executed, rejected
+    observation_id = Column(String(64), ForeignKey("observations.observation_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="experiments")
+    observation = relationship("ObservationModel", back_populates="experiment")
+
+    __table_args__ = (
+        Index("idx_experiments_run_status", "run_id", "execution_status"),
+    )
+
+
+class EvaluationResultModel(Base):
+    """Evaluated fitness and predictive performance of a hypothesis revision against an observation set."""
+
+    __tablename__ = "evaluation_results"
+
+    evaluation_id = Column(String(64), primary_key=True)
+    revision_id = Column(String(64), ForeignKey("hypothesis_revisions.revision_id", ondelete="RESTRICT"), nullable=False)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    status = Column(String(32), nullable=False, default="completed")  # completed, failed, pending
+    sample_count = Column(Integer, nullable=False, default=0)
+    dataset_version = Column(Integer, nullable=False, default=0)  # Number of observations available at evaluation time
+    
+    # Structured predictive metrics
+    metrics = Column(JSON, nullable=False)  # {"mae": 0.045, "rmse": 0.052, ...}
+    held_out_metrics = Column(JSON, nullable=True)  # {"mae": 0.082, "rmse": 0.091, ...}
+    error_message = Column(Text, nullable=True)
+    evaluated_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    revision = relationship("HypothesisRevisionModel", back_populates="evaluations")
+
+    __table_args__ = (
+        Index("idx_evaluations_rev_run", "revision_id", "run_id"),
+        Index("idx_evaluations_run_evaluated", "run_id", "evaluated_at"),
+    )
+
+
+class ComputeTaskModel(Base):
+    """Individual compute execution units scheduled locally or via Nodus."""
+
+    __tablename__ = "compute_tasks"
+
+    task_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    candidate_id = Column(String(64), nullable=True)
+    execution_mode = Column(String(32), nullable=False, default="local")  # local, nodus_remote, mock
+    provider_task_id = Column(String(128), nullable=True)  # Nodus task identifier
+    status = Column(String(32), nullable=False, default="pending")  # pending, running, completed, failed, timed_out
+    
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    error_metadata = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="tasks")
+
+    __table_args__ = (
+        Index("idx_tasks_run_status", "run_id", "status"),
+        Index("idx_tasks_provider_task_id", "provider_task_id"),
+    )
+
+
+class UsageRecordModel(Base):
+    """Tracks query counts, evaluations, and cost progression for a run."""
+
+    __tablename__ = "usage_records"
+
+    usage_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    queries_executed = Column(Integer, nullable=False, default=0)
+    evaluations_scheduled = Column(Integer, nullable=False, default=0)
+    evaluations_completed = Column(Integer, nullable=False, default=0)
+    
+    # Explicit cost separation (context.md §5)
+    estimated_cost_usd = Column(Float, nullable=True)
+    live_accruing_cost_usd = Column(Float, nullable=True)
+    settled_cost_usd = Column(Float, nullable=True)
+    
+    is_budget_exhausted = Column(Boolean, nullable=False, default=False)
+    exhaustion_reason = Column(String(255), nullable=True)
+    recorded_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="usage_records")
+
+    __table_args__ = (
+        Index("idx_usage_run_recorded", "run_id", "recorded_at"),
+    )
+
+
+class AuditEventModel(Base):
+    """Immutable audit trail for researcher interactions and system lifecycle changes."""
+
+    __tablename__ = "audit_events"
+
+    event_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    event_type = Column(String(64), nullable=False)  # RUN_STARTED, HYPOTHESIS_PINNED, HYPOTHESIS_EXCLUDED, etc.
+    actor = Column(String(64), nullable=False, default="researcher")  # researcher, system, orchestrator
+    metadata_json = Column(JSON, nullable=True)
+    timestamp = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="audit_events")
+
+    __table_args__ = (
+        Index("idx_audit_run_timestamp", "run_id", "timestamp"),
+        Index("idx_audit_event_type", "event_type"),
+    )
+
+
+class BenchmarkResultModel(Base):
+    """Ground-truth evaluation benchmarks comparing discovery runs against targets."""
+
+    __tablename__ = "benchmark_results"
+
+    benchmark_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    benchmark_name = Column(String(128), nullable=False)
+    target_label = Column(String(128), nullable=False)
+    
+    # Ground-truth accuracy metrics
+    hit_at_1 = Column(Boolean, nullable=False, default=False)
+    hit_at_3 = Column(Boolean, nullable=False, default=False)
+    hit_at_5 = Column(Boolean, nullable=False, default=False)
+    reciprocal_rank = Column(Float, nullable=False, default=0.0)
+    best_candidate_id = Column(String(64), nullable=True)
+    queries_to_target = Column(Integer, nullable=True)
+    
+    held_out_mae = Column(Float, nullable=True)
+    held_out_rmse = Column(Float, nullable=True)
+    baseline_type = Column(String(64), nullable=True)  # random_sampling, passive_uniform
+    efficiency_gain = Column(String(32), nullable=True)  # e.g., "3.2x"
+    execution_metadata = Column(JSON, nullable=True)
+    executed_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="benchmark_results")
+
+    __table_args__ = (
+        Index("idx_benchmarks_run", "run_id"),
+        Index("idx_benchmarks_name_executed", "benchmark_name", "executed_at"),
+    )
+
+
+class ReportModel(Base):
+    """Generated summary report containing scientific findings and candidate rankings."""
+
+    __tablename__ = "reports"
+
+    report_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
+    status = Column(String(32), nullable=False, default="generated")  # pending, generated, failed
+    ranked_candidates = Column(JSON, nullable=False)  # Top 3-5 candidates with metrics and evidence
+    stop_reason = Column(String(255), nullable=True)
+    limitations = Column(Text, nullable=True)
+    artifact_uri = Column(String(255), nullable=True)
+    generated_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="reports")
+
+    __table_args__ = (
+        Index("idx_reports_run_generated", "run_id", "generated_at"),
+    )
