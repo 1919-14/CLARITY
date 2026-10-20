@@ -9,6 +9,7 @@ Covers:
 5. Isolation: the generation module does not depend on the oracle or evaluator.
 """
 
+from collections.abc import Mapping
 import inspect
 import json
 import os
@@ -18,7 +19,7 @@ import sys
 import pytest
 
 from app.domain.candidate_generator import (
-    ERROR_CANDIDATE_SPACE_EXHAUSTED,
+    ERROR_ATTEMPT_BUDGET_EXHAUSTED,
     ERROR_INVALID_GENERATION_CONFIG,
     GENERATOR_NAME,
     GENERATOR_VERSION,
@@ -32,6 +33,7 @@ from app.domain.contracts import (
     HypothesisProvenance,
     HypothesisRepresentation,
     HypothesisStatus,
+    StructuredError,
 )
 from app.domain.hypothesis_models import (
     ERROR_INVALID_PARAMETER_TYPE,
@@ -43,8 +45,10 @@ from app.domain.hypothesis_models import (
     ERROR_UNSUPPORTED_DEGREE,
     HARD_MAX_POLYNOMIAL_DEGREE,
     POLYNOMIAL_FAMILY_ID,
+    HypothesisModelFamily,
     ModelFamilyRegistry,
     PolynomialFamily,
+    ValidatedModel,
     default_registry,
 )
 
@@ -162,6 +166,54 @@ def test_provenance_researcher_proposal_is_representable():
     }
 
 
+def test_hypothesis_payloads_are_immutable_snapshots():
+    """Nested payloads are frozen, so post-validation mutation cannot bypass checks."""
+    source = {"degree": 1, "coefficients": {"c0": 0.0, "c1": 1.0}}
+    hypothesis = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = 0.0 + 1.0*x",
+        parameters=source,
+        generation_metadata={"tags": ["baseline"]},
+    )
+
+    # The caller's dict is copied, not aliased.
+    source["degree"] = 9
+    source["coefficients"]["c0"] = 5.0
+    assert hypothesis.parameters["degree"] == 1
+    assert hypothesis.parameters["coefficients"]["c0"] == 0.0
+
+    # In-place mutation of the stored snapshot fails instead of silently succeeding.
+    assert isinstance(hypothesis.parameters, Mapping)
+    assert not isinstance(hypothesis.parameters, dict)
+    with pytest.raises(TypeError):
+        hypothesis.parameters["degree"] = 2
+    with pytest.raises(TypeError):
+        hypothesis.parameters["coefficients"]["c0"] = 5.0
+    with pytest.raises(AttributeError):
+        hypothesis.generation_metadata["tags"].append("later")
+
+
+def test_hypothesis_to_dict_returns_a_mutable_copy():
+    """Serialization thaws the snapshot so consumers get plain JSON-safe data."""
+    hypothesis = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = 0.0",
+        parameters={"degree": 0, "coefficients": {"c0": 0.0}},
+        generation_metadata={"tags": ["baseline"]},
+    )
+
+    data = hypothesis.to_dict()
+    assert data["parameters"] == {"degree": 0, "coefficients": {"c0": 0.0}}
+    assert isinstance(data["parameters"], dict)
+    assert data["generation_metadata"]["tags"] == ["baseline"]
+
+    data["parameters"]["degree"] = 3
+    data["generation_metadata"]["tags"].append("mutated")
+    assert hypothesis.parameters["degree"] == 0
+    assert list(hypothesis.generation_metadata["tags"]) == ["baseline"]
+    json.dumps(data)  # returned copy stays JSON serializable
+
+
 # ==============================================================================
 # 2. Polynomial model family
 # ==============================================================================
@@ -211,12 +263,12 @@ def test_polynomial_summary_and_complexity():
     model, error = family.parse_specification(polynomial_spec(list(CUBIC_COEFFICIENTS)))
     assert error is None
 
-    summary = family.summarize(model)
+    summary = model.summarize()
     assert summary.startswith("y = ")
     assert "x^2" in summary
     assert "x^3" in summary
     # Complexity is documented as the number of free coefficients.
-    assert family.complexity(model) == 4
+    assert model.complexity() == 4
 
 
 def test_polynomial_rejects_missing_degree():
@@ -380,6 +432,97 @@ def test_registry_rejects_duplicate_registration():
         registry.register(PolynomialFamily())
 
 
+@pytest.mark.parametrize("bad_family", [[], {}, 5, 1.5, False])
+def test_registry_rejects_non_string_family_identifier(bad_family):
+    """Malformed identifiers must not escape as a raw TypeError from dict lookup."""
+    registry = default_registry()
+    specification = {"family": bad_family, "degree": 0, "coefficients": [0.0]}
+
+    _, parse_error = registry.parse_specification(specification)
+    assert parse_error.code == ERROR_INVALID_PARAMETER_TYPE
+    assert parse_error.details == {"received_type": type(bad_family).__name__}
+
+    _, predict_error = registry.predict(specification, {"x": 1.0})
+    assert predict_error.code == ERROR_INVALID_PARAMETER_TYPE
+
+
+def test_registry_still_reports_missing_family_separately():
+    registry = default_registry()
+    _, error = registry.parse_specification({"degree": 0, "coefficients": [0.0]})
+    assert error.code == ERROR_MISSING_PARAMETER
+
+
+class _ThresholdModel(ValidatedModel):
+    """Minimal non-polynomial model used to prove the interface is model-neutral."""
+
+    def __init__(self, threshold: float):
+        self.threshold = threshold
+
+    def to_specification(self):
+        return {"family": "threshold", "threshold": self.threshold}
+
+    def canonical_key(self):
+        return json.dumps(self.to_specification(), sort_keys=True)
+
+    def summarize(self):
+        return f"y = 1.0 if x >= {self.threshold} else 0.0"
+
+    def complexity(self):
+        return 1
+
+
+class _ThresholdFamily(HypothesisModelFamily):
+    """Second family registered only in tests, with a non-polynomial output shape."""
+
+    family_id = "threshold"
+
+    @property
+    def max_complexity(self):
+        return 1
+
+    def parse_specification(self, specification):
+        if not isinstance(specification, Mapping):
+            return None, StructuredError(
+                code=ERROR_INVALID_SPECIFICATION, message="Specification must be a mapping."
+            )
+        threshold = specification.get("threshold")
+        if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+            return None, StructuredError(
+                code=ERROR_INVALID_PARAMETER_TYPE, message="threshold must be numeric."
+            )
+        return _ThresholdModel(float(threshold)), None
+
+    def predict(self, specification, input_values):
+        model, error = self.parse_specification(specification)
+        if error is not None:
+            return None, error
+        x = input_values.get("x")
+        if not isinstance(x, (int, float)) or isinstance(x, bool):
+            return None, StructuredError(
+                code=ERROR_INVALID_PARAMETER_TYPE, message="x must be numeric."
+            )
+        return {"y": 1.0 if x >= model.threshold else 0.0}, None
+
+
+def test_registry_supports_model_neutral_family_interface():
+    """A non-polynomial family registers and predicts without polymorphic leakage."""
+    registry = ModelFamilyRegistry([PolynomialFamily(max_degree=2), _ThresholdFamily()])
+    assert registry.family_ids() == ("polynomial", "threshold")
+
+    model, error = registry.parse_specification({"family": "threshold", "threshold": 0.5})
+    assert error is None
+    assert isinstance(model, ValidatedModel)
+    assert model.complexity() == 1
+    assert model.canonical_key() == '{"family": "threshold", "threshold": 0.5}'
+    assert model.summarize().startswith("y = ")
+
+    prediction, predict_error = registry.predict(
+        {"family": "threshold", "threshold": 0.5}, {"x": 1.0}
+    )
+    assert predict_error is None
+    assert prediction == {"y": 1.0}
+
+
 # ==============================================================================
 # 4. Candidate generation
 # ==============================================================================
@@ -396,7 +539,7 @@ def test_generator_produces_unique_valid_candidates():
     assert len({candidate.parameters["degree"] for candidate in candidates}) >= 2
 
     canonical_keys = {
-        json.dumps(candidate.parameters, sort_keys=True) for candidate in candidates
+        json.dumps(candidate.to_dict()["parameters"], sort_keys=True) for candidate in candidates
     }
     assert len(canonical_keys) == len(candidates)
 
@@ -534,9 +677,11 @@ def test_generator_reports_candidate_space_exhaustion():
         CandidateGenerator(config).generate()
 
     error = excinfo.value.error
-    assert error.code == ERROR_CANDIDATE_SPACE_EXHAUSTED
+    assert error.code == ERROR_ATTEMPT_BUDGET_EXHAUSTED
     assert error.details["generated"] == 1
     assert error.details["requested"] == 2
+    assert error.details["attempt_budget"] == 4
+    assert "does not prove" in error.message
 
 
 def test_generator_duplicate_detection_uses_canonical_specification():

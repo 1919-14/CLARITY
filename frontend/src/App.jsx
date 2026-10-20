@@ -201,11 +201,11 @@ function App() {
             <h2 id="foundation-card-title" className="card-title">
               System Architecture & Status
             </h2>
-            <span className="status-pill healthy">Issues #3–#4 Baseline</span>
+            <span className="status-pill healthy">Issue #3 Baseline</span>
           </div>
 
           <div className="section-subtitle implemented">
-            <span>&bull;</span> Implemented and Verified
+            <span>&bull;</span> Implemented in Foundation Skeleton
           </div>
           <div className="info-list">
             <div className="info-item">
@@ -229,26 +229,19 @@ function App() {
                 <span className="badge-tag implemented">Active</span>
               </div>
             </div>
-            <div className="info-item">
-              <span className="info-icon" style={{ color: 'var(--accent-emerald)' }}>✓</span>
-              <div>
-                <strong>Scientific Data Contracts:</strong> Immutable experiment, observation, hypothesis, evaluation, and benchmark schemas with structured errors, a held-out/training leakage invariant, and a ground-truth denylist guard.
-                <span className="badge-tag implemented">Active</span>
-              </div>
-            </div>
-            <div className="info-item">
-              <span className="info-icon" style={{ color: 'var(--accent-emerald)' }}>✓</span>
-              <div>
-                <strong>Black-Box Oracle &amp; Isolated Evaluator:</strong> Deterministic local simulator with hidden coefficients and structured validation errors, plus a separate benchmark evaluator for Hit@K and MRR scoring.
-                <span className="badge-tag implemented">Active</span>
-              </div>
-            </div>
           </div>
 
           <div className="section-subtitle planned">
             <span>&bull;</span> Target Capabilities (Upcoming Issues)
           </div>
           <div className="info-list">
+            <div className="info-item">
+              <span className="info-icon" style={{ color: 'var(--accent-amber)' }}>⏳</span>
+              <div>
+                <strong>Trust Isolation:</strong> Complete structural separation between Oracle (black box), Discovery Engine, and Ground-Truth Evaluator.
+                <span className="badge-tag planned">Planned</span>
+              </div>
+            </div>
             <div className="info-item">
               <span className="info-icon" style={{ color: 'var(--accent-amber)' }}>⏳</span>
               <div>

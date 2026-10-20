@@ -223,6 +223,7 @@ Issue #4 type with optional fields; existing fields keep their meaning.
 
 Rules:
 - Missing optional metrics mean "not computed"; they are never serialized as zero error, perfect confidence, or a completed evaluation.
+- `parameters` and the metadata payloads are stored as immutable snapshots: mappings are read-only views and sequences become tuples. Mutating the caller's dict after construction cannot change the hypothesis, and in-place edits raise `TypeError`/`AttributeError`. `to_dict()` returns a fresh mutable plain-JSON copy. This is a data-integrity convention, not a security boundary.
 - `parameters`, `generation_metadata`, `fitting_metadata`, and `uncertainty_metadata` are checked by `verify_no_ground_truth_leakage()` at construction, so a candidate cannot carry `ground_truth*`, `secret_*`, `true_*`, `evaluator_only*`, or `oracle_internal*` keys.
 - `status` must be a `HypothesisStatus` member; raw strings are rejected.
 
@@ -273,6 +274,12 @@ Validation rules:
 - Unknown specification keys are rejected instead of silently dropped, so a specification cannot smuggle an expression or evaluator field.
 - No expression parser, `eval`, `exec`, dynamic import, or unsafe deserialization is used anywhere in this path.
 
+Extension point: validated models implement the model-neutral `ValidatedModel` interface
+(`to_specification`, `canonical_key`, `summarize`, `complexity`), and families only
+validate specifications and predict. A later non-polynomial family therefore never
+has to fit polynomial-specific method signatures, and the registry, generator, and
+consumers keep working unchanged.
+
 ### 4.3 Prediction interface
 
 `PolynomialFamily.predict(specification, input_values)` and
@@ -300,7 +307,7 @@ Validation rules:
 Algorithm:
 1. One deterministic baseline per degree in `[min_degree, max_degree]`: zero coefficients except the leading term (`c_degree = 1.0`); degree 0 uses `c0 = 0.0`. These are interpretable starting points, not fits.
 2. Seeded uniform draws until `candidate_count` unique candidates exist. Every draw is validated by the family; rejected or duplicate draws are skipped and consume attempt budget.
-3. If the attempt budget is exhausted, generation raises `CandidateGenerationError` with `CANDIDATE_SPACE_EXHAUSTED` instead of silently returning fewer candidates.
+3. If the attempt budget is exhausted, generation raises `CandidateGenerationError` with `ATTEMPT_BUDGET_EXHAUSTED` instead of silently returning fewer candidates. The error reports bounded-sampling failure with the requested count, generated count, attempts used, and attempt budget; it does not claim that the candidate space is finite or empty.
 
 Generated parameters are an **initialization policy**, not a fitted result.
 Generation makes no accuracy, confidence, or ranking claim and leaves `status`
@@ -330,7 +337,7 @@ not part of seed reproducibility.
 | `UNSUPPORTED_DEGREE` | Degree exceeds the family or configured maximum. |
 | `NON_FINITE_PREDICTION` | Computed prediction is NaN/infinity, including overflow. |
 | `INVALID_GENERATION_CONFIG` | Generation configuration is unusable. |
-| `CANDIDATE_SPACE_EXHAUSTED` | Requested unique candidates cannot be reached under the configured limits. |
+| `ATTEMPT_BUDGET_EXHAUSTED` | Bounded sampling used its attempt budget before reaching the requested count. Not proof that the candidate space is empty. |
 
 Failures raise `CandidateGenerationError` carrying the same `StructuredError`
 contract used by `OracleQueryError`, so API layers can serialize both consistently.

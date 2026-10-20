@@ -9,9 +9,11 @@ Defines schemas and domain objects for:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Union
 import uuid
 
@@ -310,29 +312,32 @@ class HypothesisRepresentation:
     zero error, perfect confidence, or a completed evaluation.
 
     `parameters`, `generation_metadata`, `fitting_metadata`, and
-    `uncertainty_metadata` are checked by verify_no_ground_truth_leakage(), so a
-    candidate cannot carry evaluator-only or hidden-oracle keys.
+    `uncertainty_metadata` are checked by verify_no_ground_truth_leakage() and
+    stored as immutable snapshots: nested dicts become read-only mappings and
+    sequences become tuples, so later mutation of the caller's objects cannot
+    change validated data and in-place edits raise. Use to_dict() for a mutable
+    plain-JSON copy. This is a data-integrity convention, not a security boundary.
     """
     model_family: str
     formula: str
-    parameters: Dict[str, Any]
+    parameters: Mapping[str, Any]
     hypothesis_id: str = field(default_factory=lambda: generate_id("hyp"))
     complexity: int = 1
     revision: int = 1
     created_at: str = field(default_factory=utc_now_iso)
     status: HypothesisStatus = HypothesisStatus.CANDIDATE
     provenance: Optional[HypothesisProvenance] = None
-    generation_metadata: Optional[Dict[str, Any]] = None
-    fitting_metadata: Optional[Dict[str, Any]] = None
-    uncertainty_metadata: Optional[Dict[str, Any]] = None
+    generation_metadata: Optional[Mapping[str, Any]] = None
+    fitting_metadata: Optional[Mapping[str, Any]] = None
+    uncertainty_metadata: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self):
         if not isinstance(self.model_family, str) or not self.model_family:
             raise ValueError("Hypothesis model_family must be a non-empty string.")
         if not isinstance(self.formula, str) or not self.formula:
             raise ValueError("Hypothesis formula (human-readable summary) must be a non-empty string.")
-        if not isinstance(self.parameters, dict):
-            raise ValueError("Hypothesis parameters must be a dictionary specification.")
+        if not isinstance(self.parameters, Mapping):
+            raise ValueError("Hypothesis parameters must be a mapping specification.")
         if not isinstance(self.status, HypothesisStatus):
             raise ValueError(
                 f"Hypothesis status must be a HypothesisStatus, got {type(self.status).__name__}."
@@ -348,12 +353,19 @@ class HypothesisRepresentation:
             if payload is not None:
                 verify_no_ground_truth_leakage(payload)
 
+        # Freeze after validation so the checked payload cannot drift afterwards.
+        object.__setattr__(self, "parameters", freeze_payload(self.parameters))
+        for field_name in ("generation_metadata", "fitting_metadata", "uncertainty_metadata"):
+            payload = getattr(self, field_name)
+            if payload is not None:
+                object.__setattr__(self, field_name, freeze_payload(payload))
+
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
             "hypothesis_id": self.hypothesis_id,
             "model_family": self.model_family,
             "formula": self.formula,
-            "parameters": self.parameters,
+            "parameters": thaw_payload(self.parameters),
             "complexity": self.complexity,
             "revision": self.revision,
             "created_at": self.created_at,
@@ -362,11 +374,11 @@ class HypothesisRepresentation:
         if self.provenance is not None:
             data["provenance"] = self.provenance.to_dict()
         if self.generation_metadata is not None:
-            data["generation_metadata"] = self.generation_metadata
+            data["generation_metadata"] = thaw_payload(self.generation_metadata)
         if self.fitting_metadata is not None:
-            data["fitting_metadata"] = self.fitting_metadata
+            data["fitting_metadata"] = thaw_payload(self.fitting_metadata)
         if self.uncertainty_metadata is not None:
-            data["uncertainty_metadata"] = self.uncertainty_metadata
+            data["uncertainty_metadata"] = thaw_payload(self.uncertainty_metadata)
         return data
 
     @classmethod
@@ -579,21 +591,55 @@ LEAKAGE_DENYLIST_PREFIXES = (
 )
 
 
-def verify_no_ground_truth_leakage(payload: Dict[str, Any]) -> None:
+def verify_no_ground_truth_leakage(payload: Mapping[str, Any]) -> None:
     """Recursively verify that no evaluator-only or ground-truth keys exist in payload.
-    
+
+    Accepts any mapping, including the read-only snapshots stored on hypotheses.
+
     Raises:
-      ValueError if any forbidden key is detected in the dictionary.
+      ValueError if any forbidden key is detected or a key is not a string.
     """
     for key, value in payload.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"Ground-truth leakage check requires string keys, got {type(key).__name__}."
+            )
         for prefix in LEAKAGE_DENYLIST_PREFIXES:
             if key.startswith(prefix):
                 raise ValueError(
                     f"Ground-truth leakage detected: key '{key}' is forbidden in discovery payloads."
                 )
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             verify_no_ground_truth_leakage(value)
-        elif isinstance(value, list):
+        elif isinstance(value, (list, tuple)):
             for item in value:
-                if isinstance(item, dict):
+                if isinstance(item, Mapping):
                     verify_no_ground_truth_leakage(item)
+
+
+def freeze_payload(payload: Any) -> Any:
+    """Recursively copy a JSON-like payload into an immutable snapshot.
+
+    Mappings become read-only ``MappingProxyType`` views and sequences become
+    tuples, so later mutation of the caller's dict/list cannot change stored
+    domain data and in-place edits of the snapshot fail immediately.
+
+    This is a data-integrity convention inside the domain model, not a security
+    boundary: it prevents accidental aliasing after validation runs.
+    """
+    if isinstance(payload, Mapping):
+        return MappingProxyType({key: freeze_payload(value) for key, value in payload.items()})
+    if isinstance(payload, (list, tuple)):
+        return tuple(freeze_payload(item) for item in payload)
+    return payload
+
+
+def thaw_payload(payload: Any) -> Any:
+    """Recursively convert a frozen snapshot back into plain dict/list values."""
+    if isinstance(payload, Mapping):
+        return {key: thaw_payload(value) for key, value in payload.items()}
+    if isinstance(payload, tuple):
+        return [thaw_payload(item) for item in payload]
+    if isinstance(payload, list):
+        return [thaw_payload(item) for item in payload]
+    return payload

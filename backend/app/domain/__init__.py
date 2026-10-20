@@ -24,9 +24,11 @@ from .hypothesis_models import (
     HARD_MAX_POLYNOMIAL_DEGREE,
     DEFAULT_MAX_POLYNOMIAL_DEGREE,
     POLYNOMIAL_FAMILY_ID,
+    HypothesisModelFamily,
     ModelFamilyRegistry,
     PolynomialFamily,
     PolynomialModel,
+    ValidatedModel,
     default_registry,
 )
 from .candidate_generator import (
@@ -60,6 +62,8 @@ __all__ = [
     "HARD_MAX_POLYNOMIAL_DEGREE",
     "PolynomialModel",
     "PolynomialFamily",
+    "ValidatedModel",
+    "HypothesisModelFamily",
     "ModelFamilyRegistry",
     "default_registry",
     "HypothesisGenerationConfig",

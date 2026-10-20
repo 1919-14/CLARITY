@@ -27,7 +27,7 @@ from .hypothesis_models import (
     HARD_MAX_POLYNOMIAL_DEGREE,
     POLYNOMIAL_FAMILY_ID,
     ModelFamilyRegistry,
-    PolynomialModel,
+    ValidatedModel,
     default_registry,
 )
 
@@ -40,7 +40,10 @@ DEFAULT_CANDIDATE_COUNT = 6
 MAX_CANDIDATE_COUNT = 64
 
 ERROR_INVALID_GENERATION_CONFIG = "INVALID_GENERATION_CONFIG"
-ERROR_CANDIDATE_SPACE_EXHAUSTED = "CANDIDATE_SPACE_EXHAUSTED"
+# Bounded sampling ran out of attempts. This is deliberately not named
+# "candidate space exhausted": reaching the attempt limit does not prove that no
+# further unique candidate exists.
+ERROR_ATTEMPT_BUDGET_EXHAUSTED = "ATTEMPT_BUDGET_EXHAUSTED"
 
 # Documented initialization labels recorded in generation_metadata.
 INITIALIZATION_BASELINE = "deterministic_monomial_baseline"
@@ -202,15 +205,16 @@ class CandidateGenerator:
                     details={"available_families": list(self._registry.family_ids())},
                 )
             )
-        if config.max_degree > family.max_degree:
+        family_max_degree = family.max_complexity - 1
+        if config.max_degree > family_max_degree:
             raise CandidateGenerationError(
                 StructuredError(
                     code=ERROR_UNSUPPORTED_DEGREE,
                     message=(
                         f"Configured max_degree {config.max_degree} exceeds the "
-                        f"'{family.family_id}' family maximum of {family.max_degree}."
+                        f"'{family.family_id}' family maximum of {family_max_degree}."
                     ),
-                    details={"max_degree": config.max_degree, "family_max_degree": family.max_degree},
+                    details={"max_degree": config.max_degree, "family_max_degree": family_max_degree},
                 )
             )
         self._family = family
@@ -243,16 +247,19 @@ class CandidateGenerator:
             if attempts >= attempt_budget:
                 raise CandidateGenerationError(
                     StructuredError(
-                        code=ERROR_CANDIDATE_SPACE_EXHAUSTED,
+                        code=ERROR_ATTEMPT_BUDGET_EXHAUSTED,
                         message=(
-                            f"Generated {len(candidates)} of {config.candidate_count} requested "
-                            f"unique candidates within {attempt_budget} attempts; the unique "
-                            "candidate space is exhausted under the configured limits."
+                            f"Attempt budget exhausted: generated {len(candidates)} of "
+                            f"{config.candidate_count} unique candidates after {attempts} of "
+                            f"{attempt_budget} attempts. Bounded sampling did not find another "
+                            "unique candidate; this does not prove the candidate space is "
+                            "finite or empty."
                         ),
                         details={
                             "requested": config.candidate_count,
                             "generated": len(candidates),
                             "attempts": attempts,
+                            "attempt_budget": attempt_budget,
                             "configuration": config.to_dict(),
                         },
                     )
@@ -304,16 +311,16 @@ class CandidateGenerator:
 
     def _build_hypothesis(
         self,
-        model: PolynomialModel,
+        model: ValidatedModel,
         initialization: str,
         sequence_index: int,
     ) -> HypothesisRepresentation:
         config = self._config
         return HypothesisRepresentation(
             model_family=self._family.family_id,
-            formula=self._family.summarize(model),
+            formula=model.summarize(),
             parameters=model.to_specification(),
-            complexity=self._family.complexity(model),
+            complexity=model.complexity(),
             status=HypothesisStatus.CANDIDATE,
             provenance=HypothesisProvenance(
                 origin=HypothesisOrigin.SYSTEM_GENERATED,

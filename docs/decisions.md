@@ -140,7 +140,7 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Status:** Confirmed (Issue #5)
 
-**Decision:** Candidate generation produces one deterministic monomial baseline per allowed degree plus seeded uniform coefficient draws until the requested unique count is reached. Candidates carry `status = candidate`, `system_generated` provenance, and generation metadata (generator, version, seed, configuration, initialization, sequence index). Duplicates are canonical-specification equality within one batch. An unreachable requested count raises `CANDIDATE_SPACE_EXHAUSTED`.
+**Decision:** Candidate generation produces one deterministic monomial baseline per allowed degree plus seeded uniform coefficient draws until the requested unique count is reached. Candidates carry `status = candidate`, `system_generated` provenance, and generation metadata (generator, version, seed, configuration, initialization, sequence index). Duplicates are canonical-specification equality within one batch. An unreachable requested count raises `ATTEMPT_BUDGET_EXHAUSTED`, which reports bounded-sampling failure rather than a proven empty candidate space.
 
 **Rationale:** Generated candidates need valid, explicit parameters to make predictions, but fitting belongs to Issue #6. Seeded initialization makes batches reproducible without implying fit quality.
 

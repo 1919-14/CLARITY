@@ -73,8 +73,33 @@ def _format_number(value: float) -> str:
     return repr(value)
 
 
+class ValidatedModel(ABC):
+    """Model-neutral contract for a validated specification.
+
+    Families produce models implementing this interface, so the registry, the
+    candidate generator, and downstream consumers can treat any family's model
+    uniformly without importing a family-specific class.
+    """
+
+    @abstractmethod
+    def to_specification(self) -> Dict[str, Any]:
+        """Canonical, JSON-serializable specification for this model."""
+
+    @abstractmethod
+    def canonical_key(self) -> str:
+        """Stable key for duplicate detection of canonical specifications."""
+
+    @abstractmethod
+    def summarize(self) -> str:
+        """Human-readable summary of this model."""
+
+    @abstractmethod
+    def complexity(self) -> int:
+        """Documented complexity measure for this model."""
+
+
 @dataclass(frozen=True)
-class PolynomialModel:
+class PolynomialModel(ValidatedModel):
     """Validated polynomial model: y = sum(coefficients[i] * x**i).
 
     ``coefficients`` always has ``degree + 1`` entries in ascending-power order.
@@ -108,36 +133,54 @@ class PolynomialModel:
         """
         return json.dumps(self.to_specification(), sort_keys=True, separators=(",", ":"))
 
+    def summarize(self) -> str:
+        terms = []
+        for index, coefficient in enumerate(self.coefficients):
+            magnitude = _format_number(abs(coefficient))
+            if index == 0:
+                term = magnitude
+            elif index == 1:
+                term = f"{magnitude}*{self.input_variable}"
+            else:
+                term = f"{magnitude}*{self.input_variable}^{index}"
+            if not terms:
+                terms.append(f"-{term}" if coefficient < 0 else term)
+            else:
+                terms.append(f"- {term}" if coefficient < 0 else f"+ {term}")
+        return f"{self.output_variable} = " + " ".join(terms)
+
+    def complexity(self) -> int:
+        """Complexity = number of free coefficients (degree + 1)."""
+        return self.degree + 1
+
 
 class HypothesisModelFamily(ABC):
-    """Interface every registered model family implements."""
+    """Interface every registered model family implements.
+
+    Families are model-neutral: they validate specifications into
+    ValidatedModel instances and predict from specifications. Summaries and
+    complexity live on the validated model, so a non-polynomial family never has
+    to fit into polynomial-shaped method signatures.
+    """
 
     family_id: str
 
     @property
     @abstractmethod
-    def max_degree(self) -> int:
-        """Maximum degree/complexity supported by this family instance."""
+    def max_complexity(self) -> int:
+        """Largest complexity score this family instance can produce."""
 
     @abstractmethod
     def parse_specification(
         self, specification: Mapping[str, Any]
-    ) -> Tuple[Optional[PolynomialModel], Optional[StructuredError]]:
-        """Validate a specification, returning a typed model or a structured error."""
+    ) -> Tuple[Optional[ValidatedModel], Optional[StructuredError]]:
+        """Validate a specification, returning a validated model or a structured error."""
 
     @abstractmethod
     def predict(
         self, specification: Mapping[str, Any], input_values: Mapping[str, Any]
     ) -> Tuple[Optional[Dict[str, Any]], Optional[StructuredError]]:
         """Predict outputs for input values using the specification."""
-
-    @abstractmethod
-    def summarize(self, model: PolynomialModel) -> str:
-        """Human-readable summary of a validated model."""
-
-    @abstractmethod
-    def complexity(self, model: PolynomialModel) -> int:
-        """Documented complexity measure for a validated model."""
 
     def validate_specification(self, specification: Mapping[str, Any]) -> Optional[StructuredError]:
         """Validate a specification; return None when valid."""
@@ -182,6 +225,10 @@ class PolynomialFamily(HypothesisModelFamily):
     @property
     def max_degree(self) -> int:
         return self._max_degree
+
+    @property
+    def max_complexity(self) -> int:
+        return self._max_degree + 1
 
     @property
     def input_variable(self) -> str:
@@ -445,26 +492,6 @@ class PolynomialFamily(HypothesisModelFamily):
 
         return {model.output_variable: y}, None
 
-    def summarize(self, model: PolynomialModel) -> str:
-        terms = []
-        for index, coefficient in enumerate(model.coefficients):
-            magnitude = _format_number(abs(coefficient))
-            if index == 0:
-                term = magnitude
-            elif index == 1:
-                term = f"{magnitude}*{model.input_variable}"
-            else:
-                term = f"{magnitude}*{model.input_variable}^{index}"
-            if not terms:
-                terms.append(f"-{term}" if coefficient < 0 else term)
-            else:
-                terms.append(f"- {term}" if coefficient < 0 else f"+ {term}")
-        return f"{model.output_variable} = " + " ".join(terms)
-
-    def complexity(self, model: PolynomialModel) -> int:
-        """Complexity = number of free coefficients (degree + 1)."""
-        return model.degree + 1
-
 
 class ModelFamilyRegistry:
     """Small registry mapping stable family identifiers to implementations."""
@@ -488,9 +515,14 @@ class ModelFamilyRegistry:
     def family_ids(self) -> Tuple[str, ...]:
         return tuple(sorted(self._families))
 
-    def parse_specification(
+    def _resolve_family(
         self, specification: Mapping[str, Any]
-    ) -> Tuple[Optional[PolynomialModel], Optional[StructuredError]]:
+    ) -> Tuple[Optional[HypothesisModelFamily], Optional[StructuredError]]:
+        """Resolve the family for a specification, returning structured errors only.
+
+        The family identifier is type-checked before any dict lookup, because an
+        unhashable value (list/dict) would otherwise raise a raw TypeError.
+        """
         if not isinstance(specification, Mapping):
             return None, StructuredError(
                 code=ERROR_INVALID_SPECIFICATION,
@@ -504,6 +536,15 @@ class ModelFamilyRegistry:
                 message="Model specification requires a 'family' identifier.",
                 details={"missing": ["family"]},
             )
+        if not isinstance(family_id, str) or not family_id:
+            return None, StructuredError(
+                code=ERROR_INVALID_PARAMETER_TYPE,
+                message=(
+                    "Model family identifier must be a non-empty string, got "
+                    f"{type(family_id).__name__}."
+                ),
+                details={"received_type": type(family_id).__name__},
+            )
         family = self.get(family_id)
         if family is None:
             return None, StructuredError(
@@ -511,6 +552,14 @@ class ModelFamilyRegistry:
                 message=f"Model family {family_id!r} is not registered.",
                 details={"family": family_id, "available_families": list(self.family_ids())},
             )
+        return family, None
+
+    def parse_specification(
+        self, specification: Mapping[str, Any]
+    ) -> Tuple[Optional[ValidatedModel], Optional[StructuredError]]:
+        family, error = self._resolve_family(specification)
+        if error is not None:
+            return None, error
         return family.parse_specification(specification)
 
     def validate_specification(self, specification: Mapping[str, Any]) -> Optional[StructuredError]:
@@ -519,19 +568,9 @@ class ModelFamilyRegistry:
     def predict(
         self, specification: Mapping[str, Any], input_values: Mapping[str, Any]
     ) -> Tuple[Optional[Dict[str, Any]], Optional[StructuredError]]:
-        family = (
-            self.get(specification.get("family")) if isinstance(specification, Mapping) else None
-        )
-        if family is None:
-            return None, StructuredError(
-                code=ERROR_UNKNOWN_MODEL_FAMILY,
-                message=(
-                    "Cannot predict: model family is missing or not registered."
-                    if not isinstance(specification, Mapping)
-                    else f"Model family {specification.get('family')!r} is not registered."
-                ),
-                details={"available_families": list(self.family_ids())},
-            )
+        family, error = self._resolve_family(specification)
+        if error is not None:
+            return None, error
         return family.predict(specification, input_values)
 
 
