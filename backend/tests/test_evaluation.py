@@ -990,3 +990,205 @@ def test_evaluate_many_still_isolates_when_overflow_candidate_present():
     assert results[0].status == EvaluationStatus.COMPLETED
     assert results[1].hypothesis_id == "hyp-b"
     assert results[1].status == EvaluationStatus.FAILED
+
+
+# ==============================================================================
+# P2 Regression Tests: Overflow at Fitting / Model Contract Boundary
+# (requested by PR reviewer: target fit_candidate directly,
+#  parse_specification directly, and EvaluationPipeline.evaluate() — not only
+#  evaluate_many())
+# ==============================================================================
+
+def _make_pipeline_and_obs(x_val, y_val, degree=1):
+    """Shared setup: one observation, one candidate, one request."""
+    obs = Observation(
+        observation_id="obs-ov0",
+        input_id="inp-ov0",
+        input_values={"x": x_val},
+        output_values={"y": y_val},
+        status=ObservationStatus.SUCCESS,
+        sequence_number=1,
+    )
+    cand = polynomial_candidate(degree=degree, hypothesis_id="hyp-ov")
+    request = make_request(cand, ["obs-ov0"])
+    return EvaluationPipeline(), {"obs-ov0": obs}, cand, request
+
+
+def test_fit_candidate_returns_failed_result_for_overflow_input():
+    """fit_candidate must return FittingResult.FAILED, not raise, on huge int input."""
+    from app.domain.fitting import FittingStatus
+    # Degree-1 needs >= 2 samples; include a normal sample so the fitter
+    # reaches _require_finite_sample before failing on INSUFFICIENT_OBSERVATIONS.
+    sample_overflow = ObservationSample(
+        observation_id="obs-x-overflow",
+        input_value=_HUGE_INT,   # 10**400 — raises OverflowError on float()
+        output_value=1.0,
+    )
+    sample_normal = ObservationSample(
+        observation_id="obs-x-normal",
+        input_value=1.0,
+        output_value=2.0,
+    )
+    cand = polynomial_candidate(degree=1, hypothesis_id="hyp-overflow-in")
+    result = fit_candidate(cand, [sample_overflow, sample_normal])
+    assert result.status == FittingStatus.FAILED, (
+        "fit_candidate must return FAILED when a training sample input overflows"
+    )
+    assert result.error is not None
+    assert result.error.code == ERROR_NON_FINITE_VALUE
+    assert "overflow" in result.error.details.get("reason", "").lower() or \
+           "overflow" in result.error.message.lower()
+
+
+def test_fit_candidate_returns_failed_result_for_overflow_output():
+    """fit_candidate must return FittingResult.FAILED, not raise, on huge int output."""
+    from app.domain.fitting import FittingStatus
+    # Degree-1 needs >= 2 samples; include a normal sample so the fitter
+    # reaches _require_finite_sample before failing on INSUFFICIENT_OBSERVATIONS.
+    sample_overflow = ObservationSample(
+        observation_id="obs-y-overflow",
+        input_value=1.0,
+        output_value=_HUGE_INT,  # 10**400 — raises OverflowError on float()
+    )
+    sample_normal = ObservationSample(
+        observation_id="obs-y-normal",
+        input_value=2.0,
+        output_value=3.0,
+    )
+    cand = polynomial_candidate(degree=1, hypothesis_id="hyp-overflow-out")
+    result = fit_candidate(cand, [sample_overflow, sample_normal])
+    assert result.status == FittingStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == ERROR_NON_FINITE_VALUE
+
+
+def test_parse_specification_returns_structured_error_for_overflow_coefficient():
+    """PolynomialFamily.parse_specification must return a structured error, not raise,
+    when a coefficient value is a Python integer too large for float (OverflowError)."""
+    from app.domain.hypothesis_models import PolynomialFamily
+    family = PolynomialFamily()
+    spec = {
+        "family": POLYNOMIAL_FAMILY_ID,
+        "degree": 1,
+        "coefficient_order": "ascending",
+        "coefficients": {"c0": 0.0, "c1": _HUGE_INT},
+        "input_variable": "x",
+        "output_variable": "y",
+    }
+    model, error = family.parse_specification(spec)
+    assert model is None, "parse_specification must not return a model when a coefficient overflows"
+    assert error is not None
+    assert error.code == ERROR_NON_FINITE_VALUE
+    assert "overflow" in error.details.get("reason", "").lower() or \
+           "overflow" in error.message.lower()
+
+
+def test_evaluate_returns_failed_result_for_overflow_input_not_only_evaluate_many():
+    """EvaluationPipeline.evaluate() (single call) must return FAILED, not raise,
+    when a training observation has an overflow input value."""
+    pipeline, obs, _, request = _make_pipeline_and_obs(x_val=_HUGE_INT, y_val=1.0)
+    result = pipeline.evaluate(request, obs)
+    assert result.status == EvaluationStatus.FAILED, (
+        "evaluate() must return FAILED, not raise, on overflow input"
+    )
+    assert result.error is not None
+
+
+def test_evaluate_returns_failed_result_for_overflow_coefficient():
+    """EvaluationPipeline.evaluate() must return FAILED, not raise,
+    when the candidate specification contains an overflow coefficient."""
+    obs = success_observation("obs-c0", 1.0, truth(1.0))
+    overflow_spec = {
+        "family": POLYNOMIAL_FAMILY_ID,
+        "degree": 1,
+        "coefficient_order": "ascending",
+        "coefficients": {"c0": 0.0, "c1": _HUGE_INT},
+        "input_variable": "x",
+        "output_variable": "y",
+    }
+    cand = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = <overflow>*x",
+        parameters=overflow_spec,
+        complexity=2,
+        hypothesis_id="hyp-overflow-coeff",
+    )
+    request = make_request(cand, ["obs-c0"])
+    pipeline = EvaluationPipeline()
+    result = pipeline.evaluate(request, {"obs-c0": obs})
+    assert result.status == EvaluationStatus.FAILED, (
+        "evaluate() must return FAILED, not raise, when the specification contains an overflow coefficient"
+    )
+    assert result.error is not None
+
+
+# ==============================================================================
+# P2 Contract Tests: EvaluationResult contradictory completion state guards
+# ==============================================================================
+
+def test_evaluation_result_rejects_completed_with_failed_fitting_status():
+    """EvaluationResult must reject status=COMPLETED combined with fitting_status=FAILED."""
+    import pytest
+    from app.domain.contracts import EvaluationResult, EvaluationStatus, FittingStatus
+    with pytest.raises(ValueError, match="FAILED fitting_status"):
+        EvaluationResult(
+            hypothesis_id="hyp-contract-1",
+            status=EvaluationStatus.COMPLETED,
+            fitting_status=FittingStatus.FAILED,
+            # No error — allowed for COMPLETED but contradictory with FAILED fitting
+        )
+
+
+def test_evaluation_result_rejects_completed_success_without_fitted_specification():
+    """EvaluationResult must reject status=COMPLETED + fitting_status=SUCCESS
+    when fitted_specification is absent."""
+    import pytest
+    from app.domain.contracts import EvaluationResult, EvaluationStatus, FittingStatus
+    with pytest.raises(ValueError, match="fitted_specification"):
+        EvaluationResult(
+            hypothesis_id="hyp-contract-2",
+            status=EvaluationStatus.COMPLETED,
+            fitting_status=FittingStatus.SUCCESS,
+            fitted_specification=None,  # Missing — must be rejected
+        )
+
+
+def test_evaluation_result_allows_completed_success_with_fitted_specification():
+    """EvaluationResult must accept status=COMPLETED + fitting_status=SUCCESS
+    when fitted_specification is present."""
+    from app.domain.contracts import EvaluationResult, EvaluationStatus, FittingStatus
+    spec = {"family": POLYNOMIAL_FAMILY_ID, "degree": 0, "coefficients": {"c0": 1.0}}
+    result = EvaluationResult(
+        hypothesis_id="hyp-contract-3",
+        status=EvaluationStatus.COMPLETED,
+        fitting_status=FittingStatus.SUCCESS,
+        fitted_specification=spec,
+    )
+    assert result.status == EvaluationStatus.COMPLETED
+    assert result.fitting_status == FittingStatus.SUCCESS
+
+
+def test_evaluation_result_allows_failed_with_no_fitting_status():
+    """EvaluationResult must accept status=FAILED without fitting_status
+    (legacy/generic use — no fitting metadata)."""
+    from app.domain.contracts import EvaluationResult, EvaluationStatus
+    result = EvaluationResult(
+        hypothesis_id="hyp-contract-4",
+        status=EvaluationStatus.FAILED,
+        error=StructuredError(code="SOME_ERROR", message="something failed"),
+    )
+    assert result.status == EvaluationStatus.FAILED
+    assert result.fitting_status is None
+
+
+def test_evaluation_result_allows_completed_without_fitting_status():
+    """EvaluationResult must accept status=COMPLETED without fitting_status
+    (generic/legacy use — no contract violation when fitting_status is absent)."""
+    from app.domain.contracts import EvaluationResult, EvaluationStatus
+    result = EvaluationResult(
+        hypothesis_id="hyp-contract-5",
+        status=EvaluationStatus.COMPLETED,
+        # No fitting_status — guards must not fire
+    )
+    assert result.status == EvaluationStatus.COMPLETED
+    assert result.fitting_status is None

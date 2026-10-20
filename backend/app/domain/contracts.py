@@ -514,6 +514,28 @@ class EvaluationResult:
                 "EvaluationResult fitting_status must be a FittingStatus, "
                 f"got {type(self.fitting_status).__name__}."
             )
+        # Guard against contradictory pipeline-result combinations.
+        # These checks apply only when fitting_status is explicitly set
+        # (i.e. the result came from the evaluation pipeline, not a
+        # legacy/generic construction without fitting metadata).
+        if self.fitting_status is not None:
+            if (
+                self.status == EvaluationStatus.COMPLETED
+                and self.fitting_status == FittingStatus.FAILED
+            ):
+                raise ValueError(
+                    "EvaluationResult cannot be COMPLETED with a FAILED fitting_status; "
+                    "a failed fit must produce a FAILED evaluation status."
+                )
+            if (
+                self.status == EvaluationStatus.COMPLETED
+                and self.fitting_status == FittingStatus.SUCCESS
+                and self.fitted_specification is None
+            ):
+                raise ValueError(
+                    "EvaluationResult with status=COMPLETED and fitting_status=SUCCESS "
+                    "must include a fitted_specification."
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {

@@ -443,7 +443,17 @@ class PolynomialFamily(HypothesisModelFamily):
                     ),
                     details={"coefficient": f"c{index}", "received_type": type(value).__name__},
                 )
-            number = float(value)
+            try:
+                number = float(value)
+            except OverflowError:
+                return None, StructuredError(
+                    code=ERROR_NON_FINITE_VALUE,
+                    message=(
+                        f"Coefficient c{index} is too large to represent as a float "
+                        "(OverflowError)."
+                    ),
+                    details={"coefficient": f"c{index}", "reason": "overflow"},
+                )
             if not math.isfinite(number):
                 return None, StructuredError(
                     code=ERROR_NON_FINITE_VALUE,

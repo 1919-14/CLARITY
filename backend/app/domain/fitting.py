@@ -212,7 +212,21 @@ def _require_finite_sample(sample: ObservationSample) -> None:
                     details={"observation_id": sample.observation_id, "field": field_name},
                 )
             )
-        if not math.isfinite(float(value)):
+        try:
+            as_float = float(value)
+        except OverflowError:
+            raise _FittingFailure(
+                StructuredError(
+                    code=ERROR_NON_FINITE_VALUE,
+                    message=(
+                        f"Training sample {sample.observation_id!r} {field_name} is too "
+                        "large to represent as a float (OverflowError)."
+                    ),
+                    details={"observation_id": sample.observation_id, "field": field_name,
+                              "reason": "overflow"},
+                )
+            )
+        if not math.isfinite(as_float):
             raise _FittingFailure(
                 StructuredError(
                     code=ERROR_NON_FINITE_VALUE,
