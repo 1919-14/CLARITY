@@ -18,6 +18,13 @@ class DatabaseManager:
     """Manages SQLAlchemy engine lifecycle and session factories."""
 
     def __init__(self, database_uri: str, echo: bool = False):
+        env = os.environ.get("FLASK_ENV", os.environ.get("ENV", "development")).lower()
+        if env == "production" and database_uri.startswith("sqlite"):
+            raise ValueError(
+                "SQLite database URI cannot be used in production environment. "
+                "A production database (e.g., MySQL) URL must be configured."
+            )
+
         self.database_uri = database_uri
         self.echo = echo
 
@@ -98,25 +105,28 @@ def reset_db_manager() -> None:
 def get_db_manager(database_uri: str = None) -> DatabaseManager:
     """Retrieve or initialize the global DatabaseManager instance.
     
-    Fails fast in production if a valid non-SQLite database URI is not provided.
+    Resolves URI first, then strictly forbids SQLite or missing configuration in production.
     """
     global _db_manager
     if _db_manager is None:
+        env = os.environ.get("FLASK_ENV", os.environ.get("ENV", "development")).lower()
         if database_uri is None:
-            env = os.environ.get("FLASK_ENV", os.environ.get("ENV", "development")).lower()
             database_uri = os.environ.get("DATABASE_URL")
-            if not database_uri:
-                if env == "production":
-                    raise ValueError(
-                        "DATABASE_URL must be explicitly configured in production environment. "
-                        "Silent fallback to SQLite is prohibited in production."
-                    )
-                database_uri = "sqlite:///clarity_dev.db"
-            elif env == "production" and database_uri.startswith("sqlite"):
+
+        if not database_uri:
+            if env == "production":
                 raise ValueError(
-                    "SQLite database URI cannot be used in production environment. "
-                    "A production database (e.g., MySQL) URL must be configured."
+                    "DATABASE_URL must be explicitly configured in production environment. "
+                    "Silent fallback to SQLite is prohibited in production."
                 )
+            database_uri = "sqlite:///clarity_dev.db"
+
+        if env == "production" and database_uri.startswith("sqlite"):
+            raise ValueError(
+                "SQLite database URI cannot be used in production environment. "
+                "A production database (e.g., MySQL) URL must be configured."
+            )
+
         _db_manager = DatabaseManager(database_uri)
     return _db_manager
 

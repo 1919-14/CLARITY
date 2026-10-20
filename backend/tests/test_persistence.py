@@ -522,3 +522,89 @@ def test_alembic_config_escapes_url_encoded_credentials(monkeypatch):
     cfg.set_main_option("sqlalchemy.url", env_db_url.replace("%", "%%"))
     retrieved_url = cfg.get_main_option("sqlalchemy.url")
     assert retrieved_url == encoded_url
+
+
+def test_production_environment_rejects_explicit_sqlite_uri(monkeypatch):
+    """Verify production mode rejects an explicitly passed SQLite URI across all entry points (Follow-up Finding 1)."""
+    from app.adapters.persistence.database import (
+        DatabaseManager,
+        get_db_manager,
+        init_db,
+        reset_db_manager,
+    )
+
+    reset_db_manager()
+    monkeypatch.setenv("FLASK_ENV", "production")
+
+    # 1. get_db_manager with explicit SQLite argument
+    with pytest.raises(ValueError, match="SQLite database URI cannot be used in production"):
+        get_db_manager("sqlite:///clarity_prod.db")
+
+    # 2. init_db with explicit SQLite argument
+    reset_db_manager()
+    with pytest.raises(ValueError, match="SQLite database URI cannot be used in production"):
+        init_db("sqlite:///clarity_prod.db")
+
+    # 3. DatabaseManager direct constructor with SQLite argument
+    with pytest.raises(ValueError, match="SQLite database URI cannot be used in production"):
+        DatabaseManager("sqlite:///clarity_prod.db")
+
+    reset_db_manager()
+
+
+def test_alembic_migrations_upgrade_and_downgrade_smoke(tmp_path):
+    """Verify that Alembic migrations successfully apply, roll back, and re-apply cleanly (Follow-up Finding 2)."""
+    import sqlite3
+    from alembic import command
+    from alembic.config import Config
+
+    db_file = tmp_path / "smoke_migration.db"
+    db_url = f"sqlite:///{db_file}"
+
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", db_url)
+
+    # 1. Upgrade to head
+    command.upgrade(cfg, "head")
+
+    # Verify tables were created in the SQLite database
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = {row[0] for row in cursor.fetchall()}
+    conn.close()
+
+    expected_tables = {
+        "runs",
+        "hypotheses",
+        "hypothesis_revisions",
+        "observations",
+        "candidate_experiments",
+        "evaluation_results",
+        "compute_tasks",
+        "usage_records",
+        "audit_events",
+        "benchmark_results",
+        "reports",
+        "alembic_version",
+    }
+    assert expected_tables.issubset(tables)
+
+    # 2. Downgrade to base
+    command.downgrade(cfg, "base")
+
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'alembic_version';")
+    downgraded_tables = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    assert len(downgraded_tables) == 0
+
+    # 3. Re-upgrade to head
+    command.upgrade(cfg, "head")
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    recreated_tables = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    assert expected_tables.issubset(recreated_tables)
