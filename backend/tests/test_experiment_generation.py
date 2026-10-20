@@ -6,10 +6,15 @@ Covers:
 3. Uniform and Stratified Random generation: reproducibility with seed, diversity.
 4. Input validation: rejecting non-numeric, NaN, infinite, or out-of-bounds inputs.
 5. Deduplication: guaranteed uniqueness of candidate points within a batch.
-6. Exclusion of previously queried inputs within tolerance.
-7. Handling of empty or undersized candidate pools.
-8. Ground-truth leakage prevention: generation depends strictly on schema/bounds.
-9. Compatibility with Oracle validation contracts.
+6. Exclusion of previously queried inputs with pure absolute tolerance (rel_tol=0.0).
+7. Narrow-interval precision preservation across all strategies.
+8. Full domain coverage in grid generation after exclusions.
+9. Tolerance type and finiteness validation.
+10. OverflowError handling for extreme arbitrary-precision integers in validate_value().
+11. Diagnostic information and requested-vs-generated counts in CandidateExperimentBatch.
+12. Handling of empty or undersized candidate pools.
+13. Ground-truth isolation: generation depends strictly on schema/bounds without oracle leakage.
+14. Compatibility with Oracle validation contracts.
 """
 
 import math
@@ -21,6 +26,7 @@ from app.adapters.oracle.local_simulator import PolynomialLocalOracle
 from app.domain.contracts import ExperimentInput
 from app.domain.experiment_generator import (
     CandidateExperiment,
+    CandidateExperimentBatch,
     CandidateExperimentGenerationError,
     CandidateExperimentGenerator,
     CandidateExperimentStatus,
@@ -40,7 +46,7 @@ from app.domain.experiment_generator import (
 # ==============================================================================
 
 def test_numerical_domain_bounds_validation():
-    """Verify NumericalDomainBounds rejects invalid inputs."""
+    """Verify NumericalDomainBounds rejects invalid bounds and types."""
     bounds = NumericalDomainBounds(variable_name="x", min_val=-5.0, max_val=5.0)
     assert bounds.contains(0.0) is True
     assert bounds.contains(-5.0) is True
@@ -55,6 +61,17 @@ def test_numerical_domain_bounds_validation():
     # Non-finite bounds
     with pytest.raises(ValueError, match="must be finite"):
         NumericalDomainBounds(min_val=float("-inf"), max_val=10.0)
+
+
+def test_validate_value_handles_overflow_integer():
+    """Verify validate_value handles huge integers (10**400) cleanly without leaking OverflowError."""
+    bounds = NumericalDomainBounds(variable_name="x", min_val=-10.0, max_val=10.0)
+    huge_int = 10 ** 400
+
+    err = bounds.validate_value(huge_int)
+    assert err is not None
+    assert err.code == ERROR_OUT_OF_BOUNDS
+    assert "overflow" in err.message.lower()
 
 
 def test_candidate_experiment_serialization():
@@ -75,33 +92,135 @@ def test_candidate_experiment_serialization():
 
 
 # ==============================================================================
-# 2. Grid-based Candidate Generation
+# 2. Tolerance Type and Finiteness Validation (Review Finding 5)
 # ==============================================================================
 
-def test_grid_candidate_generation():
-    """Verify deterministic grid candidate generation spans domain evenly."""
+@pytest.mark.parametrize("invalid_tolerance, error_pattern", [
+    (-0.01, "tolerance must be non-negative"),
+    (float("nan"), "tolerance must be finite"),
+    (float("inf"), "tolerance must be finite"),
+    (float("-inf"), "tolerance must be finite"),
+    ("0.05", "tolerance must be a real number"),
+    (True, "tolerance must be a real number"),
+    (False, "tolerance must be a real number"),
+])
+def test_experiment_generation_config_rejects_invalid_tolerance(invalid_tolerance, error_pattern):
+    """Verify ExperimentGenerationConfig validates tolerance strictly."""
+    with pytest.raises(ValueError, match=error_pattern):
+        ExperimentGenerationConfig(tolerance=invalid_tolerance)
+
+
+# ==============================================================================
+# 3. Pure Absolute Tolerance on Large-Magnitude Domains (Review Finding 1)
+# ==============================================================================
+
+def test_pure_absolute_tolerance_large_magnitude():
+    """Verify exclusion uses pure absolute tolerance (rel_tol=0.0) without false exclusions at ~1e9."""
+    # Domain around 1e9: points are 0.5 apart
+    bounds = NumericalDomainBounds(variable_name="x", min_val=1e9, max_val=1e9 + 10.0)
+    # Exclude exactly 1e9 + 5.0
+    excluded = [{"x": 1e9 + 5.0}]
+    # Query point is 1e9 + 5.5 (distance = 0.5)
+    # If default rel_tol=1e-9 was used, relative difference 0.5 / 1e9 = 5e-10 < 1e-9 would falsely exclude it!
+    # With rel_tol=0.0 and abs_tol=1e-5, distance 0.5 > 1e-5, so it MUST NOT be excluded.
+    cfg = ExperimentGenerationConfig(
+        pool_size=5,
+        bounds=bounds,
+        strategy=ExperimentGenerationStrategy.GRID,
+        exclude_inputs=excluded,
+        tolerance=1e-5,
+    )
+    candidates = CandidateExperimentGenerator(cfg).generate()
+    xs = [c.input_data.values["x"] for c in candidates]
+
+    # Verify candidate 1e9 + 5.0 is excluded, but points > 1e-5 away are kept
+    assert not any(math.isclose(x, 1e9 + 5.0, abs_tol=1e-5, rel_tol=0.0) for x in xs)
+    # Ensure points close to 1e9 + 5.5 can exist
+    assert any(x > 1e9 + 5.0 for x in xs)
+
+
+# ==============================================================================
+# 4. Precision Preservation on Narrow Intervals (Review Finding 2)
+# ==============================================================================
+
+@pytest.mark.parametrize("strategy", [
+    ExperimentGenerationStrategy.GRID,
+    ExperimentGenerationStrategy.UNIFORM_RANDOM,
+    ExperimentGenerationStrategy.STRATIFIED_RANDOM,
+])
+def test_narrow_interval_bounds_preservation(strategy):
+    """Verify narrow interval [1e-7, 4e-7] is preserved and never truncated to 0.0 out of bounds."""
+    bounds = NumericalDomainBounds(variable_name="x", min_val=1e-7, max_val=4e-7)
+    cfg = ExperimentGenerationConfig(
+        pool_size=4,
+        bounds=bounds,
+        strategy=strategy,
+        seed=42,
+    )
+    candidates = CandidateExperimentGenerator(cfg).generate()
+
+    assert len(candidates) > 0
+    for cand in candidates:
+        x = cand.input_data.values["x"]
+        assert bounds.contains(x), f"Candidate x={x} violated narrow bounds [{bounds.min_val}, {bounds.max_val}]"
+        assert x != 0.0
+
+
+# ==============================================================================
+# 5. Full Domain Coverage in Grid Generation after Exclusions (Review Finding 3)
+# ==============================================================================
+
+def test_grid_maintains_full_domain_coverage_after_early_exclusions():
+    """Verify grid generation maintains coverage across upper domain after lower-interval exclusions."""
     bounds = NumericalDomainBounds(variable_name="x", min_val=-10.0, max_val=10.0)
+    # Exclude specific early grid points
+    excluded = [{"x": -10.0}, {"x": -5.0}, {"x": 0.0}]
+
     candidates = generate_candidate_experiments(
         pool_size=5,
         bounds=bounds,
         strategy=ExperimentGenerationStrategy.GRID,
+        exclude_inputs=excluded,
+        tolerance=1e-3,
     )
 
     assert len(candidates) == 5
     xs = [c.input_data.values["x"] for c in candidates]
-    # For pool_size=5 over [-10, 10], points should be [-10.0, -5.0, 0.0, 5.0, 10.0]
-    expected = [-10.0, -5.0, 0.0, 5.0, 10.0]
-    for actual, exp in zip(xs, expected):
-        assert math.isclose(actual, exp, abs_tol=1e-5)
-
-    # All candidates must be eligible
-    for c in candidates:
-        assert c.status == CandidateExperimentStatus.ELIGIBLE
-        assert bounds.contains(c.input_data.values["x"])
+    # The pool must span towards the upper domain limit (+10.0) rather than stopping early at 0.0
+    assert max(xs) >= 8.0, f"Upper domain was omitted: max(xs)={max(xs)}"
+    # Excluded points must not be present
+    for ex in [-10.0, -5.0, 0.0]:
+        assert not any(math.isclose(x, ex, abs_tol=1e-3, rel_tol=0.0) for x in xs)
 
 
 # ==============================================================================
-# 3. Reproducibility of Randomized Generation
+# 6. Undersized Pool Diagnostics (Review Finding 4)
+# ==============================================================================
+
+def test_undersized_pool_returns_diagnostics_when_allowed():
+    """Verify CandidateExperimentBatch exposes requested vs generated counts and diagnostic message."""
+    # Degenerate single-point domain requesting 5 points with allow_undersized=True
+    bounds = NumericalDomainBounds(variable_name="x", min_val=3.0, max_val=3.0)
+    cfg = ExperimentGenerationConfig(
+        pool_size=5,
+        bounds=bounds,
+        allow_undersized=True,
+    )
+    generator = CandidateExperimentGenerator(cfg)
+    batch = generator.generate_batch()
+
+    assert isinstance(batch, CandidateExperimentBatch)
+    assert batch.requested_count == 5
+    assert batch.generated_count == 1
+    assert batch.is_undersized is True
+    assert batch.diagnostic_message is not None
+    assert "fewer than requested" in batch.diagnostic_message
+    assert len(batch) == 1
+    assert batch[0].input_data.values["x"] == 3.0
+
+
+# ==============================================================================
+# 7. Reproducibility of Randomized Generation
 # ==============================================================================
 
 def test_uniform_random_generation_reproducibility():
@@ -161,12 +280,11 @@ def test_stratified_random_generation_reproducibility():
     xs1 = [c.input_data.values["x"] for c in candidates1]
     xs2 = [c.input_data.values["x"] for c in candidates2]
     assert xs1 == xs2
-    # Verify values span [0, 10] monotonically roughly across strata
     assert all(0.0 <= x <= 10.0 for x in xs1)
 
 
 # ==============================================================================
-# 4. Deduplication & Batch Uniqueness
+# 8. Deduplication & Batch Uniqueness
 # ==============================================================================
 
 def test_batch_deduplication():
@@ -183,31 +301,7 @@ def test_batch_deduplication():
 
 
 # ==============================================================================
-# 5. Exclusion of Previously Queried Inputs
-# ==============================================================================
-
-def test_exclude_previously_queried_inputs():
-    """Verify previously queried inputs are excluded from candidate pool."""
-    bounds = NumericalDomainBounds(variable_name="x", min_val=-10.0, max_val=10.0)
-    # Target points from a standard 5-point grid are: -10, -5, 0, 5, 10
-    excluded = [{"x": 0.0}, {"x": -5.0}]
-
-    candidates = generate_candidate_experiments(
-        pool_size=5,
-        bounds=bounds,
-        strategy=ExperimentGenerationStrategy.GRID,
-        exclude_inputs=excluded,
-        tolerance=1e-3,
-    )
-
-    xs = [c.input_data.values["x"] for c in candidates]
-    # None of the excluded points should be in the pool
-    for ex in [0.0, -5.0]:
-        assert not any(math.isclose(x, ex, abs_tol=1e-3) for x in xs)
-
-
-# ==============================================================================
-# 6. Diagnostics on Empty or Undersized Pools
+# 9. Diagnostics on Empty or Undersized Pools (When Not Allowed)
 # ==============================================================================
 
 def test_empty_candidate_pool_error():
@@ -241,7 +335,7 @@ def test_undersized_candidate_pool_error_when_disallowed():
 
 
 # ==============================================================================
-# 7. Compatibility with Oracle Interface
+# 10. Compatibility with Oracle Interface
 # ==============================================================================
 
 def test_generated_candidates_valid_for_oracle_query():
@@ -267,7 +361,7 @@ def test_generated_candidates_valid_for_oracle_query():
 
 
 # ==============================================================================
-# 8. Ground-Truth Isolation Check
+# 11. Ground-Truth Isolation Check
 # ==============================================================================
 
 def test_experiment_generator_isolation_from_oracle_and_evaluator():

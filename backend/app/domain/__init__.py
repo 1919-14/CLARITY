@@ -40,6 +40,7 @@ from .candidate_generator import (
 from .experiment_generator import (
     CandidateExperiment,
     CandidateExperimentStatus,
+    CandidateExperimentBatch,
     ExperimentGenerationStrategy,
     NumericalDomainBounds,
     ExperimentGenerationConfig,
@@ -82,6 +83,7 @@ __all__ = [
     "generate_candidates",
     "CandidateExperiment",
     "CandidateExperimentStatus",
+    "CandidateExperimentBatch",
     "ExperimentGenerationStrategy",
     "NumericalDomainBounds",
     "ExperimentGenerationConfig",
