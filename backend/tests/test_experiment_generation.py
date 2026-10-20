@@ -365,7 +365,15 @@ def test_generated_candidates_valid_for_oracle_query():
 # ==============================================================================
 
 def test_experiment_generator_isolation_from_oracle_and_evaluator():
-    """Subprocess test asserting experiment_generator imports no oracle or evaluator modules."""
+    """Subprocess test asserting experiment_generator imports no oracle or evaluator modules.
+
+    The subprocess is run from the backend/ directory so that `app` is on the
+    Python path without requiring an installed package.
+    """
+    import pathlib
+
+    backend_dir = pathlib.Path(__file__).parent.parent
+
     script = """
 import sys
 from app.domain import experiment_generator
@@ -383,6 +391,7 @@ print("ISOLATED_OK")
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
+        cwd=str(backend_dir),
     )
     assert result.returncode == 0, f"Isolation violated: {result.stdout} {result.stderr}"
     assert "ISOLATED_OK" in result.stdout
