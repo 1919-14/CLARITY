@@ -78,7 +78,16 @@ class NumericalDomainBounds:
             raise ValueError("min_val must be a real number.")
         if not isinstance(self.max_val, (int, float)) or isinstance(self.max_val, bool):
             raise ValueError("max_val must be a real number.")
-        if not math.isfinite(self.min_val) or not math.isfinite(self.max_val):
+        # Safely coerce to float before finiteness check; arbitrary-precision integers
+        # such as 10**400 raise OverflowError on float() rather than returning inf.
+        try:
+            min_f = float(self.min_val)
+            max_f = float(self.max_val)
+        except OverflowError:
+            raise ValueError(
+                "Domain bounds must be finite; value overflows standard float representation."
+            )
+        if not math.isfinite(min_f) or not math.isfinite(max_f):
             raise ValueError("Domain bounds must be finite.")
         if self.min_val > self.max_val:
             raise ValueError(f"min_val ({self.min_val}) cannot exceed max_val ({self.max_val}).")
@@ -424,6 +433,11 @@ class CandidateExperimentGenerator:
         # Select n evenly spaced samples across the entire eligible array to maintain global coverage
         if len(eligible_pts) <= n:
             selected_pts = eligible_pts
+        elif n == 1:
+            # Special case: choose the single representative point at the midpoint of the
+            # eligible range to avoid division by zero in the general formula (n-1 == 0).
+            mid_idx = len(eligible_pts) // 2
+            selected_pts = [eligible_pts[mid_idx]]
         else:
             # Subsample evenly from beginning to end of eligible_pts
             indices = [int(round(i * (len(eligible_pts) - 1) / (n - 1))) for i in range(n)]
@@ -534,7 +548,12 @@ def generate_candidate_experiments(
     allow_undersized: bool = True,
     precision_digits: Optional[int] = None,
 ) -> List[CandidateExperiment]:
-    """Functional convenience entrypoint to generate candidate experiments."""
+    """Functional convenience entry point returning a list of candidate experiments.
+
+    For access to undersized-pool diagnostics (``is_undersized``, ``diagnostic_message``,
+    ``requested_count``, ``generated_count``), use :func:`generate_batch_candidate_experiments`
+    instead.
+    """
     cfg = ExperimentGenerationConfig(
         pool_size=pool_size,
         bounds=bounds or NumericalDomainBounds(),
@@ -547,3 +566,38 @@ def generate_candidate_experiments(
     )
     generator = CandidateExperimentGenerator(cfg)
     return generator.generate()
+
+
+def generate_batch_candidate_experiments(
+    pool_size: int = DEFAULT_EXPERIMENT_POOL_SIZE,
+    bounds: Optional[NumericalDomainBounds] = None,
+    strategy: ExperimentGenerationStrategy = ExperimentGenerationStrategy.GRID,
+    seed: Optional[int] = None,
+    exclude_inputs: Optional[Sequence[Dict[str, Any]]] = None,
+    tolerance: float = 1e-5,
+    allow_undersized: bool = True,
+    precision_digits: Optional[int] = None,
+) -> CandidateExperimentBatch:
+    """Functional convenience entry point returning a :class:`CandidateExperimentBatch`.
+
+    Unlike :func:`generate_candidate_experiments`, this function surfaces pool diagnostics:
+
+    - ``batch.is_undersized`` — ``True`` when fewer candidates than ``pool_size`` were produced.
+    - ``batch.diagnostic_message`` — human-readable explanation of the shortfall.
+    - ``batch.requested_count`` / ``batch.generated_count`` — exact counts.
+
+    The returned batch is iterable and indexable, so callers that only need the list can
+    pass it directly to any sequence consumer or use ``list(batch)``.
+    """
+    cfg = ExperimentGenerationConfig(
+        pool_size=pool_size,
+        bounds=bounds or NumericalDomainBounds(),
+        strategy=strategy,
+        seed=seed,
+        exclude_inputs=exclude_inputs or [],
+        tolerance=tolerance,
+        allow_undersized=allow_undersized,
+        precision_digits=precision_digits,
+    )
+    generator = CandidateExperimentGenerator(cfg)
+    return generator.generate_batch()

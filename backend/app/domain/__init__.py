@@ -48,6 +48,7 @@ from .experiment_generator import (
     CandidateExperimentGenerationError,
     CandidateExperimentGenerator,
     generate_candidate_experiments,
+    generate_batch_candidate_experiments,
 )
 from .fitting import (
     FITTING_METHOD_LEAST_SQUARES,
@@ -113,6 +114,7 @@ __all__ = [
     "CandidateExperimentGenerationError",
     "CandidateExperimentGenerator",
     "generate_candidate_experiments",
+    "generate_batch_candidate_experiments",
     "FITTING_METHOD_LEAST_SQUARES",
     "ObservationSample",
     "FittingConfig",

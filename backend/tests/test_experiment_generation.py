@@ -38,6 +38,7 @@ from app.domain.experiment_generator import (
     ExperimentGenerationStrategy,
     NumericalDomainBounds,
     generate_candidate_experiments,
+    generate_batch_candidate_experiments,
 )
 
 
@@ -395,3 +396,78 @@ print("ISOLATED_OK")
     )
     assert result.returncode == 0, f"Isolation violated: {result.stdout} {result.stderr}"
     assert "ISOLATED_OK" in result.stdout
+
+
+# ==============================================================================
+# 12. Regression: pool_size=1 grid does not crash  [P2]
+# ==============================================================================
+
+def test_grid_pool_size_1_does_not_crash():
+    """Grid generation with pool_size=1 and a non-degenerate domain must not raise
+    ZeroDivisionError and must return exactly one eligible candidate.
+
+    Previously the subsampling formula divided by (n - 1) == 0, crashing for this
+    valid configuration.
+    """
+    cfg = ExperimentGenerationConfig(
+        pool_size=1,
+        strategy=ExperimentGenerationStrategy.GRID,
+        bounds=NumericalDomainBounds(variable_name="x", min_val=0.0, max_val=10.0),
+    )
+    batch = CandidateExperimentGenerator(cfg).generate_batch()
+
+    assert batch.generated_count == 1
+    assert len(batch.candidates) == 1
+    x = batch.candidates[0].input_data.values["x"]
+    # Representative point must lie within domain bounds
+    assert 0.0 <= x <= 10.0
+
+
+# ==============================================================================
+# 13. Regression: extreme integer bounds raise clear ValueError, not OverflowError  [P3]
+# ==============================================================================
+
+def test_large_integer_bounds_raise_value_error_not_overflow():
+    """NumericalDomainBounds.__post_init__() must reject bounds such as 10**400 with
+    a clear ValueError rather than leaking a raw OverflowError.
+
+    Historically, math.isfinite(10**400) raises OverflowError before the check
+    can evaluate because Python integers larger than float range overflow on
+    coercion to float.
+    """
+    with pytest.raises(ValueError, match="overflows standard float representation"):
+        NumericalDomainBounds(variable_name="x", min_val=0, max_val=10**400)
+
+    with pytest.raises(ValueError, match="overflows standard float representation"):
+        NumericalDomainBounds(variable_name="x", min_val=-(10**400), max_val=0)
+
+
+# ==============================================================================
+# 14. Regression: batch convenience API surfaces undersized diagnostics  [P2]
+# ==============================================================================
+
+def test_generate_batch_convenience_exposes_diagnostics():
+    """generate_batch_candidate_experiments() must return a CandidateExperimentBatch
+    with is_undersized=True and a non-empty diagnostic_message when the domain
+    cannot satisfy the requested pool size.
+
+    Callers using the plain list API via generate_candidate_experiments() lose this
+    information; the batch API is the documented way to access diagnostics.
+    """
+    # Degenerate domain: only one distinct point is available, but we request 5.
+    batch = generate_batch_candidate_experiments(
+        pool_size=5,
+        bounds=NumericalDomainBounds(variable_name="x", min_val=3.0, max_val=3.0),
+        strategy=ExperimentGenerationStrategy.GRID,
+        allow_undersized=True,
+    )
+
+    assert isinstance(batch, CandidateExperimentBatch)
+    assert batch.requested_count == 5
+    assert batch.generated_count < 5
+    assert batch.is_undersized is True
+    assert batch.diagnostic_message is not None and len(batch.diagnostic_message) > 0
+
+    # Confirm list compatibility: batch is directly iterable
+    candidates_list = list(batch)
+    assert len(candidates_list) == batch.generated_count
