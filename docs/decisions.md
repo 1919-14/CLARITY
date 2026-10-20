@@ -122,11 +122,37 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Rationale:** Explicit verification reduces untested assumptions and late integration failures.
 
+## D-013 — Bounded polynomial family is the first hypothesis family
+
+**Status:** Confirmed (Issue #5)
+
+**Decision:** One registered `polynomial` family covers constant, linear, and higher-degree models (degrees 0 through a configurable maximum, default 3, hard ceiling 12). Specifications use ascending coefficients `c0..c_degree`, require a non-zero leading coefficient for degree >= 1, and define complexity as `degree + 1`. Prediction is an explicit Horner evaluation over validated numeric coefficients.
+
+**Rationale:** The family is small, testable, analytically checkable, and matches the deterministic scalar `x -> y` local oracle. A registry keeps further families addable without changing candidate generation or the discovery loop.
+
+**Trade-off:** Narrower than unrestricted symbolic discovery. Higher-degree models with zero leading terms are rejected rather than silently treated as lower degree, so the declared degree and complexity stay honest.
+
+**Rejected alternatives:** Expression strings with `eval`/`exec` or an expression parser (unsafe and unverifiable); arbitrary user code; separate constant/linear/quadratic classes (duplicate logic).
+
+**Validation:** `backend/tests/test_hypotheses.py`; contract details in [contracts.md](contracts.md) section 4.
+
+## D-014 — Generated candidates are initialized, not fitted
+
+**Status:** Confirmed (Issue #5)
+
+**Decision:** Candidate generation produces one deterministic monomial baseline per allowed degree plus seeded uniform coefficient draws until the requested unique count is reached. Candidates carry `status = candidate`, `system_generated` provenance, and generation metadata (generator, version, seed, configuration, initialization, sequence index). Duplicates are canonical-specification equality within one batch. An unreachable requested count raises `CANDIDATE_SPACE_EXHAUSTED`.
+
+**Rationale:** Generated candidates need valid, explicit parameters to make predictions, but fitting belongs to Issue #6. Seeded initialization makes batches reproducible without implying fit quality.
+
+**Trade-off:** Initial coefficients carry no evidence about the hidden system; generation must never be read as accuracy, confidence, or ranking. Duplicate detection covers canonical equality only, not general symbolic equivalence.
+
+**Validation:** `backend/tests/test_hypotheses.py` (reproducibility, limits, exhaustion, isolation); [contracts.md](contracts.md) section 4.
+
 ## Open decisions
 
-1. First hypothesis representation/model family.
+1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
 2. First deterministic oracle input domain/output type.
-3. Candidate fitting objective, ranking formula, complexity proxy.
+3. Candidate fitting objective and ranking formula; complexity proxy is `degree + 1` for the current family (D-013).
 4. Disagreement and uncertainty score.
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.

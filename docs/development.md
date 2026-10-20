@@ -2,7 +2,7 @@
 
 ## Start here
 
-Before an issue, read [README](../README.md), [master context](../context.md), [architecture](architecture.md), [decisions](decisions.md), [collaboration workflow](collaboration-workflow.md), and the assigned GitHub issue. Then inspect the actual branch, files, code, and tests. A documented target layout does not mean those files already exist. For team git practices, pull request standards, handoffs, and branch rules, refer to [Collaboration Workflow](collaboration-workflow.md).
+Before an issue, read [README](../README.md), [master context](../context.md), [architecture](architecture.md), [scientific data contracts](contracts.md), [decisions](decisions.md), [collaboration workflow](collaboration-workflow.md), and the assigned GitHub issue. Then inspect the actual branch, files, code, and tests. A documented target layout does not mean those files already exist. For team git practices, pull request standards, handoffs, and branch rules, refer to [Collaboration Workflow](collaboration-workflow.md).
 
 ## Repository layout
 
@@ -10,7 +10,7 @@ Before an issue, read [README](../README.md), [master context](../context.md), [
 CLARITY/
 ├── README.md
 ├── context.md
-├── docs/{architecture,development,decisions}.md
+├── docs/{architecture,contracts,development,decisions}.md
 ├── backend/{app,tests,requirements.txt}
 ├── frontend/{src,package.json}
 └── .github/{workflows,pull_request_template.md}

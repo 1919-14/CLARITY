@@ -7,6 +7,9 @@ from .contracts import (
     Observation,
     ObservationStatus,
     HypothesisRepresentation,
+    HypothesisStatus,
+    HypothesisOrigin,
+    HypothesisProvenance,
     EvaluationRequest,
     EvaluationResult,
     EvaluationStatus,
@@ -17,6 +20,21 @@ from .contracts import (
     utc_now_iso,
     generate_id,
 )
+from .hypothesis_models import (
+    HARD_MAX_POLYNOMIAL_DEGREE,
+    DEFAULT_MAX_POLYNOMIAL_DEGREE,
+    POLYNOMIAL_FAMILY_ID,
+    ModelFamilyRegistry,
+    PolynomialFamily,
+    PolynomialModel,
+    default_registry,
+)
+from .candidate_generator import (
+    CandidateGenerationError,
+    CandidateGenerator,
+    HypothesisGenerationConfig,
+    generate_candidates,
+)
 
 __all__ = [
     "StructuredError",
@@ -25,6 +43,9 @@ __all__ = [
     "Observation",
     "ObservationStatus",
     "HypothesisRepresentation",
+    "HypothesisStatus",
+    "HypothesisOrigin",
+    "HypothesisProvenance",
     "EvaluationRequest",
     "EvaluationResult",
     "EvaluationStatus",
@@ -34,4 +55,15 @@ __all__ = [
     "verify_no_ground_truth_leakage",
     "utc_now_iso",
     "generate_id",
+    "POLYNOMIAL_FAMILY_ID",
+    "DEFAULT_MAX_POLYNOMIAL_DEGREE",
+    "HARD_MAX_POLYNOMIAL_DEGREE",
+    "PolynomialModel",
+    "PolynomialFamily",
+    "ModelFamilyRegistry",
+    "default_registry",
+    "HypothesisGenerationConfig",
+    "CandidateGenerator",
+    "CandidateGenerationError",
+    "generate_candidates",
 ]
