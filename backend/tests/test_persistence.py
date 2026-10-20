@@ -504,13 +504,17 @@ def test_production_environment_rejects_missing_database_url(monkeypatch):
 def test_alembic_config_escapes_url_encoded_credentials(monkeypatch):
     """Verify Alembic config safely escapes % in URL-encoded credentials (Finding 5)."""
     import os
+    import pathlib
     from alembic.config import Config
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    ini_path = repo_root / "alembic.ini"
 
     # URL-encoded credential containing %40 (@) and %25 (%)
     encoded_url = "mysql+pymysql://clarity_user:p%40ss%25word%21@db.host.internal:3306/clarity_db"
     monkeypatch.setenv("DATABASE_URL", encoded_url)
 
-    cfg = Config("alembic.ini")
+    cfg = Config(str(ini_path))
     env_db_url = os.environ.get("DATABASE_URL")
     assert env_db_url is not None
 
@@ -554,14 +558,20 @@ def test_production_environment_rejects_explicit_sqlite_uri(monkeypatch):
 
 def test_alembic_migrations_upgrade_and_downgrade_smoke(tmp_path):
     """Verify that Alembic migrations successfully apply, roll back, and re-apply cleanly (Follow-up Finding 2)."""
+    import pathlib
     import sqlite3
     from alembic import command
     from alembic.config import Config
 
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    ini_path = repo_root / "alembic.ini"
+    migrations_dir = repo_root / "backend" / "migrations"
+
     db_file = tmp_path / "smoke_migration.db"
     db_url = f"sqlite:///{db_file}"
 
-    cfg = Config("alembic.ini")
+    cfg = Config(str(ini_path))
+    cfg.set_main_option("script_location", str(migrations_dir))
     cfg.set_main_option("sqlalchemy.url", db_url)
 
     # 1. Upgrade to head
