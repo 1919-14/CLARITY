@@ -1192,3 +1192,156 @@ def test_evaluation_result_allows_completed_without_fitting_status():
     )
     assert result.status == EvaluationStatus.COMPLETED
     assert result.fitting_status is None
+
+
+# ==============================================================================
+# P2 Regression Tests: Guard math.fsum() accumulation overflow
+# (requested by PR reviewer: MAE [1e308, 1e308], RMSE [1e154, 1e154], evaluate())
+# ==============================================================================
+
+def test_mae_accumulation_overflow_safe():
+    """MAE with actuals [1e308, 1e308] and predictions [0.0, 0.0] has a finite
+    mathematical result (1e308) and must not raise OverflowError in math.fsum."""
+    value, error = mean_absolute_error([1e308, 1e308], [0.0, 0.0])
+    assert error is None
+    assert value == pytest.approx(1e308)
+
+
+def test_rmse_accumulation_overflow_safe():
+    """RMSE with actuals [1e154, 1e154] and predictions [0.0, 0.0] has a finite
+    mathematical result (1e154) and must not raise OverflowError in math.fsum."""
+    value, error = root_mean_squared_error([1e154, 1e154], [0.0, 0.0])
+    assert error is None
+    assert value == pytest.approx(1e154)
+
+
+def test_compute_metrics_accumulation_overflow_safe():
+    """compute_metrics returns finite metrics for large numbers that would
+    otherwise overflow intermediate fsum accumulation."""
+    metrics_mae, error_mae = compute_metrics([1e308, 1e308], [0.0, 0.0], ["mae"])
+    assert error_mae is None
+    assert metrics_mae["mae"] == pytest.approx(1e308)
+
+    metrics_rmse, error_rmse = compute_metrics([1e154, 1e154], [0.0, 0.0], ["rmse"])
+    assert error_rmse is None
+    assert metrics_rmse["rmse"] == pytest.approx(1e154)
+
+
+def test_evaluate_single_candidate_accumulation_overflow_mae():
+    """EvaluationPipeline.evaluate() (single candidate) must handle fsum accumulation
+    overflow in MAE without escaping as a raw OverflowError."""
+    cand = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = 0.0",
+        parameters={
+            "family": POLYNOMIAL_FAMILY_ID,
+            "degree": 0,
+            "coefficients": {"c0": 0.0},
+            "input_variable": "x",
+            "output_variable": "y",
+        },
+        complexity=1,
+        hypothesis_id="hyp-fsum-mae",
+    )
+    obs = {
+        "obs-0": success_observation("obs-0", 0.0, 0.0),
+        "obs-1": success_observation("obs-1", 1.0, 0.0),
+        "obs-h0": success_observation("obs-h0", 0.0, 1e308),
+        "obs-h1": success_observation("obs-h1", 1.0, 1e308),
+    }
+    pipeline = EvaluationPipeline()
+    req = make_request(
+        cand,
+        ["obs-0", "obs-1"],
+        held_out_ids=["obs-h0", "obs-h1"],
+        metric_names=["mae"],
+    )
+    result = pipeline.evaluate(req, obs)
+    assert result.status == EvaluationStatus.COMPLETED
+    assert result.error is None
+    assert result.held_out_metrics is not None
+    assert result.held_out_metrics["mae"] == pytest.approx(1e308)
+
+
+def test_evaluate_single_candidate_accumulation_overflow_rmse():
+    """EvaluationPipeline.evaluate() (single candidate) must handle fsum accumulation
+    overflow in RMSE without escaping as a raw OverflowError."""
+    cand = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = 1.0",
+        parameters={
+            "family": POLYNOMIAL_FAMILY_ID,
+            "degree": 0,
+            "coefficients": {"c0": 1.0},
+            "input_variable": "x",
+            "output_variable": "y",
+        },
+        complexity=1,
+        hypothesis_id="hyp-fsum-rmse",
+    )
+    obs = {
+        "obs-0": success_observation("obs-0", 0.0, 1.0),
+        "obs-1": success_observation("obs-1", 1.0, 1.0),
+        "obs-h0": success_observation("obs-h0", 0.0, 1e154),
+        "obs-h1": success_observation("obs-h1", 1.0, 1e154),
+    }
+    pipeline = EvaluationPipeline()
+    req = make_request(
+        cand,
+        ["obs-0", "obs-1"],
+        held_out_ids=["obs-h0", "obs-h1"],
+        metric_names=["rmse"],
+    )
+    result = pipeline.evaluate(req, obs)
+    assert result.status == EvaluationStatus.COMPLETED
+    assert result.error is None
+    assert result.held_out_metrics is not None
+    assert result.held_out_metrics["rmse"] == pytest.approx(1e154)
+
+
+def test_evaluate_single_candidate_metric_overflow_returns_failed_result():
+    """EvaluationPipeline.evaluate() returns a structured FAILED result, not a raw
+    exception, when a metric genuinely overflows float arithmetic."""
+    from app.domain.fitting import FittingResult
+    from app.domain.hypothesis_models import PolynomialModel
+
+    class IdentityFitter:
+        def fit(self, parameters, samples, config, family):
+            m = PolynomialModel(degree=0, coefficients=(-_MAX_FLOAT,))
+            return FittingResult(
+                status=FittingStatus.SUCCESS,
+                family_id=family.family_id,
+                specification=dict(parameters),
+                model=m,
+            )
+
+    cand = HypothesisRepresentation(
+        model_family=POLYNOMIAL_FAMILY_ID,
+        formula="y = -max",
+        parameters={
+            "family": POLYNOMIAL_FAMILY_ID,
+            "degree": 0,
+            "coefficients": {"c0": -_MAX_FLOAT},
+            "input_variable": "x",
+            "output_variable": "y",
+        },
+        complexity=1,
+        hypothesis_id="hyp-overflow-metric",
+    )
+    # Actual is +_MAX_FLOAT, predicted is -_MAX_FLOAT -> difference overflows to inf
+    obs = {
+        "obs-0": success_observation("obs-0", 0.0, _MAX_FLOAT),
+        "obs-1": success_observation("obs-1", 1.0, _MAX_FLOAT),
+    }
+    pipeline = EvaluationPipeline(fitters={POLYNOMIAL_FAMILY_ID: IdentityFitter()})
+    req = make_request(
+        cand,
+        ["obs-0", "obs-1"],
+        metric_names=["mae"],
+    )
+    # Must not raise OverflowError
+    result = pipeline.evaluate(req, obs)
+    assert result.status == EvaluationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == ERROR_METRIC_COMPUTATION_FAILURE
+

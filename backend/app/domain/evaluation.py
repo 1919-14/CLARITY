@@ -174,7 +174,22 @@ def mean_absolute_error(
             message="Absolute error is not finite; refusing to report a metric.",
             details={"sample_count": len(differences)},
         )
-    value = math.fsum(differences) / len(differences)
+    try:
+        value = math.fsum(differences) / len(differences)
+    except OverflowError:
+        try:
+            scale = max(differences)
+            if scale == 0.0:
+                value = 0.0
+            else:
+                scaled = [d / scale for d in differences]
+                value = (math.fsum(scaled) / len(differences)) * scale
+        except OverflowError:
+            return None, StructuredError(
+                code=ERROR_NON_FINITE_METRIC,
+                message="MAE accumulation overflows float; refusing to report a metric.",
+                details={"sample_count": len(differences)},
+            )
     if not math.isfinite(value):
         return None, StructuredError(
             code=ERROR_NON_FINITE_METRIC,
@@ -209,7 +224,23 @@ def root_mean_squared_error(
             message="Squared error is not finite; refusing to report a metric.",
             details={"sample_count": len(squared_errors)},
         )
-    value = math.sqrt(math.fsum(squared_errors) / len(squared_errors))
+    try:
+        value = math.sqrt(math.fsum(squared_errors) / len(squared_errors))
+    except OverflowError:
+        try:
+            scale = max(squared_errors)
+            if scale == 0.0:
+                value = 0.0
+            else:
+                scaled = [s / scale for s in squared_errors]
+                mean_scaled = math.fsum(scaled) / len(squared_errors)
+                value = math.sqrt(mean_scaled) * math.sqrt(scale)
+        except OverflowError:
+            return None, StructuredError(
+                code=ERROR_NON_FINITE_METRIC,
+                message="RMSE accumulation overflows float; refusing to report a metric.",
+                details={"sample_count": len(squared_errors)},
+            )
     if not math.isfinite(value):
         return None, StructuredError(
             code=ERROR_NON_FINITE_METRIC,
@@ -257,7 +288,14 @@ def compute_metrics(
 
     results: Dict[str, float] = {}
     for name in metric_names:
-        value, error = SUPPORTED_METRICS[name](actuals, predictions)
+        try:
+            value, error = SUPPORTED_METRICS[name](actuals, predictions)
+        except ArithmeticError as exc:
+            return {}, StructuredError(
+                code=ERROR_METRIC_COMPUTATION_FAILURE,
+                message=f"Metric '{name}' encountered a numerical error: {exc}",
+                details={"metric": name, "exception_type": type(exc).__name__},
+            )
         if error is not None:
             return {}, StructuredError(
                 code=ERROR_METRIC_COMPUTATION_FAILURE,
@@ -532,7 +570,22 @@ class EvaluationPipeline:
                 warnings=fitting.warnings,
             )
 
-        metrics, metric_failure = compute_metrics(actuals, predictions, request.metric_names)
+        try:
+            metrics, metric_failure = compute_metrics(actuals, predictions, request.metric_names)
+        except ArithmeticError as exc:
+            return self._failure(
+                candidate,
+                StructuredError(
+                    code=ERROR_METRIC_COMPUTATION_FAILURE,
+                    message=f"Numerical failure during metric computation: {exc}",
+                    details={"exception_type": type(exc).__name__},
+                ),
+                request=request,
+                counts=counts,
+                exclusions=exclusion_codes,
+                dataset_ids=dataset_ids,
+                warnings=fitting.warnings,
+            )
         if metric_failure is not None:
             return self._failure(
                 candidate,
@@ -565,9 +618,24 @@ class EvaluationPipeline:
                     dataset_ids=dataset_ids,
                     warnings=fitting.warnings,
                 )
-            held_out_metrics, held_metric_failure = compute_metrics(
-                held_actuals, held_predictions, request.metric_names
-            )
+            try:
+                held_out_metrics, held_metric_failure = compute_metrics(
+                    held_actuals, held_predictions, request.metric_names
+                )
+            except ArithmeticError as exc:
+                return self._failure(
+                    candidate,
+                    StructuredError(
+                        code=ERROR_METRIC_COMPUTATION_FAILURE,
+                        message=f"Numerical failure during held-out metric computation: {exc}",
+                        details={"exception_type": type(exc).__name__},
+                    ),
+                    request=request,
+                    counts=counts,
+                    exclusions=exclusion_codes,
+                    dataset_ids=dataset_ids,
+                    warnings=fitting.warnings,
+                )
             if held_metric_failure is not None:
                 return self._failure(
                     candidate,
@@ -706,11 +774,27 @@ class EvaluationPipeline:
                     },
                 )
             value = prediction.get(output_variable)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-            ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None, None, StructuredError(
+                    code=ERROR_PREDICTION_FAILURE,
+                    message=(
+                        f"Prediction for {partition} observation "
+                        f"{sample.observation_id!r} is not a finite number."
+                    ),
+                    details={"partition": partition, "observation_id": sample.observation_id},
+                )
+            try:
+                float_val = float(value)
+            except OverflowError:
+                return None, None, StructuredError(
+                    code=ERROR_PREDICTION_FAILURE,
+                    message=(
+                        f"Prediction for {partition} observation "
+                        f"{sample.observation_id!r} overflows float."
+                    ),
+                    details={"partition": partition, "observation_id": sample.observation_id},
+                )
+            if not math.isfinite(float_val):
                 return None, None, StructuredError(
                     code=ERROR_PREDICTION_FAILURE,
                     message=(
@@ -720,7 +804,7 @@ class EvaluationPipeline:
                     details={"partition": partition, "observation_id": sample.observation_id},
                 )
             actuals.append(sample.output_value)
-            predictions.append(float(value))
+            predictions.append(float_val)
         return actuals, predictions, None
 
     def _merge_exclusions(
