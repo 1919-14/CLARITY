@@ -4,6 +4,8 @@
 
 This is the intended MVP architecture, not a claim that components are already implemented. Preserve clear boundaries between discovery logic, UI, persistence, oracle access, and provider-specific execution. Keep hidden truth away from the discovery engine, enforce limits before scheduling work, and make the system testable without live services for every unit test.
 
+The concrete field definitions, validation rules, structured errors, and serialization guardrails for oracle, experiment, observation, hypothesis, evaluation, and benchmark data live in [contracts.md](contracts.md).
+
 ## Logical architecture
 
 ```mermaid

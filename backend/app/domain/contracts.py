@@ -9,9 +9,11 @@ Defines schemas and domain objects for:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Union
 import uuid
 
@@ -207,40 +209,182 @@ class EvaluationStatus(str, Enum):
     FAILED = "failed"
 
 
+class HypothesisStatus(str, Enum):
+    """Lifecycle state of a candidate explanation.
+
+    CANDIDATE covers the generated/proposed state: the hypothesis has a
+    specification but has not been evaluated against observations. EVALUATED is
+    set by downstream evaluation services (Issue #6) once a result exists; the
+    generator must never set it.
+    """
+    CANDIDATE = "candidate"
+    EVALUATED = "evaluated"
+
+
+class HypothesisOrigin(str, Enum):
+    """Where a candidate explanation came from."""
+    SYSTEM_GENERATED = "system_generated"
+    RESEARCHER_PROPOSED = "researcher_proposed"
+    REFINED = "refined"
+
+
+@dataclass(frozen=True)
+class HypothesisProvenance:
+    """Structured description of a candidate's origin.
+
+    Fields:
+      origin: One of HypothesisOrigin.
+      generator: Generator identifier. Required for SYSTEM_GENERATED and rejected
+        for RESEARCHER_PROPOSED so a researcher submission cannot claim to be
+        produced by the generator.
+      generator_version: Generator version string, when applicable.
+      parent_hypothesis_id: Parent candidate ID. Required for REFINED candidates.
+      note: Optional short non-sensitive note (for example a researcher rationale).
+
+    Configuration and seed details live in the hypothesis's generation_metadata
+    rather than being duplicated here.
+    """
+    origin: HypothesisOrigin
+    generator: Optional[str] = None
+    generator_version: Optional[str] = None
+    parent_hypothesis_id: Optional[str] = None
+    note: Optional[str] = None
+
+    def __post_init__(self):
+        if not isinstance(self.origin, HypothesisOrigin):
+            raise ValueError(
+                f"HypothesisProvenance origin must be a HypothesisOrigin, got {type(self.origin).__name__}."
+            )
+        if self.origin == HypothesisOrigin.SYSTEM_GENERATED and not self.generator:
+            raise ValueError("SYSTEM_GENERATED provenance requires a non-empty generator identifier.")
+        if self.origin == HypothesisOrigin.REFINED and not self.parent_hypothesis_id:
+            raise ValueError("REFINED provenance requires a parent_hypothesis_id.")
+        if self.origin == HypothesisOrigin.RESEARCHER_PROPOSED and self.generator is not None:
+            raise ValueError(
+                "RESEARCHER_PROPOSED provenance must not claim a generator; "
+                "record the submission source in note instead."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"origin": self.origin.value}
+        if self.generator is not None:
+            data["generator"] = self.generator
+        if self.generator_version is not None:
+            data["generator_version"] = self.generator_version
+        if self.parent_hypothesis_id is not None:
+            data["parent_hypothesis_id"] = self.parent_hypothesis_id
+        if self.note is not None:
+            data["note"] = self.note
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HypothesisProvenance":
+        origin = data["origin"]
+        return cls(
+            origin=origin if isinstance(origin, HypothesisOrigin) else HypothesisOrigin(origin),
+            generator=data.get("generator"),
+            generator_version=data.get("generator_version"),
+            parent_hypothesis_id=data.get("parent_hypothesis_id"),
+            note=data.get("note"),
+        )
+
+
 @dataclass(frozen=True)
 class HypothesisRepresentation:
     """Scientific description of a candidate explanation.
-    
+
     Fields:
-      hypothesis_id: Unique candidate identifier.
-      model_family: Family tag (e.g. "polynomial", "piecewise_linear", "boolean_dnf").
-      formula: Mathematical or symbolic representation string (e.g. "y = 0.5x^3 - 2x + 1").
-      parameters: Estimated model parameters / weights.
-      complexity: Defined complexity score (e.g. polynomial degree, number of free terms).
-      revision: Revision sequence number for tracked revisions.
+      hypothesis_id: Unique, stable candidate identifier.
+      model_family: Registered family identifier (e.g. "polynomial").
+      formula: Human-readable summary of the model (e.g. "y = 3.0 - 2.0*x").
+      parameters: Machine-readable model specification in the canonical shape
+        defined by the registered model family (see docs/contracts.md).
+      complexity: Defined complexity score (e.g. number of polynomial coefficients).
+      revision: Revision sequence number, incremented only on specification changes.
       created_at: UTC ISO-8601 timestamp.
+      status: Lifecycle state; generated candidates are CANDIDATE, not EVALUATED.
+      provenance: Structured origin information (see HypothesisProvenance).
+      generation_metadata: Generator name/version, seed, and configuration.
+      fitting_metadata: Optional output reserved for downstream fitting services.
+      uncertainty_metadata: Optional output reserved for downstream uncertainty work.
+
+    Absent optional fields mean "not computed yet". They are never defaulted to
+    zero error, perfect confidence, or a completed evaluation.
+
+    `parameters`, `generation_metadata`, `fitting_metadata`, and
+    `uncertainty_metadata` are checked by verify_no_ground_truth_leakage() and
+    stored as immutable snapshots: nested dicts become read-only mappings and
+    sequences become tuples, so later mutation of the caller's objects cannot
+    change validated data and in-place edits raise. Use to_dict() for a mutable
+    plain-JSON copy. This is a data-integrity convention, not a security boundary.
     """
     model_family: str
     formula: str
-    parameters: Dict[str, Any]
+    parameters: Mapping[str, Any]
     hypothesis_id: str = field(default_factory=lambda: generate_id("hyp"))
     complexity: int = 1
     revision: int = 1
     created_at: str = field(default_factory=utc_now_iso)
+    status: HypothesisStatus = HypothesisStatus.CANDIDATE
+    provenance: Optional[HypothesisProvenance] = None
+    generation_metadata: Optional[Mapping[str, Any]] = None
+    fitting_metadata: Optional[Mapping[str, Any]] = None
+    uncertainty_metadata: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self):
+        if not isinstance(self.model_family, str) or not self.model_family:
+            raise ValueError("Hypothesis model_family must be a non-empty string.")
+        if not isinstance(self.formula, str) or not self.formula:
+            raise ValueError("Hypothesis formula (human-readable summary) must be a non-empty string.")
+        if not isinstance(self.parameters, Mapping):
+            raise ValueError("Hypothesis parameters must be a mapping specification.")
+        if not isinstance(self.status, HypothesisStatus):
+            raise ValueError(
+                f"Hypothesis status must be a HypothesisStatus, got {type(self.status).__name__}."
+            )
+        if self.provenance is not None and not isinstance(self.provenance, HypothesisProvenance):
+            raise ValueError("Hypothesis provenance must be a HypothesisProvenance instance.")
+        for field_name, payload in (
+            ("parameters", self.parameters),
+            ("generation_metadata", self.generation_metadata),
+            ("fitting_metadata", self.fitting_metadata),
+            ("uncertainty_metadata", self.uncertainty_metadata),
+        ):
+            if payload is not None:
+                verify_no_ground_truth_leakage(payload)
+
+        # Freeze after validation so the checked payload cannot drift afterwards.
+        object.__setattr__(self, "parameters", freeze_payload(self.parameters))
+        for field_name in ("generation_metadata", "fitting_metadata", "uncertainty_metadata"):
+            payload = getattr(self, field_name)
+            if payload is not None:
+                object.__setattr__(self, field_name, freeze_payload(payload))
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "hypothesis_id": self.hypothesis_id,
             "model_family": self.model_family,
             "formula": self.formula,
-            "parameters": self.parameters,
+            "parameters": thaw_payload(self.parameters),
             "complexity": self.complexity,
             "revision": self.revision,
             "created_at": self.created_at,
+            "status": self.status.value,
         }
+        if self.provenance is not None:
+            data["provenance"] = self.provenance.to_dict()
+        if self.generation_metadata is not None:
+            data["generation_metadata"] = thaw_payload(self.generation_metadata)
+        if self.fitting_metadata is not None:
+            data["fitting_metadata"] = thaw_payload(self.fitting_metadata)
+        if self.uncertainty_metadata is not None:
+            data["uncertainty_metadata"] = thaw_payload(self.uncertainty_metadata)
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HypothesisRepresentation":
+        provenance_data = data.get("provenance")
+        status = data.get("status", HypothesisStatus.CANDIDATE.value)
         return cls(
             hypothesis_id=data.get("hypothesis_id", generate_id("hyp")),
             model_family=data["model_family"],
@@ -249,6 +393,17 @@ class HypothesisRepresentation:
             complexity=data.get("complexity", 1),
             revision=data.get("revision", 1),
             created_at=data.get("created_at", utc_now_iso()),
+            status=status if isinstance(status, HypothesisStatus) else HypothesisStatus(status),
+            provenance=(
+                provenance_data
+                if isinstance(provenance_data, HypothesisProvenance)
+                else HypothesisProvenance.from_dict(provenance_data)
+                if provenance_data is not None
+                else None
+            ),
+            generation_metadata=data.get("generation_metadata"),
+            fitting_metadata=data.get("fitting_metadata"),
+            uncertainty_metadata=data.get("uncertainty_metadata"),
         )
 
 
@@ -436,21 +591,55 @@ LEAKAGE_DENYLIST_PREFIXES = (
 )
 
 
-def verify_no_ground_truth_leakage(payload: Dict[str, Any]) -> None:
+def verify_no_ground_truth_leakage(payload: Mapping[str, Any]) -> None:
     """Recursively verify that no evaluator-only or ground-truth keys exist in payload.
-    
+
+    Accepts any mapping, including the read-only snapshots stored on hypotheses.
+
     Raises:
-      ValueError if any forbidden key is detected in the dictionary.
+      ValueError if any forbidden key is detected or a key is not a string.
     """
     for key, value in payload.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"Ground-truth leakage check requires string keys, got {type(key).__name__}."
+            )
         for prefix in LEAKAGE_DENYLIST_PREFIXES:
             if key.startswith(prefix):
                 raise ValueError(
                     f"Ground-truth leakage detected: key '{key}' is forbidden in discovery payloads."
                 )
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             verify_no_ground_truth_leakage(value)
-        elif isinstance(value, list):
+        elif isinstance(value, (list, tuple)):
             for item in value:
-                if isinstance(item, dict):
+                if isinstance(item, Mapping):
                     verify_no_ground_truth_leakage(item)
+
+
+def freeze_payload(payload: Any) -> Any:
+    """Recursively copy a JSON-like payload into an immutable snapshot.
+
+    Mappings become read-only ``MappingProxyType`` views and sequences become
+    tuples, so later mutation of the caller's dict/list cannot change stored
+    domain data and in-place edits of the snapshot fail immediately.
+
+    This is a data-integrity convention inside the domain model, not a security
+    boundary: it prevents accidental aliasing after validation runs.
+    """
+    if isinstance(payload, Mapping):
+        return MappingProxyType({key: freeze_payload(value) for key, value in payload.items()})
+    if isinstance(payload, (list, tuple)):
+        return tuple(freeze_payload(item) for item in payload)
+    return payload
+
+
+def thaw_payload(payload: Any) -> Any:
+    """Recursively convert a frozen snapshot back into plain dict/list values."""
+    if isinstance(payload, Mapping):
+        return {key: thaw_payload(value) for key, value in payload.items()}
+    if isinstance(payload, tuple):
+        return [thaw_payload(item) for item in payload]
+    if isinstance(payload, list):
+        return [thaw_payload(item) for item in payload]
+    return payload

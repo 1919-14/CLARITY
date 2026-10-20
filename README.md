@@ -70,6 +70,7 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 
 - [Master project context](context.md)
 - [Architecture](docs/architecture.md)
+- [Scientific data contracts](docs/contracts.md)
 - [Development guide](docs/development.md)
 - [Decision record](docs/decisions.md)
 - [GitHub Issues](https://github.com/1919-14/CLARITY/issues)
@@ -122,4 +123,4 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 
 ## Development status
 
-The application skeleton and automated CI checks (Issue #3) are in place. The Flask backend, React status interface, and GitHub Actions CI workflow are established. Next phase focuses on domain contracts, the discovery engine, and the first vertical slice.
+The application skeleton and automated CI checks (Issue #3), the scientific data contracts and black-box oracle interface (Issue #4), and bounded candidate hypothesis representation/generation (Issue #5) are in place. The Flask backend, React status interface, GitHub Actions CI workflow, domain contracts, deterministic local oracle, isolated benchmark evaluator, polynomial model family, prediction interface, and seeded candidate generator are established. Next phase focuses on hypothesis fitting and candidate evaluation.
