@@ -60,15 +60,15 @@ class RunModel(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Relationships preserving history
-    hypotheses = relationship("HypothesisModel", back_populates="run", cascade="all, delete-orphan")
-    observations = relationship("ObservationModel", back_populates="run", cascade="all, delete-orphan")
-    experiments = relationship("CandidateExperimentModel", back_populates="run", cascade="all, delete-orphan")
-    tasks = relationship("ComputeTaskModel", back_populates="run", cascade="all, delete-orphan")
-    usage_records = relationship("UsageRecordModel", back_populates="run", cascade="all, delete-orphan")
-    audit_events = relationship("AuditEventModel", back_populates="run", cascade="all, delete-orphan")
-    reports = relationship("ReportModel", back_populates="run", cascade="all, delete-orphan")
-    benchmark_results = relationship("BenchmarkResultModel", back_populates="run", cascade="all, delete-orphan")
+    # Relationships preserving history with foreign-key RESTRICT protections
+    hypotheses = relationship("HypothesisModel", back_populates="run", passive_deletes=True)
+    observations = relationship("ObservationModel", back_populates="run", passive_deletes=True)
+    experiments = relationship("CandidateExperimentModel", back_populates="run", passive_deletes=True)
+    tasks = relationship("ComputeTaskModel", back_populates="run", passive_deletes=True)
+    usage_records = relationship("UsageRecordModel", back_populates="run", passive_deletes=True)
+    audit_events = relationship("AuditEventModel", back_populates="run", passive_deletes=True)
+    reports = relationship("ReportModel", back_populates="run", passive_deletes=True)
+    benchmark_results = relationship("BenchmarkResultModel", back_populates="run", passive_deletes=True)
 
     __table_args__ = (
         Index("idx_runs_status", "status"),
@@ -94,7 +94,7 @@ class HypothesisModel(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
     run = relationship("RunModel", back_populates="hypotheses")
-    revisions = relationship("HypothesisRevisionModel", back_populates="hypothesis", cascade="all, delete-orphan", order_by="HypothesisRevisionModel.revision_number")
+    revisions = relationship("HypothesisRevisionModel", back_populates="hypothesis", passive_deletes=True, order_by="HypothesisRevisionModel.revision_number")
 
     __table_args__ = (
         Index("idx_hypotheses_run_state", "run_id", "is_excluded", "is_pinned"),
@@ -116,7 +116,7 @@ class HypothesisRevisionModel(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     hypothesis = relationship("HypothesisModel", back_populates="revisions")
-    evaluations = relationship("EvaluationResultModel", back_populates="revision", cascade="all, delete-orphan")
+    evaluations = relationship("EvaluationResultModel", back_populates="revision", passive_deletes=True)
 
     __table_args__ = (
         UniqueConstraint("hypothesis_id", "revision_number", name="uq_hypothesis_revision_number"),

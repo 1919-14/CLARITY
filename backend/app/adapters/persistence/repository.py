@@ -145,6 +145,16 @@ class ClarityRepository:
     # =========================================================================
 
     def record_evaluation(self, evaluation: EvaluationResultModel) -> EvaluationResultModel:
+        # Enforce that evaluation and its referenced revision belong to the exact same run
+        if evaluation.revision_id:
+            rev = self.session.get(HypothesisRevisionModel, evaluation.revision_id)
+            if rev is not None:
+                hyp = self.session.get(HypothesisModel, rev.hypothesis_id)
+                if hyp is not None and hyp.run_id != evaluation.run_id:
+                    raise ValueError(
+                        f"Cross-run evaluation invariant violated: EvaluationResult run_id ('{evaluation.run_id}') "
+                        f"does not match Hypothesis run_id ('{hyp.run_id}') for revision '{evaluation.revision_id}'."
+                    )
         self.session.add(evaluation)
         self.session.flush()
         return evaluation

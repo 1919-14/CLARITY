@@ -97,6 +97,8 @@ erDiagram
 ## 2. Integrity and Scientific History Preservation
 
 - **Immutable Revisions:** Every modification or parameter refit of a hypothesis creates a new revision record (`revision_number = n + 1`). Prior revisions are never overwritten or deleted.
+- **Non-Destructive Parent Retention:** Relationships between runs, hypotheses, revisions, observations, and audit events configure `passive_deletes=True` with database-level `RESTRICT` foreign key rules. Cascading deletions are disabled to prevent accidental erasure of scientific history or audit trails.
+- **Cross-Run Evaluation Isolation:** Evaluations strictly require that the target hypothesis revision belongs to the exact same discovery run (`run_id`). Cross-run evaluations are rejected to preserve strict provenance.
 - **Evaluation Provenance:** Evaluation results point directly to `revision_id` and record `dataset_version` (observation count). This ensures that historical evaluations are reproducible across discovery steps.
 - **Researcher Action Non-Destructiveness:** Pinning (`is_pinned`) and excluding (`is_excluded`) update hypothesis state flags while logging immutable audit events. Raw evaluation scores and historical records are never modified by UI preferences.
 
@@ -106,9 +108,9 @@ erDiagram
 
 ### Configuration via Environment Variables:
 - **`DATABASE_URL`:**
-  - Production / Local MySQL: `mysql+pymysql://<user>:<password>@<host>:3306/<dbname>`
+  - Production: Required valid database URL (e.g. `mysql+pymysql://<user>:<password>@<host>:3306/<dbname>`). Silent fallback to SQLite is strictly forbidden in production.
   - Local Development Fallback: `sqlite:///clarity_dev.db`
-  - Automated Unit Tests: `sqlite:///:memory:`
+  - Automated Unit Tests: `sqlite:///:memory:` (with SQLite foreign key enforcement enabled via `PRAGMA foreign_keys=ON`)
 
 ### Migration Commands (Alembic):
 ```bash

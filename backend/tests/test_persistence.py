@@ -395,3 +395,130 @@ def test_minimal_seed_data_factory(repo):
     # Second invocation should be idempotent without creating duplicate runs
     run_id2 = seed_minimal_development_data(repo)
     assert run_id1 == run_id2
+
+
+# ==============================================================================
+# 9. Relational Integrity, Retention & Environment Enforcement (PR #35 Review Findings)
+# ==============================================================================
+
+def test_run_deletion_cannot_silently_erase_historical_records(repo):
+    """Verify deleting a run cannot erase child scientific/audit records (Finding 1).
+    
+    Relationships configure passive_deletes=True and database-level RESTRICT
+    constraints to ensure historical records are preserved from accidental deletion.
+    """
+    run = RunModel(run_id="run-protect-01", name="Protected Run")
+    repo.create_run(run)
+
+    obs = ObservationModel(
+        observation_id="obs-protect-01",
+        run_id="run-protect-01",
+        input_id="inp-01",
+        input_values={"x": 5.0},
+        sequence_number=1,
+    )
+    repo.add_observation(obs)
+    repo.session.commit()
+
+    # Attempting to delete the parent run directly must be rejected by foreign key RESTRICT
+    run_to_delete = repo.get_run("run-protect-01")
+    repo.session.delete(run_to_delete)
+    with pytest.raises(IntegrityError):
+        repo.session.commit()
+    repo.session.rollback()
+
+    # Verify both parent run and historical observation remain fully intact
+    assert repo.get_run("run-protect-01") is not None
+    obs_list = repo.list_observations_for_run("run-protect-01")
+    assert len(obs_list) == 1
+    assert obs_list[0].observation_id == "obs-protect-01"
+
+
+def test_cross_run_evaluation_rejected(repo):
+    """Verify that an evaluation cannot reference a hypothesis revision from a different run (Finding 2)."""
+    run1 = RunModel(run_id="run-iso-1", name="Run 1")
+    run2 = RunModel(run_id="run-iso-2", name="Run 2")
+    repo.create_run(run1)
+    repo.create_run(run2)
+
+    hyp1 = HypothesisModel(hypothesis_id="hyp-iso-1", run_id="run-iso-1", model_family="poly")
+    rev1 = HypothesisRevisionModel(revision_id="rev-iso-1", formula="y = x", parameters={})
+    repo.create_hypothesis_with_initial_revision(hyp1, rev1)
+    repo.session.commit()
+
+    # Attempt to record an evaluation under run-iso-2 for rev-iso-1 (which belongs to run-iso-1)
+    cross_run_eval = EvaluationResultModel(
+        evaluation_id="eval-cross-01",
+        revision_id="rev-iso-1",
+        run_id="run-iso-2",
+        metrics={"mae": 0.05},
+    )
+    with pytest.raises(ValueError, match="Cross-run evaluation invariant violated"):
+        repo.record_evaluation(cross_run_eval)
+    repo.session.rollback()
+
+
+def test_foreign_key_enforcement_rejects_orphan_child(repo):
+    """Verify SQLite foreign key enforcement is active and rejects orphan child records (Finding 3)."""
+    orphan_obs = ObservationModel(
+        observation_id="orphan-obs-001",
+        run_id="non-existent-run-id",
+        input_id="inp-orphan",
+        input_values={"x": 1.0},
+        sequence_number=1,
+    )
+    repo.session.add(orphan_obs)
+    with pytest.raises(IntegrityError):
+        repo.session.flush()
+    repo.session.rollback()
+
+
+def test_production_environment_rejects_missing_database_url(monkeypatch):
+    """Verify production environment fails fast if DATABASE_URL is missing or SQLite (Finding 4)."""
+    import os
+    from app.adapters.persistence.database import get_db_manager, reset_db_manager
+    from app import create_app
+
+    # 1. get_db_manager fails fast in production when DATABASE_URL is missing
+    reset_db_manager()
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(ValueError, match="DATABASE_URL must be explicitly configured"):
+        get_db_manager()
+
+    # 2. get_db_manager fails fast in production when DATABASE_URL is SQLite
+    reset_db_manager()
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///clarity_prod.db")
+    with pytest.raises(ValueError, match="SQLite database URI cannot be used in production"):
+        get_db_manager()
+
+    # 3. create_app in production mode fails fast when DATABASE_URL is missing
+    monkeypatch.setenv("SECRET_KEY", "real-production-secret-key-1234567890")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(ValueError, match="DATABASE_URL.*explicitly configured"):
+        create_app("production")
+
+    reset_db_manager()
+
+
+def test_alembic_config_escapes_url_encoded_credentials(monkeypatch):
+    """Verify Alembic config safely escapes % in URL-encoded credentials (Finding 5)."""
+    import os
+    from alembic.config import Config
+
+    # URL-encoded credential containing %40 (@) and %25 (%)
+    encoded_url = "mysql+pymysql://clarity_user:p%40ss%25word%21@db.host.internal:3306/clarity_db"
+    monkeypatch.setenv("DATABASE_URL", encoded_url)
+
+    cfg = Config("alembic.ini")
+    env_db_url = os.environ.get("DATABASE_URL")
+    assert env_db_url is not None
+
+    # Unescaped setting would raise ValueError("invalid interpolation syntax") in ConfigParser
+    with pytest.raises(ValueError, match="invalid interpolation syntax"):
+        cfg.set_main_option("sqlalchemy.url", env_db_url)
+
+    # With proper escaping as done in migrations/env.py, it succeeds and round-trips correctly
+    cfg.set_main_option("sqlalchemy.url", env_db_url.replace("%", "%%"))
+    retrieved_url = cfg.get_main_option("sqlalchemy.url")
+    assert retrieved_url == encoded_url
