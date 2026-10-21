@@ -49,6 +49,7 @@ class NodusConfig:
     timeout_seconds: float
     max_retries: int
     base_url: str | None = None
+    project: str | None = None
     _extra: dict = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -109,6 +110,7 @@ class NodusConfig:
         function_name = os.environ.get("NODUS_FUNCTION_NAME", "").strip()
         api_key = os.environ.get("NODUS_API_KEY", "").strip() or None
         base_url = os.environ.get("NODUS_BASE_URL", "").strip() or None
+        project = os.environ.get("NODUS_PROJECT", "").strip() or None
 
         raw_timeout = os.environ.get("NODUS_TIMEOUT_SECONDS", "30").strip()
         try:
@@ -136,6 +138,7 @@ class NodusConfig:
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
             base_url=base_url,
+            project=project,
         )
 
     def __repr__(self) -> str:
@@ -145,6 +148,7 @@ class NodusConfig:
             f"execution_mode={self.execution_mode.value!r}, "
             f"app_name={self.app_name!r}, "
             f"function_name={self.function_name!r}, "
+            f"project={self.project!r}, "
             f"api_key=<redacted>, "
             f"timeout_seconds={self.timeout_seconds}, "
             f"max_retries={self.max_retries}"

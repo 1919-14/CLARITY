@@ -219,16 +219,32 @@ def sanitize_sdk_error(exc: Exception) -> dict[str, Any]:
 
 
 def _classify_sdk_exception(exc_class_name: str) -> str:
-    """Map SDK exception class name to a ``NodusErrorCode``."""
+    """Map SDK exception class name to a ``NodusErrorCode``.
+
+    Class names are matched against the verified nodus.errors hierarchy from
+    nodus-compute==1.0.27.  Only class names are used; exception messages are
+    never read or forwarded.
+    """
     name = exc_class_name.lower()
-    if "timeout" in name:
+    # nodus.errors.APITimeoutError — client-side timeout
+    if "apitimeout" in name or ("timeout" in name and "function" not in name):
         return NodusErrorCode.TIMEOUT
-    if "ratelimit" in name or "rate_limit" in name or "toomanyrequests" in name:
+    # nodus.errors.TooManyRequests, QuotaExceeded, BudgetExceeded
+    if "toomany" in name or "quota" in name or "budget" in name or "ratelimit" in name:
         return NodusErrorCode.RATE_LIMITED
+    # nodus.errors.NotFound
     if "notfound" in name or "not_found" in name:
         return NodusErrorCode.NOT_FOUND
-    if "permission" in name or "forbidden" in name or "unauthorized" in name:
+    # nodus.errors.Unauthorized, Forbidden
+    if "unauthorized" in name or "forbidden" in name or "permission" in name:
         return NodusErrorCode.PERMISSION_DENIED
+    # nodus.errors.FunctionCallFailed — function ended without result
+    if "functioncall" in name or "callfailed" in name:
+        return NodusErrorCode.REMOTE_EXECUTION_FAILED
+    # nodus.errors.APIConnectionError
+    if "connection" in name:
+        return NodusErrorCode.SDK_ERROR
+    # Cancellation
     if "cancelled" in name or "canceled" in name:
         return NodusErrorCode.CANCELLED
     return NodusErrorCode.SDK_ERROR

@@ -397,102 +397,227 @@ class TestSanitizeResultError:
 # 6. Remote-mode failure — mocked SDK boundary
 # ===========================================================================
 
-def _build_nodus_mock_module() -> types.ModuleType:
-    """Build a minimal mock ``nodus`` package hierarchy for unit tests."""
+def _build_nodus_mock_module(fn_return_value: dict | None = None) -> types.ModuleType:
+    """Build a minimal mock ``nodus`` package hierarchy for unit tests.
+
+    Models the verified nodus-compute==1.0.27 public API:
+    - ``nodus.Function.from_name(app: str, name: str, project=None)``
+    - ``fn.spawn(**kwargs) -> FunctionCall handle``
+    - ``handle.get(timeout=...) -> Any``  (returns function return value directly)
+    - ``handle.name: str``  (provider FunctionCall identifier)
+    - ``nodus.Client(api_key=..., api_url=..., project=...)``
+    - ``nodus.errors.NodusError.retryable: bool``
+    """
+    if fn_return_value is None:
+        fn_return_value = {"echo_value": "ok"}  # direct function return, NOT envelope
+
     nodus_mod = types.ModuleType("nodus")
     errors_mod = types.ModuleType("nodus.errors")
-    functions_mod = types.ModuleType("nodus.functions")
 
-    # Error classes
-    class TimeoutError(Exception):  # noqa: A001
-        pass
+    # --------------- Error classes (verified from nodus.errors) ----------------
+    class NodusError(Exception):
+        code = "Unknown"
+        retryable = False
 
-    class RateLimitError(Exception):
-        pass
+    class FunctionCallFailed(NodusError):
+        code = "FunctionCallFailed"
+        retryable = False
+        def __init__(self, call="", *, reason=None, message=""):
+            super().__init__(message)
+            self.call = call
+            self.reason = reason
 
-    class NotFoundError(Exception):
-        pass
+    class TooManyRequests(NodusError):
+        code = "TooManyRequests"
+        retryable = True  # documented retryable
 
-    errors_mod.TimeoutError = TimeoutError
-    errors_mod.RateLimitError = RateLimitError
-    errors_mod.NotFoundError = NotFoundError
+    class Unavailable(NodusError):
+        code = "Unavailable"
+        retryable = True  # documented retryable
 
+    class APITimeoutError(NodusError):
+        code = "APITimeoutError"
+        retryable = False
+
+    class NotFound(NodusError):
+        code = "NotFound"
+        retryable = False
+
+    errors_mod.NodusError = NodusError
+    errors_mod.FunctionCallFailed = FunctionCallFailed
+    errors_mod.TooManyRequests = TooManyRequests
+    errors_mod.Unavailable = Unavailable
+    errors_mod.APITimeoutError = APITimeoutError
+    errors_mod.NotFound = NotFound
     nodus_mod.errors = errors_mod
 
-    # Client / App stubs
-    nodus_mod.Client = MagicMock
-    nodus_mod.App = MagicMock
+    # --------------- FunctionCall handle stub ----------------------------------
+    _captured_return = fn_return_value
 
-    # Function stub with from_name classmethod
+    class _FunctionCallStub:
+        """Mimics nodus.FunctionCall: name property + async get()."""
+        def __init__(self):
+            self._name = "prov-abc"
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        async def get(self, timeout=None):
+            return _captured_return
+
+    # --------------- Function stub ---------------------------------------------
     class _FunctionStub:
+        """Mimics the object returned by nodus.Function.from_name."""
         @classmethod
-        def from_name(cls, name, app):
+        def from_name(cls, app: str, name: str, project=None):
+            """Verified public API: positional (app, name, project)."""
             return cls()
 
-        def spawn(self, **kwargs):
+        async def spawn(self, **kwargs):
+            return _FunctionCallStub()
+
+    # Client context manager stub
+    class _ClientStub:
+        def __init__(self, **kwargs):
+            pass
+        def __enter__(self):
             return self
+        def __exit__(self, *args):
+            pass
 
-        def get(self, timeout=None):
-            return {
-                "status": "succeeded",
-                "task_id": "prov-abc",
-                "result": {"echo_value": "ok"},
-            }
+    nodus_mod.Client = _ClientStub
+    nodus_mod.Function = _FunctionStub
 
-    functions_mod._Function = _FunctionStub
-    nodus_mod.functions = functions_mod
-
-    # Register in sys.modules
     sys.modules["nodus"] = nodus_mod
     sys.modules["nodus.errors"] = errors_mod
-    sys.modules["nodus.functions"] = functions_mod
 
     return nodus_mod
 
 
 class TestRemoteDriver:
-    """Tests that mock the SDK boundary to avoid real network calls."""
+    """Tests that mock the SDK boundary to avoid real network calls.
+
+    All mocks model the verified nodus-compute==1.0.27 public API.
+    """
 
     def setup_method(self):
         self._nodus = _build_nodus_mock_module()
 
     def teardown_method(self):
-        for key in ["nodus", "nodus.errors", "nodus.functions"]:
+        for key in ["nodus", "nodus.errors"]:
             sys.modules.pop(key, None)
 
     def test_remote_success_returns_succeeded_result(self):
+        """get() returns the function return value directly; no envelope."""
         config = _make_config("nodus_remote", api_key="test-key")
         adapter = NodusExecutionAdapter(config)
         task = _make_task(payload={"echo_value": "clarity-smoke-test-v1"})
         result = adapter.execute(task)
         assert result.status == "succeeded"
         assert result.execution_mode == "nodus_remote"
-        assert result.provider_task_id == "prov-abc"
+        assert result.provider_task_id == "prov-abc"  # from handle.name
+        # result_data IS the function return value, not an inner .result field
         assert result.result_data == {"echo_value": "ok"}
 
-    def test_remote_timeout_returns_timed_out_result(self):
+    def test_remote_function_return_is_used_as_result_data(self):
+        """Verify get() return value is treated as result_data, not parsed as envelope."""
+        # If the adapter were still treating return value as an envelope it would
+        # look for a 'result' key and find nothing, failing. This confirms the fix.
+        _build_nodus_mock_module(fn_return_value={"computed": 42, "steps": 3})
+        config = _make_config("nodus_remote", api_key="test-key")
+        adapter = NodusExecutionAdapter(config)
+        result = adapter.execute(_make_task())
+        assert result.status == "succeeded"
+        assert result.result_data == {"computed": 42, "steps": 3}
+
+    def test_remote_api_timeout_returns_timed_out_result(self):
+        """nodus.errors.APITimeoutError maps to timed_out status."""
         import nodus.errors as nodus_errors
 
         config = _make_config("nodus_remote", api_key="test-key")
 
-        # Make .get() raise TimeoutError
-        self._nodus.functions._Function.get = MagicMock(
-            side_effect=nodus_errors.TimeoutError("timed out")
-        )
+        original_fn = sys.modules["nodus"].Function
 
-        adapter = NodusExecutionAdapter(config)
-        result = adapter.execute(_make_task())
+        class _TimeoutFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+
+            async def spawn(self, **kwargs):
+                return _TimeoutHandleStub()
+
+        class _TimeoutHandleStub:
+            name = "prov-timeout"
+            async def get(self, timeout=None):
+                raise nodus_errors.APITimeoutError()
+
+        sys.modules["nodus"].Function = _TimeoutFunctionStub
+
+        try:
+            adapter = NodusExecutionAdapter(config)
+            result = adapter.execute(_make_task())
+        finally:
+            sys.modules["nodus"].Function = original_fn
+
         assert result.status == "timed_out"
         assert result.error["code"] == NodusErrorCode.TIMEOUT
 
-    def test_remote_sdk_error_is_sanitized(self):
-        """Raw SDK exception text must not appear in the result error."""
+    def test_function_call_failed_is_terminal(self):
+        """FunctionCallFailed (deadline, OOM, crash) maps to failed status, no retry."""
         import nodus.errors as nodus_errors
 
-        config = _make_config("nodus_remote", api_key="test-key")
-        self._nodus.functions._Function.get = MagicMock(
-            side_effect=ValueError("CANARY_SDK_SECRET_DO_NOT_FORWARD")
+        config = NodusConfig(
+            execution_mode=ExecutionMode.REMOTE,
+            app_name="app",
+            function_name="fn",
+            api_key="test-key",
+            timeout_seconds=5.0,
+            max_retries=3,  # must not retry despite max_retries=3
         )
+
+        spawn_count = 0
+
+        class _FailedFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+
+            async def spawn(self, **kwargs):
+                nonlocal spawn_count
+                spawn_count += 1
+                return _FailedHandleStub()
+
+        class _FailedHandleStub:
+            name = "prov-failed"
+            async def get(self, timeout=None):
+                raise nodus_errors.FunctionCallFailed(call="prov-failed", reason="DeadlineExceeded")
+
+        sys.modules["nodus"].Function = _FailedFunctionStub
+
+        adapter = NodusExecutionAdapter(config)
+        task = NodusTask(task_id="fc-t", operation="op", payload={"x": 1}, max_retries=3)
+        result = adapter.execute(task)
+
+        assert result.status == "failed"
+        assert result.error["code"] == NodusErrorCode.REMOTE_EXECUTION_FAILED
+        assert spawn_count == 1  # submitted once only; get() not retried
+
+    def test_remote_sdk_error_is_sanitized(self):
+        """Raw SDK exception text must not appear in the result error."""
+        class _SanitizeHandleStub:
+            name = "prov-san"
+            async def get(self, timeout=None):
+                raise ValueError("CANARY_SDK_SECRET_DO_NOT_FORWARD")
+
+        class _SanitizeFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+            async def spawn(self, **kwargs):
+                return _SanitizeHandleStub()
+
+        sys.modules["nodus"].Function = _SanitizeFunctionStub
 
         adapter = NodusExecutionAdapter(NodusConfig(
             execution_mode=ExecutionMode.REMOTE,
@@ -507,7 +632,9 @@ class TestRemoteDriver:
         result_str = str(result.to_dict())
         assert "CANARY_SDK_SECRET_DO_NOT_FORWARD" not in result_str
 
-    def test_remote_non_dict_result_raises_result_error(self):
+    def test_remote_non_dict_result_is_failed(self):
+        """If the function returns a non-dict, the adapter returns a failed result."""
+        _build_nodus_mock_module(fn_return_value="not-a-dict")
         config = NodusConfig(
             execution_mode=ExecutionMode.REMOTE,
             app_name="app",
@@ -516,43 +643,88 @@ class TestRemoteDriver:
             timeout_seconds=5.0,
             max_retries=0,
         )
-        self._nodus.functions._Function.get = MagicMock(return_value="not-a-dict")
         adapter = NodusExecutionAdapter(config)
         result = adapter.execute(_make_task())
         assert result.status == "failed"
         assert result.error is not None
 
+    def test_function_from_name_uses_public_api(self):
+        """Verify from_name is called with (app, name, project) positional args."""
+        calls = []
+
+        class _SpyFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                calls.append({"app": app, "name": name, "project": project})
+                return cls()
+            async def spawn(self, **kwargs):
+                return _SpyHandle()
+
+        class _SpyHandle:
+            name = "prov-spy"
+            async def get(self, timeout=None):
+                return {"result": "ok"}
+
+        sys.modules["nodus"].Function = _SpyFunctionStub
+
+        config = NodusConfig(
+            execution_mode=ExecutionMode.REMOTE,
+            app_name="my-app",
+            function_name="my-fn",
+            api_key="key",
+            timeout_seconds=5.0,
+            max_retries=0,
+        )
+        adapter = NodusExecutionAdapter(config)
+        adapter.execute(_make_task())
+
+        assert len(calls) == 1
+        assert calls[0]["app"] == "my-app"
+        assert calls[0]["name"] == "my-fn"
+
 
 # ===========================================================================
-# 7. Retry logic
+# 7. Retry logic — pre-submission only
 # ===========================================================================
 
 class TestRetryLogic:
+    """Retry tests targeting the pre-submission (spawn) phase only.
+
+    Post-submission errors (from get()) must never trigger retries because
+    the task is already submitted and re-spawning would create duplicates.
+    """
+
     def setup_method(self):
         _build_nodus_mock_module()
 
     def teardown_method(self):
-        for key in ["nodus", "nodus.errors", "nodus.functions"]:
+        for key in ["nodus", "nodus.errors"]:
             sys.modules.pop(key, None)
 
-    def test_rate_limit_error_is_retried(self):
-        """Rate-limit errors must trigger retries up to max_retries."""
+    def test_retryable_sdk_error_on_spawn_is_retried(self):
+        """NodusError with retryable=True on spawn is retried up to max_retries."""
         import nodus.errors as nodus_errors
 
-        call_count = 0
+        spawn_count = 0
 
-        def side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                raise nodus_errors.RateLimitError("rate limited")
-            return {
-                "status": "succeeded",
-                "task_id": "prov-retry",
-                "result": {"v": 1},
-            }
+        class _RetryFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
 
-        sys.modules["nodus"].functions._Function.get = MagicMock(side_effect=side_effect)
+            async def spawn(self, **kwargs):
+                nonlocal spawn_count
+                spawn_count += 1
+                if spawn_count <= 2:
+                    raise nodus_errors.TooManyRequests("rate limited")
+                return _RetryHandle()
+
+        class _RetryHandle:
+            name = "prov-retry"
+            async def get(self, timeout=None):
+                return {"v": 1}
+
+        sys.modules["nodus"].Function = _RetryFunctionStub
 
         config = NodusConfig(
             execution_mode=ExecutionMode.REMOTE,
@@ -574,20 +746,25 @@ class TestRetryLogic:
             result = adapter.execute(task)
 
         assert result.status == "succeeded"
-        assert call_count == 3
+        assert spawn_count == 3  # failed twice, succeeded third
 
-    def test_timeout_error_is_not_retried(self):
-        """Timeout errors must not trigger retries."""
+    def test_non_retryable_sdk_error_on_spawn_is_terminal(self):
+        """NodusError with retryable=False on spawn must not be retried."""
         import nodus.errors as nodus_errors
 
-        call_count = 0
+        spawn_count = 0
 
-        def side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            raise nodus_errors.TimeoutError("timeout")
+        class _NonRetryFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
 
-        sys.modules["nodus"].functions._Function.get = MagicMock(side_effect=side_effect)
+            async def spawn(self, **kwargs):
+                nonlocal spawn_count
+                spawn_count += 1
+                raise nodus_errors.NotFound("function not found")
+
+        sys.modules["nodus"].Function = _NonRetryFunctionStub
 
         config = NodusConfig(
             execution_mode=ExecutionMode.REMOTE,
@@ -598,11 +775,47 @@ class TestRetryLogic:
             max_retries=3,
         )
         adapter = NodusExecutionAdapter(config)
-        task = NodusTask(task_id="to-t", operation="op", payload={"x": 1}, max_retries=3)
+        task = NodusTask(task_id="nr-t", operation="op", payload={"x": 1}, max_retries=3)
         result = adapter.execute(task)
 
-        assert result.status == "timed_out"
-        assert call_count == 1  # no retries
+        assert result.status == "failed"
+        assert spawn_count == 1  # terminal, not retried
+
+    def test_post_submission_error_does_not_trigger_retry(self):
+        """An error in get() after a successful spawn must NOT cause re-spawn."""
+        spawn_count = 0
+
+        class _PostFailFunctionStub:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+
+            async def spawn(self, **kwargs):
+                nonlocal spawn_count
+                spawn_count += 1
+                return _PostFailHandle()
+
+        class _PostFailHandle:
+            name = "prov-pf"
+            async def get(self, timeout=None):
+                raise RuntimeError("post-submission error")
+
+        sys.modules["nodus"].Function = _PostFailFunctionStub
+
+        config = NodusConfig(
+            execution_mode=ExecutionMode.REMOTE,
+            app_name="app",
+            function_name="fn",
+            api_key="key",
+            timeout_seconds=5.0,
+            max_retries=3,
+        )
+        adapter = NodusExecutionAdapter(config)
+        task = NodusTask(task_id="pf-t", operation="op", payload={"x": 1}, max_retries=3)
+        result = adapter.execute(task)
+
+        assert result.status == "failed"
+        assert spawn_count == 1  # spawned once only — no re-spawn on get() failure
 
 
 # ===========================================================================

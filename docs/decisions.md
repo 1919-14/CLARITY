@@ -14,15 +14,31 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 ## D-002 — Nodus Compute for remote parallel evaluation
 
-**Status:** Confirmed direction; SDK details open
+**Status:** Confirmed
 
-**Decision:** Nodus Compute is the intended remote execution platform for parallel hypothesis/experiment evaluation.
+**Decision:** Nodus Compute is the remote execution platform for parallel
+hypothesis/experiment evaluation. The adapter uses `nodus-compute==1.0.27` with
+the following verified public API:
 
-**Rationale:** Genuine platform usage is a core challenge requirement.
+- `nodus.Function.from_name(app: str, name: str, project=None)` — function lookup
+- `fn.spawn(**kwargs) -> FunctionCall` — submits the call; kwargs go to the remote function
+- `handle.get(timeout=...) -> Any` — waits and returns the function's return value directly
+- `handle.name: str` — provider FunctionCall identifier
+- `nodus.errors.NodusError.retryable: bool` — True for `TooManyRequests` and `Unavailable`
 
-**Trade-off:** SDK, task semantics, concurrency, cost metadata, and provider access may constrain implementation.
+**Rationale:** Genuine platform usage is a core challenge requirement. The adapter
+boundary (`backend/app/adapters/nodus/`) isolates all SDK details from application
+logic and enforces explicit execution modes with no fallback.
 
-**Validation:** Inspect actual SDK/environment, create a narrow adapter, and capture a real remote smoke test when access is available. Label mocked tests clearly.
+**Trade-off:** `handle.get()` returns the function's return value directly (not a
+status envelope). The remote function's return dict becomes `result_data` verbatim.
+Retries are pre-submission-only — post-submission retry would create duplicate
+billable calls.
+
+**Validation:** Adapter tested with 62 unit tests (mocked SDK boundary). Genuine
+remote smoke test (`python -m app.nodus_smoke_test`) is ready; pending a deployed
+Function with matching `NODUS_APP_NAME`/`NODUS_FUNCTION_NAME` and `NODUS_API_KEY`.
+See `docs/nodus-compute.md` for deployment and smoke-test instructions.
 
 ## D-003 — Isolate hidden oracle truth
 
