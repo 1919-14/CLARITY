@@ -98,7 +98,12 @@ def test_retry_default_is_disabled():
     oracle = TimeoutThenSuccessOracle()
     result = DiscoveryEngine(
         oracle,
-        make_config(max_query_budget=2, max_iterations=2, max_query_retries=0),
+        make_config(
+            max_query_budget=2,
+            max_iterations=2,
+            max_query_retries=0,
+            stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
+        ),
     ).run()
 
     assert oracle.calls == 1
