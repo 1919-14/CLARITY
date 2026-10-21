@@ -52,18 +52,19 @@ The frontend is not authoritative for budgets or scientific scores. Server-side 
 - Keep scientific algorithms out of route handlers.
 - Never expose hidden ground truth through ordinary API responses.
 
-Initial endpoint sketch, not a frozen contract:
+Confirmed REST API Endpoints (implemented in Issue #19, detailed in [docs/api.md](api.md)):
 - `GET /api/health`
 - `POST /api/runs`
+- `GET /api/runs`
 - `GET /api/runs/{run_id}`
+- `POST /api/runs/{run_id}/cancel`
 - `GET /api/runs/{run_id}/hypotheses`
 - `POST /api/runs/{run_id}/hypotheses`
 - `PATCH /api/runs/{run_id}/hypotheses/{hypothesis_id}`
 - `GET /api/runs/{run_id}/observations`
-- `GET /api/runs/{run_id}/report`
 - `GET /api/runs/{run_id}/metrics`
-
-Cancellation, benchmark retrieval, and individual researcher actions may need more endpoints. Agree on schemas/status codes before parallel implementation.
+- `GET /api/runs/{run_id}/report`
+- `GET /api/runs/{run_id}/benchmarks`
 
 ### Run lifecycle and orchestrator
 Creates runs, initializes the engine, coordinates evaluation → selection → oracle query → observation persistence → update, checks budgets before work, tracks status/progress, and records terminal reason. States must distinguish successful completion, budget/limit stopping, cancellation, and failure. Preserve successful partial results when independent tasks fail. Use REST polling first; add streaming/workers only when needed and documented.

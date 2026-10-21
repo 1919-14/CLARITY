@@ -45,8 +45,10 @@ def create_app(config_name=None):
 
     # Register blueprints
     from .routes.health import health_bp
+    from .routes.runs import runs_bp
 
     app.register_blueprint(health_bp, url_prefix="/api")
+    app.register_blueprint(runs_bp, url_prefix="/api")
 
     # Error handlers returning consistent JSON payloads
     @app.errorhandler(404)
