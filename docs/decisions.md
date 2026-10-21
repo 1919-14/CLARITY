@@ -174,6 +174,34 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Validation:** Leakage invariants A/B/E and failure-isolation tests in `backend/tests/test_evaluation.py`.
 
+## D-017 — The discovery engine coordinates; it does not reimplement science
+
+**Status:** Confirmed (Issue #8)
+
+**Decision:** Add `DiscoveryEngine` as a thin orchestrator over the existing components: `CandidateGenerator` (#5), `EvaluationPipeline` (#6), `HypothesisRanker` (#7), `CandidateExperimentGenerator` (#9), and `OracleInterface` (#4). The engine owns lifecycle, immutable run state, budget accounting, deduplication, history, and result assembly. Experiment selection sits behind a narrow `ExperimentPlanner` protocol with a `DeterministicOrderPlanner` default. Terminal precedence is deterministic: satisfied configured stopping criterion → budget exhausted → max iterations → no valid experiment, with component/oracle failures terminating immediately.
+
+**Rationale:** One coordinator prevents duplicated fitting/ranking logic and keeps the loop testable with deterministic local components. A narrow planner protocol lets Issues #10–#11 land active selection without changing the orchestrator.
+
+**Trade-off:** The default planner spends queries deterministically rather than informatively, so early query efficiency is not a benchmark claim. The engine evaluates all candidates on every refresh (no incremental evaluation cache); this is cheap for the supported candidate-count ceiling.
+
+**Rejected alternatives:** Putting selection or ranking formulas in the orchestrator (duplicates #7/#10); a generic workflow framework with configurable stages (speculative for one loop); doing the run inside a Flask service or persistence layer (couples domain logic to infrastructure).
+
+**Validation:** `backend/tests/test_discovery_loop.py`; [discovery-loop.md](discovery-loop.md); [contracts.md](contracts.md) section 7.
+
+## D-018 — Query budget and observation commit semantics
+
+**Status:** Confirmed (Issue #8)
+
+**Decision:** Reserve one unit of `max_query_budget` immediately before every `oracle.query` call. Raised calls, non-success responses, and contract-invalid responses consume that unit; pre-invocation validation rejections, duplicate skips, and externally supplied observations do not. A successful observation is committed immediately. If evaluation/ranking then raises, the observation and the previous ranking snapshot are kept, `ranking_is_fresh` becomes false, and the run terminates as `component_failure`. No automatic oracle retries exist.
+
+**Rationale:** Budget must be a hard ceiling on real oracle invocations, and valid scientific evidence must never be discarded because a downstream recomputation failed. Recording staleness is more honest than presenting an unchanged ranking as current.
+
+**Trade-off:** A failed query still costs budget, so a flaky oracle reduces the useful experiment count. The loop is training-only: all committed observations fit and test the candidates, so held-out metrics are unavailable inside the loop.
+
+**Rejected alternatives:** Refunding budget for failed calls (understates real usage); retrying inside the engine (spends unbudgeted queries, risks duplicate side effects); rolling back committed observations on ranking failure (destroys valid evidence); silently continuing after a component failure (reports a ranking that was never computed).
+
+**Validation:** Budget-ceiling, failure, and partial-result tests in `backend/tests/test_discovery_loop.py`; [discovery-loop.md](discovery-loop.md) sections 5, 7, and 8.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
@@ -182,7 +210,7 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 4. Disagreement and uncertainty score.
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.
-7. Exact run states/transitions, cancellation, recovery.
+7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018; run-level cancellation and durable recovery remain open for the API/persistence layer.
 8. Required report export formats.
 9. Deployment target and clean-start procedure.
 10. Target accuracy/error threshold and trial count for query-efficiency benchmarks.

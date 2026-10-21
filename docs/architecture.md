@@ -78,6 +78,8 @@ Keep domain logic independent of Flask request objects, React state, MySQL-speci
 - **Stopping policy:** continue or stop with explicit reason.
 - **Step interface:** execute a discovery step and return explicit outcomes.
 
+Issues #5-#7 and #9 implement the scientific subcomponents. Issue #8 adds the coordinator, `DiscoveryEngine` in `backend/app/domain/discovery_engine.py`, which connects them through their public interfaces only: candidate generation, one `evaluate_many` refresh, one `rank_candidates` call, experiment generation, a narrow `ExperimentPlanner` selection boundary, and budget-checked `OracleInterface` queries. The engine owns the deterministic termination precedence, query accounting, observation commit boundary, run history, and the immutable `DiscoveryRunResult`. Active selection (#10/#11) plugs in as a planner without changing the orchestrator. See [discovery-loop.md](discovery-loop.md).
+
 Prioritize a narrow deterministic benchmark over a broad, unverifiable model library.
 
 ### Oracle adapter
@@ -130,6 +132,7 @@ The evaluator is separate from discovery. It may access hidden rules/labels to c
 - Preserve completed observations/evaluations after budget exhaustion.
 - Record real vs mocked remote execution accurately.
 - Bound retries and prevent duplicate events from creating duplicate records where idempotency is required.
+- The discovery loop reserves query budget before every oracle call, never commits an invalid oracle response, and marks `ranking_is_fresh = false` instead of presenting a stale ranking as current ([discovery-loop.md](discovery-loop.md)).
 
 ## Suggested code boundaries
 
