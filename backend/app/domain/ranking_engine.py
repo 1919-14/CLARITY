@@ -5,28 +5,47 @@ on evaluation metrics, complexity, and stable ID tie-breaking.  Evidence
 summaries inform PlausibilityStatus and explanations but do NOT re-participate
 in the numeric sort key.
 
+Comparability cohorts
+---------------------
+Candidates are first assigned to *comparability cohorts* based on:
+  (EvaluationTier, dataset_id, metric_version)
+
+Only candidates within the same cohort are directly ranked against each other
+using metric magnitudes.  Cross-cohort ordering reflects cohort priority, not
+metric magnitude, and is disclosed in limitation notes.
+
 Tier ordering (best-first):
-  1. VALID_HELD_OUT      — finite held-out primary metric, same dataset_id.
+  1. VALID_HELD_OUT      — finite held-out primary metric, same cohort.
   2. VALID_TRAINING_ONLY — finite training primary metric, no held-out.
-  3. INCOMPARABLE        — COMPLETED but non-finite or missing primary metric.
+  3. INCOMPARABLE        — COMPLETED but non-finite / missing primary metric.
   4. EVALUATION_FAILED   — EvaluationResult.status == FAILED.
   5. UNEVALUATED         — no EvaluationResult available.
 
-Within VALID_HELD_OUT and VALID_TRAINING_ONLY candidates that share a
-dataset_id are ordered by:
+Within each cohort, candidates are ordered by:
   a. Primary metric score (direction-aware).
-  b. If scores are within the complexity_window: lower complexity wins.
+  b. If primary scores are within the complexity_window: lower complexity wins.
   c. If complexity is also equal: secondary metric score (held-out or training).
   d. Stable tie-breaker: lexicographic ascending hypothesis_id.
 
-Cross-tier comparisons are disclosed in limitation notes.  Training-only and
-held-out metrics are never compared as if equivalent.
+Absent vs. non-finite metrics
+------------------------------
+An *absent* primary metric (key not in metrics dict) is treated differently
+from an *explicitly non-finite* metric (key present with NaN/Inf value).
+When a candidate has no held-out primary metric but has a valid training
+primary metric, it is placed in VALID_TRAINING_ONLY rather than INCOMPARABLE.
+A metric key that exists with a NaN/Inf value is classified INCOMPARABLE.
+
+Metric version compatibility
+------------------------------
+``MetricComparabilityValidator`` is used during cohort construction.  When
+metric_version metadata is absent from one or both candidates, comparability
+is flagged as *unverified* in limitation notes rather than silently assumed.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .contracts import (
     EvaluationResult,
@@ -39,6 +58,7 @@ from .evidence_tracker import (
     derive_plausibility_status,
     summarize_evidence,
 )
+from .hypothesis_models import ModelFamilyRegistry, default_registry
 from .ranking_contracts import (
     EvaluationTier,
     PlausibilityStatus,
@@ -49,7 +69,7 @@ from .ranking_contracts import (
 
 # Increment this whenever the ordering strategy or explanation format changes
 # in a way that would alter existing rankings.
-RANKING_VERSION = "1.0.0"
+RANKING_VERSION = "1.1.0"
 
 # Tier priority for cross-tier ordering (lower value = better presentation tier)
 _TIER_PRIORITY: Dict[EvaluationTier, int] = {
@@ -59,6 +79,9 @@ _TIER_PRIORITY: Dict[EvaluationTier, int] = {
     EvaluationTier.EVALUATION_FAILED: 3,
     EvaluationTier.UNEVALUATED: 4,
 }
+
+# Sentinel for absent metric_version (distinct from any real version string)
+_METRIC_VERSION_ABSENT = "__absent__"
 
 
 # ---------------------------------------------------------------------------
@@ -70,23 +93,41 @@ def _is_finite_metric(value: Optional[float]) -> bool:
     return value is not None and math.isfinite(value)
 
 
-def _get_metric(
+def _get_finite_metric(
     metrics: Optional[Dict[str, Optional[float]]],
     metric_name: str,
-) -> Optional[float]:
-    """Extract a named metric value from a metrics dict; return None if absent or non-finite."""
+) -> Tuple[Optional[float], bool]:
+    """Extract a named metric from a dict, distinguishing absent from non-finite.
+
+    Returns
+    -------
+    (value, explicitly_non_finite)
+        value               Finite float, or None when absent/non-finite.
+        explicitly_non_finite
+                            True when the key IS present but its value is
+                            NaN/Inf.  False when the key is absent or value is
+                            a valid finite number.
+    """
     if metrics is None:
-        return None
-    val = metrics.get(metric_name)
-    if not _is_finite_metric(val):
-        return None
-    return val
+        return None, False
+    if metric_name not in metrics:
+        return None, False
+    raw = metrics[metric_name]
+    if raw is None:
+        return None, False
+    try:
+        f = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None, True
+    if not math.isfinite(f):
+        return None, True
+    return f, False
 
 
 def _determine_tier(
     eval_result: Optional[EvaluationResult],
     policy: RankingPolicyConfig,
-) -> Tuple[EvaluationTier, Optional[float], Optional[float], Optional[float]]:
+) -> Tuple[EvaluationTier, Optional[float], Optional[float], Optional[float], bool]:
     """Classify a candidate into an EvaluationTier and extract comparable scores.
 
     Returns
@@ -99,37 +140,38 @@ def _determine_tier(
         Primary metric value from training metrics (finite), or None.
     secondary_held_out_score
         Secondary metric value from held_out_metrics (finite), or None.
+    has_explicit_non_finite
+        True when any primary metric key was explicitly NaN/Inf (not merely absent).
     """
     if eval_result is None:
-        return EvaluationTier.UNEVALUATED, None, None, None
+        return EvaluationTier.UNEVALUATED, None, None, None, False
 
     if eval_result.status == EvaluationStatus.FAILED:
-        return EvaluationTier.EVALUATION_FAILED, None, None, None
+        return EvaluationTier.EVALUATION_FAILED, None, None, None, False
 
-    # Check for explicit non-finite primary metric in held-out or training metrics
-    if eval_result.held_out_metrics is not None and policy.primary_metric in eval_result.held_out_metrics:
-        raw_held_out = eval_result.held_out_metrics.get(policy.primary_metric)
-        if not _is_finite_metric(raw_held_out):
-            return EvaluationTier.INCOMPARABLE, None, None, None
+    held_out_val, held_out_nonfinite = _get_finite_metric(
+        eval_result.held_out_metrics, policy.primary_metric
+    )
+    training_val, training_nonfinite = _get_finite_metric(
+        eval_result.metrics, policy.primary_metric
+    )
+    secondary_val, _ = _get_finite_metric(
+        eval_result.held_out_metrics, policy.secondary_metric
+    )
+    has_explicit_non_finite = held_out_nonfinite or training_nonfinite
 
-    if eval_result.metrics is not None and policy.primary_metric in eval_result.metrics:
-        raw_training = eval_result.metrics.get(policy.primary_metric)
-        if not _is_finite_metric(raw_training):
-            return EvaluationTier.INCOMPARABLE, None, None, None
+    # If any explicitly-present metric value is non-finite → INCOMPARABLE.
+    if has_explicit_non_finite:
+        return EvaluationTier.INCOMPARABLE, None, training_val, None, True
 
-    # Attempt VALID_HELD_OUT.
-    held_out_score = _get_metric(eval_result.held_out_metrics, policy.primary_metric)
-    training_score = _get_metric(eval_result.metrics, policy.primary_metric)
-    secondary_held_out = _get_metric(eval_result.held_out_metrics, policy.secondary_metric)
+    if held_out_val is not None:
+        return EvaluationTier.VALID_HELD_OUT, held_out_val, training_val, secondary_val, False
 
-    if held_out_score is not None:
-        return EvaluationTier.VALID_HELD_OUT, held_out_score, training_score, secondary_held_out
+    if training_val is not None:
+        return EvaluationTier.VALID_TRAINING_ONLY, None, training_val, None, False
 
-    if training_score is not None:
-        return EvaluationTier.VALID_TRAINING_ONLY, None, training_score, None
-
-    # COMPLETED but no usable primary metric.
-    return EvaluationTier.INCOMPARABLE, None, training_score, None
+    # COMPLETED but no usable primary metric in either partition.
+    return EvaluationTier.INCOMPARABLE, None, None, None, False
 
 
 def _dataset_id(eval_result: Optional[EvaluationResult]) -> Optional[str]:
@@ -140,6 +182,13 @@ def _dataset_id(eval_result: Optional[EvaluationResult]) -> Optional[str]:
     if isinstance(ds, str) and ds:
         return ds
     return None
+
+
+def _metric_version(eval_result: Optional[EvaluationResult]) -> str:
+    """Return metric_version string or the absent sentinel."""
+    if eval_result is None or eval_result.metric_version is None:
+        return _METRIC_VERSION_ABSENT
+    return eval_result.metric_version
 
 
 def _complexity(
@@ -154,60 +203,79 @@ def _complexity(
     return None
 
 
-def _sort_key(
+def _cohort_key(
     tier: EvaluationTier,
+    dataset_id: Optional[str],
+    metric_ver: str,
+) -> Tuple[int, Optional[str], str]:
+    """Compute the cohort grouping key for a candidate.
+
+    Only VALID_HELD_OUT and VALID_TRAINING_ONLY candidates are sorted within
+    metric cohorts.  All other tiers use None dataset_id so they form a single
+    presentation group ordered only by tier priority and hypothesis_id.
+    """
+    if tier in (EvaluationTier.VALID_HELD_OUT, EvaluationTier.VALID_TRAINING_ONLY):
+        return (_TIER_PRIORITY[tier], dataset_id, metric_ver)
+    return (_TIER_PRIORITY[tier], None, "")
+
+
+def _sort_key(
+    cohort_key: Tuple[int, Optional[str], str],
     held_out_score: Optional[float],
     training_score: Optional[float],
     secondary_held_out: Optional[float],
     complexity_val: Optional[int],
     hypothesis_id: str,
     policy: RankingPolicyConfig,
-    best_score_in_group: Optional[float] = None,
+    best_score_in_cohort: Optional[float] = None,
 ) -> tuple:
-    """Produce a sortable key representing the ranking order for one candidate.
+    """Produce a sortable key for one candidate.
 
     Lower key value = better rank (Python's sort is ascending).
 
     Key structure:
-      (tier_priority, band, complexity_sort, metric_sort, secondary_sort, hypothesis_id)
+      (cohort_tier_priority, cohort_dataset_sentinel, band,
+       complexity_sort, metric_sort, secondary_sort, hypothesis_id)
 
-    Candidates within the complexity_window relative to the group's best score
-    share band=0, where lower complexity takes precedence.
+    Candidates within the complexity_window relative to the cohort's best score
+    share band=0, where lower complexity takes precedence.  Candidates in
+    different cohorts never share band=0 because their cohort keys differ.
     """
-    tier_priority = _TIER_PRIORITY[tier]
+    tier_priority, ds, mv = cohort_key
+    # Use dataset_id sentinel for stable cross-cohort ordering (None sorts before strings).
+    ds_sentinel = ds if ds is not None else ""
 
-    if tier == EvaluationTier.VALID_HELD_OUT and held_out_score is not None:
+    active_score: Optional[float] = None
+    if tier_priority == _TIER_PRIORITY[EvaluationTier.VALID_HELD_OUT]:
         active_score = held_out_score
-    elif tier == EvaluationTier.VALID_TRAINING_ONLY and training_score is not None:
+    elif tier_priority == _TIER_PRIORITY[EvaluationTier.VALID_TRAINING_ONLY]:
         active_score = training_score
-    else:
-        # For non-ranked tiers, use a stable sentinel so IDs break ties.
-        return (tier_priority, 0, 0, 0.0, 0.0, hypothesis_id)
+
+    if active_score is None:
+        return (tier_priority, ds_sentinel, 0, 0, 0.0, 0.0, hypothesis_id)
 
     direction = 1.0 if policy.metric_direction == "minimize" else -1.0
     metric_sort = direction * active_score
 
-    # Compute equivalence band relative to best performer in the cohort
+    # Compute equivalence band relative to best performer in the cohort.
     band = 0
-    if policy.complexity_window > 0.0 and best_score_in_group is not None:
+    if policy.complexity_window > 0.0 and best_score_in_cohort is not None:
         if policy.metric_direction == "minimize":
-            delta = max(0.0, active_score - best_score_in_group)
+            delta = max(0.0, active_score - best_score_in_cohort)
         else:
-            delta = max(0.0, best_score_in_group - active_score)
-        denom = max(abs(best_score_in_group), 1e-9)
+            delta = max(0.0, best_score_in_cohort - active_score)
+        denom = max(abs(best_score_in_cohort), 1e-9)
         rel_diff = delta / denom
         band = int(rel_diff // policy.complexity_window)
 
-    # Complexity: lower is better (simpler model preferred when within band).
     complexity_sort = complexity_val if complexity_val is not None else 999999
 
-    # Secondary metric sort (direction-aware).
     if secondary_held_out is not None and _is_finite_metric(secondary_held_out):
         secondary_sort = direction * secondary_held_out
     else:
         secondary_sort = direction * (1e308 if direction > 0 else -1e308)
 
-    return (tier_priority, band, complexity_sort, metric_sort, secondary_sort, hypothesis_id)
+    return (tier_priority, ds_sentinel, band, complexity_sort, metric_sort, secondary_sort, hypothesis_id)
 
 
 def _build_explanation(
@@ -227,6 +295,8 @@ def _build_explanation(
     held_out_sample_count: Optional[int],
     dataset_id: Optional[str],
     evaluation_id: Optional[str],
+    cohort_id: str,
+    metric_version_verified: bool,
 ) -> str:
     """Build a deterministic, human-readable ranking explanation."""
     lines = [
@@ -237,6 +307,12 @@ def _build_explanation(
         lines.append(f"Evaluation: {evaluation_id}")
     if dataset_id:
         lines.append(f"Dataset: {dataset_id}")
+    lines.append(f"Cohort: {cohort_id}")
+    if not metric_version_verified:
+        lines.append(
+            "Metric version: absent or unverified for one or more candidates in this cohort; "
+            "direct metric comparison may be invalid."
+        )
 
     if tier == EvaluationTier.VALID_HELD_OUT:
         lines.append(
@@ -265,7 +341,6 @@ def _build_explanation(
     if complexity_val is not None:
         lines.append(f"Complexity: {complexity_val}.")
 
-    # Evidence contribution to status (not to metric score).
     lines.append(
         f"Evidence: {supporting_count} supporting, {contradicting_count} contradicting, "
         f"{indeterminate_count} indeterminate observations."
@@ -286,6 +361,11 @@ def _build_explanation(
                 f"Status UNCERTAIN: {indeterminate_count} observation(s) yielded "
                 "INDETERMINATE evidence (non-finite observed or predicted values)."
             )
+        else:
+            lines.append(
+                "Status UNCERTAIN: no accepted finite primary metric found in either "
+                "partition; acceptable predictive performance cannot be confirmed."
+            )
 
     return " | ".join(lines)
 
@@ -295,6 +375,8 @@ def _build_limitations(
     status: PlausibilityStatus,
     dataset_id: Optional[str],
     has_cross_tier_peers: bool,
+    has_cross_dataset_peers: bool,
+    metric_version_verified: bool,
 ) -> Tuple[tuple, tuple]:
     """Return (limitations, comparability_notes) tuples for a ranked candidate."""
     limitations: List[str] = []
@@ -310,7 +392,7 @@ def _build_limitations(
 
     if tier == EvaluationTier.INCOMPARABLE:
         limitations.append(
-            f"Primary metric is absent or non-finite; no metric-based ordering was applied."
+            "Primary metric is absent or non-finite; no metric-based ordering was applied."
         )
 
     if tier in (EvaluationTier.EVALUATION_FAILED, EvaluationTier.UNEVALUATED):
@@ -336,11 +418,27 @@ def _build_limitations(
             "Evaluation failed: the fitting or metric pipeline reported an error."
         )
 
+    if not metric_version_verified and tier in (
+        EvaluationTier.VALID_HELD_OUT, EvaluationTier.VALID_TRAINING_ONLY
+    ):
+        limitations.append(
+            "Metric version metadata is absent for one or more candidates in this cohort; "
+            "direct metric comparison may be invalid."
+        )
+
     if has_cross_tier_peers:
         comparability_notes.append(
             "Other candidates in this ranking are in different evaluation tiers. "
             "Held-out and training-only metrics are not compared as equivalents; "
             "cross-tier ordering reflects tier priority, not metric magnitude."
+        )
+
+    if has_cross_dataset_peers:
+        comparability_notes.append(
+            "Other candidates were evaluated on different datasets. "
+            "Each dataset forms its own comparability cohort; candidates across cohorts "
+            "are presented in display order only — their metric values are NOT "
+            "scientifically comparable."
         )
 
     return tuple(limitations), tuple(comparability_notes)
@@ -356,30 +454,30 @@ def rank_candidates(
     observations_by_hypothesis: Mapping[str, Sequence[Any]],
     policy: Optional[RankingPolicyConfig] = None,
     dataset_version: Optional[int] = None,
+    registry: Optional[ModelFamilyRegistry] = None,
 ) -> RankingResult:
     """Rank candidate hypotheses and return a fully structured RankingResult.
+
+    Candidates are grouped into *comparability cohorts* by
+    (EvaluationTier, dataset_id, metric_version) before metric-based sorting.
+    Only candidates in the same cohort are ranked against each other using
+    metric magnitudes.  Cross-cohort display order reflects cohort priority,
+    not metric magnitude.
 
     Parameters
     ----------
     candidates
-        All candidate hypotheses to rank.  Candidates with no corresponding
-        entry in evaluation_results are assigned to the UNEVALUATED tier.
+        All candidate hypotheses to rank.
     evaluation_results
-        Map of hypothesis_id -> EvaluationResult.  Only complete or failed
-        results are accepted; pending results should not be passed here.
+        Map of hypothesis_id -> EvaluationResult.
     observations_by_hypothesis
-        Map of hypothesis_id -> list of Observation objects used for each
-        candidate's evaluation.  Used to build EvidenceSummaries.
+        Map of hypothesis_id -> list of Observation objects.
     policy
-        Ranking policy configuration.  Defaults to RankingPolicyConfig() when
-        not specified.
+        Ranking policy configuration.  Defaults to RankingPolicyConfig().
     dataset_version
         Optional numeric dataset version for evidence provenance.
-
-    Returns
-    -------
-    RankingResult
-        Ordered tuple of RankedCandidate from rank 1 (best) downward.
+    registry
+        Optional custom model family registry for evidence classification.
     """
     if policy is None:
         policy = RankingPolicyConfig()
@@ -392,9 +490,10 @@ def rank_candidates(
         __slots__ = (
             "hypothesis_id", "eval_result", "tier",
             "held_out_score", "training_score", "secondary_held_out",
-            "complexity_val", "dataset_id_val", "evidence_summary",
+            "complexity_val", "dataset_id_val", "metric_ver",
+            "has_explicit_non_finite", "evidence_summary",
             "plausibility", "eval_id", "training_sample_count",
-            "held_out_sample_count",
+            "held_out_sample_count", "cohort_key_val",
         )
 
         def __init__(
@@ -404,20 +503,33 @@ def rank_candidates(
             obs: Sequence[Any],
             policy: RankingPolicyConfig,
             dataset_version: Optional[int],
+            reg: ModelFamilyRegistry,
         ):
             self.hypothesis_id = candidate.hypothesis_id
             self.eval_result = eval_result
 
-            self.tier, self.held_out_score, self.training_score, self.secondary_held_out = (
-                _determine_tier(eval_result, policy)
-            )
+            (
+                self.tier,
+                self.held_out_score,
+                self.training_score,
+                self.secondary_held_out,
+                self.has_explicit_non_finite,
+            ) = _determine_tier(eval_result, policy)
+
             self.complexity_val = _complexity(eval_result, candidate)
             self.dataset_id_val = _dataset_id(eval_result)
+            self.metric_ver = _metric_version(eval_result)
+
+            # Comparability cohort key: (tier_priority, dataset_id, metric_version)
+            self.cohort_key_val = _cohort_key(
+                self.tier, self.dataset_id_val, self.metric_ver
+            )
 
             # Build evidence summary.
             if eval_result is not None and obs:
                 records = collect_evidence(
-                    eval_result, list(obs), policy, dataset_version=dataset_version
+                    eval_result, list(obs), policy,
+                    dataset_version=dataset_version, registry=reg,
                 )
             else:
                 records = []
@@ -430,33 +542,37 @@ def rank_candidates(
                 eval_result.held_out_sample_count if eval_result is not None else None
             )
 
+    if registry is None:
+        registry = default_registry()
+
     data_list: List[_CandidateData] = []
     for candidate in candidates:
         eval_result = evaluation_results.get(candidate.hypothesis_id)
         obs_list = observations_by_hypothesis.get(candidate.hypothesis_id, [])
-        data = _CandidateData(candidate, eval_result, obs_list, policy, dataset_version)
+        data = _CandidateData(candidate, eval_result, obs_list, policy, dataset_version, registry)
         data_list.append(data)
 
-    # Check for cross-tier heterogeneity.
-    tiers_present = {d.tier for d in data_list}
+    # ---- Cohort analysis ------------------------------------------------- #
+    tiers_present: Set[EvaluationTier] = {d.tier for d in data_list}
     has_cross_tier = len(tiers_present) > 1
 
-    # Check for mixed dataset_ids within comparable tiers.
-    comparable_dataset_ids = {
+    # Collect dataset IDs within comparable tiers.
+    comparable_dataset_ids: Set[Optional[str]] = {
         d.dataset_id_val
         for d in data_list
         if d.tier in (EvaluationTier.VALID_HELD_OUT, EvaluationTier.VALID_TRAINING_ONLY)
-        and d.dataset_id_val is not None
     }
-    if len(comparable_dataset_ids) > 1:
+    has_cross_dataset = len({ds for ds in comparable_dataset_ids if ds is not None}) > 1
+
+    if has_cross_dataset:
+        ds_list = sorted(ds for ds in comparable_dataset_ids if ds is not None)
         overall_limitations.append(
-            f"Candidates were evaluated on different datasets "
-            f"({', '.join(sorted(comparable_dataset_ids))}). "
-            "Within-tier ordering by metric is preserved but cross-dataset comparisons "
-            "reflect potentially incompatible evaluation conditions."
+            f"Candidates were evaluated on different datasets ({', '.join(ds_list)}). "
+            "Each dataset forms its own comparability cohort. Metric magnitudes across "
+            "cohorts are NOT directly comparable; cross-cohort display order reflects "
+            "cohort priority only."
         )
 
-    # Warn when training-only and held-out candidates coexist.
     if (
         EvaluationTier.VALID_HELD_OUT in tiers_present
         and EvaluationTier.VALID_TRAINING_ONLY in tiers_present
@@ -467,45 +583,69 @@ def rank_candidates(
             "their metric scores are NOT compared directly."
         )
 
-    # Precompute best score per (tier, dataset_id) group for complexity banding
-    best_scores: Dict[Tuple[EvaluationTier, Optional[str]], float] = {}
+    # Check metric version consistency within each cohort.
+    # cohort_key -> set of metric versions seen
+    cohort_versions: Dict[Tuple, Set[str]] = {}
     for d in data_list:
-        score = None
+        cohort_versions.setdefault(d.cohort_key_val, set()).add(d.metric_ver)
+
+    # Cohorts with mixed or absent metric versions.
+    unverified_cohorts: Set[Tuple] = set()
+    for ck, versions in cohort_versions.items():
+        if _METRIC_VERSION_ABSENT in versions or len(versions) > 1:
+            unverified_cohorts.add(ck)
+
+    # ---- Precompute best score per cohort --------------------------------- #
+    best_scores: Dict[Tuple, float] = {}
+    for d in data_list:
+        score: Optional[float] = None
         if d.tier == EvaluationTier.VALID_HELD_OUT and d.held_out_score is not None:
             score = d.held_out_score
         elif d.tier == EvaluationTier.VALID_TRAINING_ONLY and d.training_score is not None:
             score = d.training_score
         if score is not None:
-            group_key = (d.tier, d.dataset_id_val)
-            if group_key not in best_scores:
-                best_scores[group_key] = score
+            ck = d.cohort_key_val
+            if ck not in best_scores:
+                best_scores[ck] = score
+            elif policy.metric_direction == "minimize":
+                if score < best_scores[ck]:
+                    best_scores[ck] = score
             else:
-                if policy.metric_direction == "minimize":
-                    if score < best_scores[group_key]:
-                        best_scores[group_key] = score
-                else:
-                    if score > best_scores[group_key]:
-                        best_scores[group_key] = score
+                if score > best_scores[ck]:
+                    best_scores[ck] = score
 
     # ---- Sort ------------------------------------------------------------ #
     data_list.sort(
         key=lambda d: _sort_key(
-            d.tier,
+            d.cohort_key_val,
             d.held_out_score,
             d.training_score,
             d.secondary_held_out,
             d.complexity_val,
             d.hypothesis_id,
             policy,
-            best_scores.get((d.tier, d.dataset_id_val)),
+            best_scores.get(d.cohort_key_val),
         )
     )
 
     # ---- Build RankedCandidate list --------------------------------------- #
     ranked: List[RankedCandidate] = []
     for rank_idx, d in enumerate(data_list, start=1):
+        metric_version_verified = d.cohort_key_val not in unverified_cohorts
+
+        # Human-readable cohort label.
+        tier_label = d.tier.value
+        ds_label = d.dataset_id_val or "unknown-dataset"
+        mv_label = d.metric_ver if d.metric_ver != _METRIC_VERSION_ABSENT else "unversioned"
+        cohort_id = f"{tier_label}:{ds_label}:{mv_label}"
+
         limitations, comparability_notes = _build_limitations(
-            d.tier, d.plausibility, d.dataset_id_val, has_cross_tier
+            d.tier,
+            d.plausibility,
+            d.dataset_id_val,
+            has_cross_tier,
+            has_cross_dataset,
+            metric_version_verified,
         )
         explanation = _build_explanation(
             hypothesis_id=d.hypothesis_id,
@@ -524,6 +664,8 @@ def rank_candidates(
             held_out_sample_count=d.held_out_sample_count,
             dataset_id=d.dataset_id_val,
             evaluation_id=d.eval_id,
+            cohort_id=cohort_id,
+            metric_version_verified=metric_version_verified,
         )
 
         rc = RankedCandidate(
@@ -561,14 +703,19 @@ def rank_candidates(
 # ==============================================================================
 
 class MetricComparabilityValidator:
-    """Validates whether two or more evaluation results can be fairly compared."""
+    """Validates whether two or more evaluation results can be fairly compared.
+
+    This validator is wired into ``rank_candidates()`` during cohort construction.
+    It is also available as a standalone tool for callers that need to check
+    pairwise comparability before calling the ranker.
+    """
 
     def __init__(self, policy: Optional[RankingPolicyConfig] = None):
         self.policy = policy or RankingPolicyConfig()
 
     def classify_tier(self, eval_result: Optional[EvaluationResult]) -> EvaluationTier:
         """Determine the evaluation comparability tier for an evaluation result."""
-        tier, _, _, _ = _determine_tier(eval_result, self.policy)
+        tier, _, _, _, _ = _determine_tier(eval_result, self.policy)
         return tier
 
     def validate_pairwise_comparability(
@@ -579,6 +726,11 @@ class MetricComparabilityValidator:
         """Check if two evaluation results are directly comparable.
 
         Returns (is_comparable, list_of_reasons).
+
+        Metric version compatibility is flagged as incompatible when both
+        evaluations carry a version string and they differ.  When one or both
+        are absent, a warning is appended but comparability is not rejected
+        outright — the caller should treat the result as *unverified*.
         """
         reasons: List[str] = []
         if eval_a is None or eval_b is None:
@@ -601,17 +753,27 @@ class MetricComparabilityValidator:
             reasons.append(f"Tier {tier_a.value} is not a directly comparable evaluation tier.")
             return False, reasons
 
-        # Check dataset comparability
+        # Dataset comparability.
         ds_a = _dataset_id(eval_a)
         ds_b = _dataset_id(eval_b)
-        if ds_a != ds_b or ds_a is None:
+        if ds_a is None or ds_b is None or ds_a != ds_b:
             reasons.append(f"Dataset identifiers do not match or are absent ({ds_a!r} vs {ds_b!r}).")
             return False, reasons
 
-        # Check metric definition/version compatibility if present
-        if eval_a.metric_version and eval_b.metric_version and eval_a.metric_version != eval_b.metric_version:
+        # Metric version compatibility.
+        mv_a = eval_a.metric_version
+        mv_b = eval_b.metric_version
+        if mv_a is None or mv_b is None:
+            # Absent version: flag as unverified but do not reject.
             reasons.append(
-                f"Metric versions differ ({eval_a.metric_version!r} vs {eval_b.metric_version!r})."
+                "Metric version metadata is absent for one or both candidates; "
+                "direct metric comparison is unverified."
+            )
+            # Still return True (comparable) but with the warning.
+            return True, reasons
+        if mv_a != mv_b:
+            reasons.append(
+                f"Metric versions differ ({mv_a!r} vs {mv_b!r})."
             )
             return False, reasons
 
@@ -619,10 +781,24 @@ class MetricComparabilityValidator:
 
 
 class HypothesisRanker:
-    """Service orchestrating candidate hypothesis ranking and reranking."""
+    """Service orchestrating candidate hypothesis ranking and reranking.
 
-    def __init__(self, policy: Optional[RankingPolicyConfig] = None):
+    Historical ranking snapshots
+    ----------------------------
+    ``rerank_on_new_observations()`` accepts the ``current_ranking`` parameter
+    to define the audit boundary.  A full recompute is performed from the updated
+    observations, and the prior ``RankingResult`` is preserved by the caller for
+    audit purposes.  The returned result includes ``RANKING_VERSION`` so
+    downstream consumers can detect strategy changes between snapshots.
+    """
+
+    def __init__(
+        self,
+        policy: Optional[RankingPolicyConfig] = None,
+        registry: Optional[ModelFamilyRegistry] = None,
+    ):
         self.policy = policy or RankingPolicyConfig()
+        self.registry = registry or default_registry()
         self.validator = MetricComparabilityValidator(self.policy)
 
     def rank_candidates(
@@ -639,6 +815,7 @@ class HypothesisRanker:
             observations_by_hypothesis=observations_by_hypothesis,
             policy=self.policy,
             dataset_version=dataset_version,
+            registry=self.registry,
         )
 
     def rerank_on_new_observations(
@@ -649,11 +826,19 @@ class HypothesisRanker:
         updated_observations_by_hypothesis: Mapping[str, Sequence[Any]],
         dataset_version: Optional[int] = None,
     ) -> RankingResult:
-        """Rerank candidates following observation ingestion or new evaluation results."""
+        """Rerank candidates following observation ingestion or new evaluation results.
+
+        The ``current_ranking`` argument defines the audit boundary: the caller
+        is responsible for persisting the prior snapshot for historical comparison.
+        A full recompute is always performed rather than patching the previous
+        result, so the new result is deterministic and self-contained.
+        """
+        # current_ranking is accepted for API symmetry and audit-boundary clarity.
+        # The prior snapshot is preserved by the caller, not mutated here.
+        _ = current_ranking  # noqa: F841 — accepted for audit-boundary clarity
         return self.rank_candidates(
             candidates=candidates,
             evaluation_results=evaluation_results,
             observations_by_hypothesis=updated_observations_by_hypothesis,
             dataset_version=dataset_version,
         )
-

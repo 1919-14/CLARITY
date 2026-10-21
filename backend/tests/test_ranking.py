@@ -617,14 +617,30 @@ class TestScientificTransparency:
 # ==============================================================================
 
 class TestMetricComparabilityValidator:
-    def test_pairwise_comparable_same_dataset_and_tier(self):
+    def test_pairwise_comparable_same_dataset_and_tier_with_version(self):
+        """When both have the same dataset and same explicit metric version, fully comparable."""
+        validator = MetricComparabilityValidator()
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1")
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1")
+        # Manually set metric_version — make_evaluation_result does not expose it,
+        # so use object.__setattr__ on the frozen dataclass via a new object.
+        import dataclasses
+        e1v = dataclasses.replace(e1, metric_version="v1")
+        e2v = dataclasses.replace(e2, metric_version="v1")
+
+        comparable, reasons = validator.validate_pairwise_comparability(e1v, e2v)
+        assert comparable is True
+        assert len(reasons) == 0
+
+    def test_pairwise_comparable_unverified_when_version_absent(self):
+        """When metric_version is absent, comparable=True but a warning is returned."""
         validator = MetricComparabilityValidator()
         e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1")
         e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1")
 
         comparable, reasons = validator.validate_pairwise_comparability(e1, e2)
         assert comparable is True
-        assert len(reasons) == 0
+        assert any("unverified" in r for r in reasons)
 
     def test_pairwise_incomparable_different_tiers(self):
         validator = MetricComparabilityValidator()
@@ -668,4 +684,365 @@ class TestRankingPolicyConfigValidation:
         policy_max = RankingPolicyConfig(metric_direction="maximize")
         assert policy_max.is_better(0.9, 0.8) is True
         assert policy_max.is_better(0.8, 0.9) is False
+
+
+# ==============================================================================
+# 12. Finding #1 — Cross-Dataset Cohort Isolation
+# ==============================================================================
+
+class TestCrossDatasetCohortIsolation:
+    def test_candidates_on_different_datasets_do_not_share_metric_rank(self):
+        """A candidate on ds-A with higher MAE must not be ranked below ds-B solely
+        because the raw MAE number is larger.  The limitation must disclose the
+        different datasets and each cohort is ordered internally."""
+        c1 = make_candidate("hyp-A")
+        c2 = make_candidate("hyp-B")
+
+        # hyp-A has MAE=0.01 on ds-A; hyp-B has MAE=0.001 on ds-B.
+        # These are not scientifically comparable; hyp-A must NOT be placed below
+        # hyp-B merely because 0.01 > 0.001.
+        e1 = make_evaluation_result("hyp-A", held_out_mae=0.01, dataset_id="ds-A")
+        e2 = make_evaluation_result("hyp-B", held_out_mae=0.001, dataset_id="ds-B")
+
+        res = rank_candidates([c1, c2], {"hyp-A": e1, "hyp-B": e2}, {})
+
+        # Limitation must disclose incompatible datasets.
+        assert any("different datasets" in lim for lim in res.limitations)
+
+        # Both are in VALID_HELD_OUT tier; display order is dataset-label stable,
+        # not a scientific claim.  Neither candidate's comparability_notes should
+        # be empty — cross-dataset peers must be disclosed.
+        rc_a = next(r for r in res.ranked_candidates if r.hypothesis_id == "hyp-A")
+        rc_b = next(r for r in res.ranked_candidates if r.hypothesis_id == "hyp-B")
+        assert rc_a.evaluation_tier == EvaluationTier.VALID_HELD_OUT
+        assert rc_b.evaluation_tier == EvaluationTier.VALID_HELD_OUT
+        assert any("different datasets" in n for n in rc_a.comparability_notes)
+        assert any("different datasets" in n for n in rc_b.comparability_notes)
+
+    def test_within_cohort_ranking_is_still_by_metric(self):
+        """Within the same (tier, dataset_id) cohort metric ordering is preserved."""
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        c3 = make_candidate("hyp-3")
+
+        # All on ds-X; order should be hyp-1 < hyp-2 < hyp-3 by held-out MAE.
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.01, dataset_id="ds-X")
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.05, dataset_id="ds-X")
+        e3 = make_evaluation_result("hyp-3", held_out_mae=0.10, dataset_id="ds-X")
+
+        res = rank_candidates([c3, c1, c2], {"hyp-1": e1, "hyp-2": e2, "hyp-3": e3}, {})
+        order = [r.hypothesis_id for r in res.ranked_candidates]
+        assert order == ["hyp-1", "hyp-2", "hyp-3"]
+
+
+# ==============================================================================
+# 13. Finding #2 — EvidenceStore Audit Revisions
+# ==============================================================================
+
+class TestEvidenceStoreAuditRevisions:
+    def test_revision_log_preserves_prior_records(self):
+        """Re-evaluating the same observation under a new evaluation_id appends a
+        revision without overwriting the previous one."""
+        policy = RankingPolicyConfig()
+        obs = make_observation("obs-1", x=2.0, y=4.0)
+
+        eval_res_v1 = make_evaluation_result("hyp-1", eval_id="eval-v1")
+        eval_res_v2 = make_evaluation_result("hyp-1", eval_id="eval-v2")
+
+        records_v1 = collect_evidence(eval_res_v1, [obs], policy, dataset_version=1)
+        records_v2 = collect_evidence(eval_res_v2, [obs], policy, dataset_version=2)
+
+        store = EvidenceStore()
+        store.add_many(records_v1)
+        store.add_many(records_v2)
+
+        # Current view: one record (same observation identity).
+        assert store.count() == 1
+        # Revision log: two distinct revisions.
+        assert store.revision_count("hyp-1") == 2
+
+    def test_identical_reprocessing_does_not_add_revision(self):
+        """Ingesting the same evidence record twice (same eval_id + dataset_version)
+        must not create a duplicate revision."""
+        policy = RankingPolicyConfig()
+        obs = make_observation("obs-1", x=2.0, y=4.0)
+        eval_res = make_evaluation_result("hyp-1", eval_id="eval-v1")
+
+        records = collect_evidence(eval_res, [obs], policy, dataset_version=1)
+        store = EvidenceStore()
+        store.add_many(records)
+        store.add_many(records)  # identical re-ingest
+
+        assert store.count() == 1
+        assert store.revision_count("hyp-1") == 1
+
+    def test_current_view_reflects_latest_revision(self):
+        """The current view must show the latest revision's classification."""
+        policy = RankingPolicyConfig()
+        obs_supp = make_observation("obs-1", x=2.0, y=4.0)       # SUPPORTING for y=2x
+        obs_contra = make_observation("obs-1", x=2.0, y=100.0)   # CONTRADICTING
+
+        eval_v1 = make_evaluation_result("hyp-1", eval_id="eval-v1")
+        eval_v2 = make_evaluation_result("hyp-1", eval_id="eval-v2")
+
+        r_supp = collect_evidence(eval_v1, [obs_supp], policy, dataset_version=1)
+        r_contra = collect_evidence(eval_v2, [obs_contra], policy, dataset_version=2)
+
+        store = EvidenceStore()
+        store.add_many(r_supp)
+        store.add_many(r_contra)
+
+        summary = store.get_summary("hyp-1")
+        # The later revision is CONTRADICTING, so current view should reflect that.
+        assert summary.contradicting_count == 1
+        assert summary.supporting_count == 0
+
+
+# ==============================================================================
+# 14. Finding #3 — PLAUSIBLE Requires Accepted Performance Criterion
+# ==============================================================================
+
+class TestPlausibleRequiresPerformanceCriterion:
+    def test_uncertain_when_no_finite_primary_metric(self):
+        """A candidate with sufficient samples and zero contradictions but no finite
+        primary metric must remain UNCERTAIN, not PLAUSIBLE."""
+        policy = RankingPolicyConfig(min_samples_for_plausibility=5)
+        # Build an EvaluationResult with no primary metric (mae absent).
+        import dataclasses
+        from app.domain.contracts import EvaluationResult, EvaluationStatus, FittingStatus
+        from app.domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
+
+        base = make_evaluation_result("hyp-no-metric", sample_count=6)
+        # Replace metrics to have no 'mae' key.
+        no_metric_result = dataclasses.replace(base, metrics={}, held_out_metrics=None)
+
+        summary = EvidenceSummary("hyp-no-metric", 6, 0, 0, 6,
+                                  tuple(f"o{i}" for i in range(6)), (), ())
+        status = derive_plausibility_status(no_metric_result, summary, policy)
+        assert status == PlausibilityStatus.UNCERTAIN
+
+    def test_plausible_when_finite_training_metric_and_no_contradictions(self):
+        """When the training primary metric is finite and all other criteria pass,
+        PLAUSIBLE is correct even without held-out metrics."""
+        policy = RankingPolicyConfig(min_samples_for_plausibility=5, max_tolerated_contradictions=0)
+        eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.05)
+        summary = EvidenceSummary("hyp-1", 6, 0, 0, 6,
+                                  tuple(f"o{i}" for i in range(6)), (), ())
+        status = derive_plausibility_status(eval_res, summary, policy)
+        assert status == PlausibilityStatus.PLAUSIBLE
+
+
+# ==============================================================================
+# 15. Finding #4 — Adversarial Boundary & Chained-Near-Equal Tests
+# ==============================================================================
+
+class TestAdversarialRankingBoundaries:
+    def test_chained_near_equal_transitivity(self):
+        """A is close to B, B is close to C, but A is NOT close to C.
+        A must still rank above C; transitivity must hold."""
+        policy = RankingPolicyConfig(complexity_window=0.05)  # 5% window
+
+        c_a = make_candidate("hyp-A", complexity=2)
+        c_b = make_candidate("hyp-B", complexity=2)
+        c_c = make_candidate("hyp-C", complexity=2)
+
+        # A=0.100, B=0.104 (within 5% of A), C=0.115 (within 5% of B but NOT A).
+        # |A-B|/|B| = 0.004/0.104 ≈ 3.8%  < 5%  → A,B in same band relative to A.
+        # |B-C|/|C| = 0.011/0.115 ≈ 9.6%  > 5%  → B,C in different bands.
+        # |A-C|/|C| = 0.015/0.115 ≈ 13.0% > 5%  → A clearly beats C.
+        e_a = make_evaluation_result("hyp-A", held_out_mae=0.100, complexity=2, dataset_id="ds-1")
+        e_b = make_evaluation_result("hyp-B", held_out_mae=0.104, complexity=2, dataset_id="ds-1")
+        e_c = make_evaluation_result("hyp-C", held_out_mae=0.115, complexity=2, dataset_id="ds-1")
+
+        eval_map = {"hyp-A": e_a, "hyp-B": e_b, "hyp-C": e_c}
+
+        for perm in itertools.permutations([c_a, c_b, c_c]):
+            res = rank_candidates(
+                candidates=list(perm),
+                evaluation_results=eval_map,
+                observations_by_hypothesis={},
+                policy=policy,
+            )
+            order = [r.hypothesis_id for r in res.ranked_candidates]
+            # A must come before C in every permutation.
+            assert order.index("hyp-A") < order.index("hyp-C"), \
+                f"Transitivity violated for perm {[c.hypothesis_id for c in perm]}: {order}"
+
+    def test_complexity_band_boundary_exact_window(self):
+        """When metric difference equals exactly the complexity_window, the simpler
+        candidate must win (boundary is inclusive)."""
+        # window = 0.05; scores 0.100 and 0.105; rel-diff = 0.05/0.105 ≈ 4.76% < 5%.
+        # Both are in the same band → simpler wins.
+        policy = RankingPolicyConfig(complexity_window=0.05)
+        c_simple = make_candidate("hyp-simple", complexity=2)
+        c_complex = make_candidate("hyp-complex", complexity=5)
+
+        e_simple = make_evaluation_result("hyp-simple", held_out_mae=0.105, complexity=2, dataset_id="ds-1")
+        e_complex = make_evaluation_result("hyp-complex", held_out_mae=0.100, complexity=5, dataset_id="ds-1")
+
+        res = rank_candidates(
+            [c_complex, c_simple],
+            {"hyp-simple": e_simple, "hyp-complex": e_complex},
+            {},
+            policy=policy,
+        )
+        assert res.ranked_candidates[0].hypothesis_id == "hyp-simple"
+
+    def test_near_zero_primary_metric(self):
+        """Near-zero MAE values must not cause division-by-zero in band computation."""
+        policy = RankingPolicyConfig(complexity_window=0.01)
+        c1 = make_candidate("hyp-1", complexity=2)
+        c2 = make_candidate("hyp-2", complexity=3)
+
+        e1 = make_evaluation_result("hyp-1", held_out_mae=1e-10, complexity=2, dataset_id="ds-1")
+        e2 = make_evaluation_result("hyp-2", held_out_mae=2e-10, complexity=3, dataset_id="ds-1")
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {}, policy=policy)
+        # Both should appear without crash; c1 has lower MAE → rank 1.
+        assert res.ranked_candidates[0].hypothesis_id == "hyp-1"
+
+    def test_maximize_direction_ordering(self):
+        """With metric_direction='maximize', higher scores rank first."""
+        policy = RankingPolicyConfig(metric_direction="maximize", primary_metric="r2")
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        c3 = make_candidate("hyp-3")
+
+        # Build evaluation results with 'r2' as held-out metric.
+        import dataclasses
+        base1 = make_evaluation_result("hyp-1", held_out_mae=None, dataset_id="ds-1")
+        base2 = make_evaluation_result("hyp-2", held_out_mae=None, dataset_id="ds-1")
+        base3 = make_evaluation_result("hyp-3", held_out_mae=None, dataset_id="ds-1")
+        e1 = dataclasses.replace(base1, held_out_metrics={"r2": 0.90, "mae": None})
+        e2 = dataclasses.replace(base2, held_out_metrics={"r2": 0.80, "mae": None})
+        e3 = dataclasses.replace(base3, held_out_metrics={"r2": 0.70, "mae": None})
+
+        eval_map = {"hyp-1": e1, "hyp-2": e2, "hyp-3": e3}
+        for perm in itertools.permutations([c1, c2, c3]):
+            res = rank_candidates(
+                candidates=list(perm),
+                evaluation_results=eval_map,
+                observations_by_hypothesis={},
+                policy=policy,
+            )
+            order = [r.hypothesis_id for r in res.ranked_candidates]
+            assert order == ["hyp-1", "hyp-2", "hyp-3"], \
+                f"Maximize order wrong for perm {[c.hypothesis_id for c in perm]}: {order}"
+
+
+# ==============================================================================
+# 16. Finding #5 — Observation Membership Validation
+# ==============================================================================
+
+class TestObservationMembershipValidation:
+    def test_unverifiable_observation_classified_indeterminate(self):
+        """When EvaluationResult.dataset_ids contains explicit observation ID lists
+        and the supplied observation is absent, its evidence must be INDETERMINATE."""
+        import dataclasses
+        from app.domain.contracts import StructuredError
+
+        policy = RankingPolicyConfig()
+        eval_res = make_evaluation_result("hyp-1", eval_id="eval-1")
+
+        # Inject a membership list that excludes "obs-outsider".
+        known_ids = ["obs-known-1", "obs-known-2"]
+        eval_with_membership = dataclasses.replace(
+            eval_res,
+            dataset_ids={
+                "dataset_id": "dataset-default",
+                "observation_ids": known_ids,
+                "held_out_observation_ids": [],
+            },
+        )
+
+        obs_known = make_observation("obs-known-1", x=2.0, y=4.0)
+        obs_outsider = make_observation("obs-outsider", x=5.0, y=10.0)
+
+        records = collect_evidence(eval_with_membership, [obs_known, obs_outsider], policy)
+
+        known_rec = next(r for r in records if r.observation_id == "obs-known-1")
+        outsider_rec = next(r for r in records if r.observation_id == "obs-outsider")
+
+        # Known observation: should be SUPPORTING (y=2x is correct).
+        assert known_rec.classification == EvidenceClassification.SUPPORTING
+        # Outsider: membership unverifiable → INDETERMINATE.
+        assert outsider_rec.classification == EvidenceClassification.INDETERMINATE
+
+    def test_membership_unverified_when_no_id_lists(self):
+        """When dataset_ids contains no observation_ids list, membership cannot be
+        verified but evidence collection should still proceed (backwards compatibility)."""
+        policy = RankingPolicyConfig()
+        eval_res = make_evaluation_result("hyp-1")
+        obs = make_observation("obs-any", x=2.0, y=4.0)
+
+        records = collect_evidence(eval_res, [obs], policy)
+        # Should still produce a record (not crash).
+        assert len(records) == 1
+        # Without membership lists, observation is treated as verified → SUPPORTING.
+        assert records[0].classification == EvidenceClassification.SUPPORTING
+
+
+# ==============================================================================
+# 17. Finding — Absent vs. Explicitly Non-Finite Metric Distinction
+# ==============================================================================
+
+class TestAbsentVsNonFiniteMetric:
+    def test_absent_held_out_metric_falls_back_to_training_tier(self):
+        """A candidate with no held-out primary metric key should fall into
+        VALID_TRAINING_ONLY if it has a valid training metric, NOT INCOMPARABLE."""
+        import dataclasses
+        c = make_candidate("hyp-1")
+        base = make_evaluation_result("hyp-1", mae=0.05, held_out_mae=None)
+        # Remove mae from held_out_metrics entirely (absent, not NaN).
+        eval_no_ho = dataclasses.replace(base, held_out_metrics=None)
+
+        res = rank_candidates([c], {"hyp-1": eval_no_ho}, {})
+        rc = res.ranked_candidates[0]
+        assert rc.evaluation_tier == EvaluationTier.VALID_TRAINING_ONLY
+
+    def test_explicitly_nan_held_out_metric_classified_incomparable(self):
+        """A candidate with held_out_metrics containing NaN should be INCOMPARABLE,
+        not VALID_TRAINING_ONLY, even if training metric is valid."""
+        import dataclasses
+        c = make_candidate("hyp-nan")
+        base = make_evaluation_result("hyp-nan", mae=0.05, held_out_mae=float("nan"))
+
+        res = rank_candidates([c], {"hyp-nan": base}, {})
+        rc = res.ranked_candidates[0]
+        assert rc.evaluation_tier == EvaluationTier.INCOMPARABLE
+
+
+# ==============================================================================
+# 18. Finding — Rerank Audit Boundary
+# ==============================================================================
+
+class TestRerankAuditBoundary:
+    def test_rerank_produces_self_contained_new_result(self):
+        """rerank_on_new_observations must return a deterministic, self-contained
+        RankingResult; the prior snapshot (current_ranking) is not mutated."""
+        ranker = HypothesisRanker()
+        c1 = make_candidate("hyp-1")
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.05)
+
+        initial_obs = [make_observation(f"o{i}", x=float(i), y=2.0 * i) for i in range(1, 6)]
+        initial_res = ranker.rank_candidates(
+            [c1], {"hyp-1": e1}, {"hyp-1": initial_obs}
+        )
+
+        # Add one contradicting observation.
+        extra_obs = make_observation("o99", x=10.0, y=999.0)
+        reranked = ranker.rerank_on_new_observations(
+            current_ranking=initial_res,
+            candidates=[c1],
+            evaluation_results={"hyp-1": e1},
+            updated_observations_by_hypothesis={"hyp-1": initial_obs + [extra_obs]},
+        )
+
+        # Prior snapshot is unchanged.
+        assert initial_res.ranked_candidates[0].evidence_summary.contradicting_count == 0
+
+        # New result reflects the contradiction.
+        new_rc = reranked.ranked_candidates[0]
+        assert new_rc.evidence_summary.contradicting_count == 1
+        assert reranked.ranking_version == RANKING_VERSION
 
