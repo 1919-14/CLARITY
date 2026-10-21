@@ -25,9 +25,11 @@ Each retry reserves another unit of query budget before calling the oracle. A re
 
 ## Concurrency and lifecycle
 
-The engine's lifecycle start is protected by a lock, preventing the same engine instance from being started twice concurrently. Query-budget reservations are also protected by a lock so concurrent reservations cannot increment attempted-query accounting beyond the configured ceiling. The current discovery loop itself submits at most one selected experiment at a time; shared budgets across multiple engine instances or remote workers must be coordinated by the per-run budget manager in Issue #14.
+The engine's lifecycle start is protected by a lock, preventing the same engine instance from being started twice concurrently. Query-budget reservations are also protected by a lock so concurrent reservations cannot increment attempted-query accounting beyond the configured ceiling.
 
-Cancellation is not currently exposed as a core `DiscoveryEngine` operation. A future orchestration/API cancellation path should map to an explicit terminal state/reason rather than pretending the run completed normally.
+**Sequential execution per engine instance.** The current discovery loop submits at most one oracle experiment at a time. The duplicate-input check reads `_observations`, which is only mutated after a successful, serialized oracle response. This means the duplicate check is safe and correct for a single engine instance. Shared budgets or deduplication across multiple engine instances or remote workers require the per-run budget manager in Issue #14 and are not protected by the current `_query_lock`.
+
+**Cancellation (deferred scope).** Cancellation is not currently exposed as a core `DiscoveryEngine` operation. A future orchestration or API cancellation path should map the cancellation signal to an explicit terminal reason (e.g., `USER_CANCELLED`) and call the finalization path rather than interrupting the run mid-iteration. Until that support is added, a run that is externally interrupted has no graceful terminal state and will not appear as `RUNNING` only if the engine process itself is killed.
 
 ## Stopping conditions
 

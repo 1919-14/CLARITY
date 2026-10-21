@@ -1142,6 +1142,11 @@ class DiscoveryEngine:
                 if (
                     self._is_retryable_oracle_exception(exc)
                     and attempt_index < self._config.max_query_retries
+                    # Fast-path guard only — not the authoritative reservation.
+                    # The loop is sequential (one oracle call active at a time per
+                    # engine instance), so this read outside the lock is safe.
+                    # The authoritative atomic budget check happens under
+                    # ``_query_lock`` at the top of the next loop iteration.
                     and self._attempted_queries < self._config.max_query_budget
                 ):
                     with self._query_lock:
