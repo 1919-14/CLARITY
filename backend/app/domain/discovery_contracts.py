@@ -46,6 +46,7 @@ from .experiment_generator import (
 )
 from .fitting import FittingConfig
 from .candidate_generator import HypothesisGenerationConfig
+from .llm_scientist_contracts import ScientistRoundRecord
 from .ranking_contracts import RankingPolicyConfig, RankingResult
 
 # ==============================================================================
@@ -75,6 +76,9 @@ WARNING_EXPERIMENT_POOL_UNDERSIZED = "EXPERIMENT_POOL_UNDERSIZED"
 WARNING_DUPLICATE_QUERY_SKIPPED = "DUPLICATE_QUERY_SKIPPED"
 WARNING_RANKING_STALE = "RANKING_STALE"
 WARNING_EXPERIMENT_SELECTION_UNAVAILABLE = "EXPERIMENT_SELECTION_UNAVAILABLE"
+WARNING_SCIENTIST_FALLBACK = "SCIENTIST_FALLBACK"
+WARNING_SCIENTIST_ROUND_FAILED = "SCIENTIST_ROUND_FAILED"
+WARNING_SCIENTIST_PROPOSAL_SKIPPED = "SCIENTIST_PROPOSAL_SKIPPED"
 
 DISCOVERY_ENGINE_VERSION = "1.0.0"
 
@@ -666,6 +670,9 @@ class DiscoveryRunResult:
       warnings: Structured non-fatal warnings.
       ranking_is_fresh: False when a new observation was committed but the
         evaluation/ranking refresh failed; the ranking snapshot is then stale.
+      scientist_history: One auditable record per optional LLM Scientist proposal
+        round (Issue #41), including provider failures and fallbacks. Empty for
+        deterministic-only runs.
       limitations: Human-readable limitations of this run.
       started_at / finished_at: UTC ISO-8601 timestamps.
     """
@@ -686,6 +693,7 @@ class DiscoveryRunResult:
     errors: Tuple[StructuredError, ...] = ()
     warnings: Tuple[StructuredError, ...] = ()
     ranking_is_fresh: bool = False
+    scientist_history: Tuple[ScientistRoundRecord, ...] = ()
     limitations: Tuple[str, ...] = ()
     started_at: str = field(default_factory=utc_now_iso)
     finished_at: str = field(default_factory=utc_now_iso)
@@ -729,6 +737,7 @@ class DiscoveryRunResult:
             "ingestion_history": [record.to_dict() for record in self.ingestion_history],
             "errors": [error.to_dict() for error in self.errors],
             "warnings": [warning.to_dict() for warning in self.warnings],
+            "scientist_history": [record.to_dict() for record in self.scientist_history],
             "limitations": list(self.limitations),
         }
         verify_no_ground_truth_leakage(data)
@@ -767,6 +776,9 @@ __all__ = [
     "WARNING_DUPLICATE_QUERY_SKIPPED",
     "WARNING_RANKING_STALE",
     "WARNING_EXPERIMENT_SELECTION_UNAVAILABLE",
+    "WARNING_SCIENTIST_FALLBACK",
+    "WARNING_SCIENTIST_ROUND_FAILED",
+    "WARNING_SCIENTIST_PROPOSAL_SKIPPED",
     "DISCOVERY_ENGINE_VERSION",
     "DiscoveryRunError",
     "DiscoveryLifecycleStatus",

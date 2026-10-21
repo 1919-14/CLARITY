@@ -108,6 +108,20 @@ npm test
 npm run build
 ```
 
+Optional LLM Scientist (Issue #41) checks; they run fully offline with a fake
+provider and need no credentials:
+
+```bash
+cd backend
+python -m pytest tests/test_llm_scientist.py -q
+python -m benchmarks.llm_scientist_benchmark
+```
+
+A real Groq smoke test is optional, requires `GROQ_API_KEY`, and must be
+reported separately with redacted metadata. Never describe an offline fake
+provider run as live provider execution. Setup and environment variables are
+documented in [llm-scientist.md](llm-scientist.md).
+
 These are examples, not evidence that those directories/scripts already exist. Verify before relying on them.
 
 ## Environment and secrets
@@ -119,6 +133,7 @@ These are examples, not evidence that those directories/scripts already exist. V
 - Keep local data, build artifacts, caches, dependency folders, coverage output, and credentials out of Git.
 - Document tests that require MySQL, Nodus credentials, network access, or other external services.
 - Do not assume provider balance, budget enforcement, cost reporting, or SDK behavior without verification.
+- The optional LLM Scientist is disabled by default; only `LLM_SCIENTIST_*` variables plus the provider credential (for example `GROQ_API_KEY`) enable it. Never log or serialize the credential, authorization headers, or raw provider payloads.
 
 ## Documentation and definition of done
 

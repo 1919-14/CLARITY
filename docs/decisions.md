@@ -248,6 +248,24 @@ Uncertainty is reported unavailable. The fit/evaluation contracts expose no vali
 
 **Validation:** `backend/tests/test_experiment_selection.py` (metrics including large-magnitude representable variance and unrepresentable overflow, discriminative selection, ties and order reversal, duplicate tolerance and schema compatibility, fallback, eligibility, strict/opt-in sources, seeded baseline, planner compatibility, engine integration, frozen diagnostics, ground-truth isolation); [experiment-selection.md](experiment-selection.md); [contracts.md](contracts.md) §8; [discovery-loop.md](discovery-loop.md) §6.
 
+## D-022 — Optional, provider-independent LLM Scientist that only proposes
+
+**Status:** Confirmed (Issue #41)
+
+**Decision:** Add an opt-in LLM Scientist behind a narrow `LLMProposalProvider` protocol. It receives only a bounded, permitted evidence context (committed observations, candidate specifications, evaluation metrics, ranking summaries, prior round outcomes) and returns structured proposals that are parsed as untrusted JSON, schema/domain validated, canonicalized, deduplicated, and converted into the existing `HypothesisRepresentation` contract. Groq is the first runtime provider behind that protocol. Deterministic-only remains the default and requires no credentials, network, or provider package at import time.
+
+The engine calls at most one proposal round after the initial ranking pass and after each successful query, bounded by `LLMScientistConfig.max_rounds`; rounds consume no oracle budget. Hypotheses enter the existing fitting/evaluation/ranking pipeline with stable IDs and provenance (provider, model, prompt/schema versions, round ID, uncalibrated self-confidence, live-vs-fake flag). Advisory experiment suggestions are queued for the existing `CandidateExperimentGenerator` through `ExperimentGenerationConfig.suggested_inputs`, so the planner, oracle validation, duplicate guard, query budget, and stopping policy remain authoritative.
+
+Provider failures and empty rounds emit `SCIENTIST_FALLBACK`, record a non-success round in `DiscoveryRunResult.scientist_history`, and continue deterministic discovery; `disable_further_rounds` additionally stops provider calls for the run. Evaluator-only ground truth is never serialized into requests, records, logs, or results, and both request/record construction fail closed on forbidden keys.
+
+**Rationale:** The LLM can enrich the hypothesis space without becoming a scientific authority. A provider-independent interface keeps the discovery engine free of SDK details and leaves room for another compatible provider. Bounded context/response/round/retry limits and strict local validation prevent unbounded token, candidate, or query growth. Explicit fallback records prevent a provider failure from masquerading as an LLM success.
+
+**Trade-off:** Proposal quality depends on provider, model, and prompt, and is not reproducible at non-zero temperature. Only the one-dimensional numeric polynomial family is supported; other structures are rejected rather than approximated. Confidence is uncalibrated and never used. The offline synthetic benchmark showed no held-out error advantage because the deterministic generator already contains a cubic candidate that fits the noiseless synthetic oracle; no improvement is claimed.
+
+**Rejected alternatives:** Letting the LLM decide correctness or write rankings (violates the proposal/validation split); executing generated code or expressions (unsafe and unsupported); exposing a generic serializer of discovery objects (leaks evaluator/private state); automatic silent fallback to generated candidates labeled as LLM output (misreports provenance); adding a parallel experiment planner or oracle path (bypasses Issue #9/#10/#11 controls); requiring a live provider for the test suite (non-reproducible, credential-dependent).
+
+**Validation:** `backend/tests/test_llm_scientist.py` (schema/domain/safety rejection, canonical dedupe, provider outcome taxonomy, bounded retries, secret hygiene, deterministic mode, pipeline integration, evidence feedback, fallback, suggestion routing, state immutability, isolation, reproducibility); `backend/benchmarks/llm_scientist_benchmark.py`; [llm-scientist.md](llm-scientist.md); [contracts.md](contracts.md) §9.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.

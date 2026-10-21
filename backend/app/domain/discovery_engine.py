@@ -75,6 +75,9 @@ from .discovery_contracts import (
     WARNING_EXPERIMENT_POOL_UNDERSIZED,
     WARNING_EXPERIMENT_SELECTION_UNAVAILABLE,
     WARNING_RANKING_STALE,
+    WARNING_SCIENTIST_FALLBACK,
+    WARNING_SCIENTIST_PROPOSAL_SKIPPED,
+    WARNING_SCIENTIST_ROUND_FAILED,
     DeterministicOrderPlanner,
     DiscoveryIngestionRecord,
     DiscoveryIterationRecord,
@@ -100,6 +103,8 @@ from .experiment_generator import (
     ExperimentGenerationConfig,
 )
 from .hypothesis_models import ModelFamilyRegistry, default_registry
+from .llm_scientist import LLMScientist
+from .llm_scientist_contracts import ScientistRoundRecord
 from .ranking_contracts import EvaluationTier, PlausibilityStatus, RankingResult
 from .ranking_engine import HypothesisRanker
 from .selection_contracts import ExperimentSelectionResult
@@ -145,6 +150,7 @@ class DiscoveryEngine:
         experiment_generator: Optional[CandidateExperimentGenerator] = None,
         planner: Optional[ExperimentPlanner] = None,
         registry: Optional[ModelFamilyRegistry] = None,
+        scientist: Optional[LLMScientist] = None,
         run_id: Optional[str] = None,
     ):
         if not callable(getattr(oracle, "validate_input", None)) or not callable(
@@ -196,6 +202,21 @@ class DiscoveryEngine:
         )
         self._experiment_generator = experiment_generator or CandidateExperimentGenerator()
         self._planner: ExperimentPlanner = planner or DeterministicOrderPlanner()
+
+        # Optional LLM Scientist (Issue #41). It is a proposal source only: the
+        # engine still owns fitting, evaluation, ranking, query accounting,
+        # experiment selection, and stopping. ``None`` means deterministic-only.
+        if scientist is not None and not callable(getattr(scientist, "propose", None)):
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_INVALID_DISCOVERY_CONFIG,
+                    "scientist must expose a propose() method.",
+                    received_type=type(scientist).__name__,
+                )
+            )
+        self._scientist = scientist
+        self._scientist_history: List[ScientistRoundRecord] = []
+        self._pending_suggested_inputs: List[float] = []
 
         self._run_id = run_id or generate_id("run")
         self._dataset_id = self._config.dataset_id or self._run_id
@@ -317,6 +338,22 @@ class DiscoveryEngine:
                 )
         else:
             if not self._rank_without_evaluations():
+                return self._finalize(
+                    DiscoveryLifecycleStatus.FAILED,
+                    DiscoveryTerminationReason.COMPONENT_FAILURE,
+                )
+
+        # Optional first LLM proposal round: it sees the initial committed
+        # evidence and, if it contributes new candidates, those candidates are
+        # evaluated and ranked by the existing pipeline before iteration 1.
+        if self._run_scientist_round(iteration=None):
+            if self._observations:
+                if not self._refresh_evaluation_and_ranking():
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.FAILED,
+                        DiscoveryTerminationReason.COMPONENT_FAILURE,
+                    )
+            elif not self._rank_without_evaluations():
                 return self._finalize(
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
@@ -603,6 +640,18 @@ class DiscoveryEngine:
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
                 )
 
+            # Evidence feedback cycle (Issue #41): only a successful query adds
+            # committed evidence, so only then may a later proposal round see it.
+            if (
+                execution.outcome == ExperimentExecutionOutcome.INVOKED_SUCCESS
+                and self._run_scientist_round(iteration=iteration)
+            ):
+                if not self._refresh_evaluation_and_ranking():
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.FAILED,
+                        DiscoveryTerminationReason.COMPONENT_FAILURE,
+                    )
+
             if (
                 execution.outcome == ExperimentExecutionOutcome.INVOKED_FAILED
                 and self._consecutive_failures >= self._config.stopping_criteria.consecutive_failure_limit
@@ -737,10 +786,191 @@ class DiscoveryEngine:
 
         return None
 
+    def _max_supported_polynomial_degree(self) -> int:
+        """Highest degree the run's candidate configuration supports."""
+        return max(0, int(self._config.hypothesis_config.max_degree))
+
+    def _run_scientist_round(self, iteration: Optional[int]) -> bool:
+        """Run one optional LLM proposal round; return True when candidates were added.
+
+        The scientist receives only permitted state through the ``propose``
+        arguments: committed observations, candidate specifications, evaluation
+        metrics, the ranking snapshot, and the configured domain. It never
+        receives the oracle, evaluator objects, ground truth, credentials, or
+        query counters as mutable state.
+
+        Every returned proposal is re-validated here before it becomes a
+        candidate, so a provider cannot add an unsupported family, duplicate
+        candidate, or malformed specification even if the scientist contract were
+        bypassed. Advisory experiment suggestions are queued for the existing
+        experiment generator; they cannot call the oracle directly.
+        """
+        scientist = self._scientist
+        if scientist is None:
+            return False
+        if not bool(getattr(scientist, "can_propose", True)):
+            return False
+        # A proposal round never consumes oracle budget. It only runs when true
+        # committed evidence exists to reason about, and the scientist's own
+        # ``max_rounds`` bounds the total number of provider calls. With a zero
+        # query budget the run is "evaluate initial observations only", so no
+        # provider call is made at all.
+        if not self._observations:
+            return False
+        if iteration is None and self._config.max_query_budget == 0:
+            return False
+
+        try:
+            outcome = scientist.propose(
+                run_id=self._run_id,
+                observations=self.observations,
+                candidates=tuple(self._candidates),
+                evaluations=dict(self._evaluations),
+                ranking=self._ranking,
+                domain_bounds=self._config.domain_bounds,
+                output_variable=self._output_variable or "y",
+                max_polynomial_degree=self._max_supported_polynomial_degree(),
+                iteration=iteration,
+            )
+        except Exception as exc:  # noqa: BLE001 - scientist boundary is untrusted
+            self._warnings.append(
+                make_structured_error(
+                    WARNING_SCIENTIST_ROUND_FAILED,
+                    "Optional LLM Scientist round failed; deterministic discovery "
+                    "continues with the existing candidates.",
+                    exception_type=type(exc).__name__,
+                    iteration=iteration,
+                )
+            )
+            return False
+
+        record = getattr(outcome, "record", None)
+        hypotheses = getattr(outcome, "hypotheses", ())
+        if not isinstance(record, ScientistRoundRecord) or not isinstance(hypotheses, tuple):
+            self._warnings.append(
+                make_structured_error(
+                    WARNING_SCIENTIST_ROUND_FAILED,
+                    "Optional LLM Scientist returned an invalid outcome; its output was "
+                    "ignored and deterministic discovery continues.",
+                    iteration=iteration,
+                )
+            )
+            return False
+
+        self._scientist_history.append(record)
+        if record.fallback_applied:
+            self._warnings.append(
+                make_structured_error(
+                    WARNING_SCIENTIST_FALLBACK,
+                    record.fallback_reason
+                    or "LLM proposal round produced no usable hypothesis; deterministic "
+                    "discovery continued.",
+                    round_id=record.round_id,
+                    outcome_status=(
+                        record.outcome_status.value
+                        if record.outcome_status is not None
+                        else None
+                    ),
+                    rejected_count=record.rejected_count,
+                    iteration=iteration,
+                )
+            )
+
+        added = 0
+        existing_ids = set(self._candidate_by_id)
+        existing_keys = {
+            key
+            for key in (
+                self._canonical_candidate_key(candidate) for candidate in self._candidates
+            )
+            if key is not None
+        }
+        for hypothesis in hypotheses:
+            if not isinstance(hypothesis, HypothesisRepresentation):
+                continue
+            if not hypothesis.hypothesis_id or hypothesis.hypothesis_id in existing_ids:
+                self._warnings.append(
+                    make_structured_error(
+                        WARNING_SCIENTIST_PROPOSAL_SKIPPED,
+                        "Scientist proposal was skipped because its hypothesis ID is "
+                        "empty or already used.",
+                        round_id=record.round_id,
+                    )
+                )
+                continue
+            family = self._registry.get(hypothesis.model_family)
+            if family is None:
+                self._warnings.append(
+                    make_structured_error(
+                        WARNING_SCIENTIST_PROPOSAL_SKIPPED,
+                        "Scientist proposal used an unregistered model family and was "
+                        "skipped.",
+                        round_id=record.round_id,
+                        model_family=hypothesis.model_family,
+                    )
+                )
+                continue
+            model, model_error = family.parse_specification(hypothesis.parameters)
+            if model_error is not None or model is None:
+                self._warnings.append(
+                    make_structured_error(
+                        WARNING_SCIENTIST_PROPOSAL_SKIPPED,
+                        "Scientist proposal had an invalid model specification and was "
+                        "skipped.",
+                        round_id=record.round_id,
+                        family_error_code=(model_error.code if model_error else None),
+                    )
+                )
+                continue
+            canonical_key = model.canonical_key()
+            if canonical_key in existing_keys:
+                self._warnings.append(
+                    make_structured_error(
+                        WARNING_SCIENTIST_PROPOSAL_SKIPPED,
+                        "Scientist proposal duplicated an existing candidate and was "
+                        "skipped.",
+                        round_id=record.round_id,
+                        hypothesis_id=hypothesis.hypothesis_id,
+                    )
+                )
+                continue
+            existing_keys.add(canonical_key)
+            existing_ids.add(hypothesis.hypothesis_id)
+            self._candidates.append(hypothesis)
+            self._candidate_by_id[hypothesis.hypothesis_id] = hypothesis
+            added += 1
+
+        for value in getattr(outcome, "suggested_inputs", ()):
+            if self._config.domain_bounds.validate_value(value) is not None:
+                continue
+            numeric = float(value)
+            if numeric not in self._pending_suggested_inputs:
+                self._pending_suggested_inputs.append(numeric)
+
+        return added > 0
+
+    def _canonical_candidate_key(
+        self, candidate: HypothesisRepresentation
+    ) -> Optional[str]:
+        """Canonical duplication key for a candidate, or None when unparseable."""
+        family = self._registry.get(candidate.model_family)
+        if family is None:
+            return None
+        model, error = family.parse_specification(candidate.parameters)
+        if error is not None or model is None:
+            return None
+        return model.canonical_key()
+
     def _generate_experiment_batch(self):
         exclude_inputs = [
             dict(observation.input_values) for observation in self._observations.values()
         ]
+        # Advisory LLM suggestions are consumed once, through the existing
+        # generator's validation/deduplication, and then cleared. The planner,
+        # oracle validation, duplicate guard, and query budget still decide
+        # whether anything is actually executed.
+        suggested_inputs = list(self._pending_suggested_inputs)
+        self._pending_suggested_inputs.clear()
         generation_config = ExperimentGenerationConfig(
             pool_size=self._config.experiment_pool_size,
             strategy=self._config.experiment_strategy,
@@ -749,6 +979,7 @@ class DiscoveryEngine:
             exclude_inputs=exclude_inputs,
             tolerance=self._config.query_exclusion_tolerance,
             allow_undersized=True,
+            suggested_inputs=suggested_inputs,
         )
         try:
             return self._experiment_generator.generate_batch(generation_config)
@@ -1527,6 +1758,18 @@ class DiscoveryEngine:
             limitations.append(
                 "The configured query budget was zero, so only initial observations were used."
             )
+        if self._scientist is not None:
+            limitations.append(
+                "Optional LLM-assisted proposals are uncalibrated conjectures; their "
+                "self-reported confidence is not statistical uncertainty, and only the "
+                "existing fitting/evaluation/ranking components judge them."
+            )
+            if any(record.fallback_applied for record in self._scientist_history):
+                limitations.append(
+                    "At least one LLM proposal round produced no usable hypothesis or "
+                    "failed; deterministic discovery continued and the fallback is "
+                    "recorded in scientist_history."
+                )
         return tuple(limitations)
 
     def _finalize(
@@ -1570,6 +1813,7 @@ class DiscoveryEngine:
             errors=tuple(self._frozen_error(error) for error in self._errors),
             warnings=tuple(self._frozen_error(warning) for warning in self._warnings),
             ranking_is_fresh=self._ranking_is_fresh,
+            scientist_history=tuple(self._scientist_history),
             limitations=self._limitations(),
             started_at=self._started_at,
             finished_at=self._finished_at,

@@ -77,6 +77,7 @@ Keep domain logic independent of Flask request objects, React state, MySQL-speci
 - **Active selector:** disagreement and defensible uncertainty/information signals.
 - **Stopping policy:** continue or stop with explicit reason.
 - **Step interface:** execute a discovery step and return explicit outcomes.
+- **Optional LLM Scientist (#41):** a disabled-by-default, provider-independent proposal source. It consumes only permitted observations/evidence and returns validated proposals through the existing hypothesis contract; CLARITY still owns fitting, evaluation, ranking, selection, oracle access, budget, and stopping. See [llm-scientist.md](llm-scientist.md).
 
 Issues #5-#7 and #9 implement the scientific subcomponents. Issue #8 adds the coordinator, `DiscoveryEngine` in `backend/app/domain/discovery_engine.py`, which connects them through their public interfaces only: candidate generation, one `evaluate_many` refresh, one `rank_candidates` call, experiment generation, a narrow `ExperimentPlanner` selection boundary, and budget-checked `OracleInterface` queries. The engine owns the deterministic termination precedence, query accounting, observation commit boundary, run history, and the immutable `DiscoveryRunResult`. Active selection (#10/#11) plugs in as a planner without changing the orchestrator. See [discovery-loop.md](discovery-loop.md).
 
@@ -113,13 +114,16 @@ The evaluator is separate from discovery. It may access hidden rules/labels to c
 7. Ranker produces candidates with measured metrics and evidence.
 8. Experiment generator proposes valid candidate queries.
 9. Active selector scores queries using disagreement/uncertainty signals.
-10. Budget manager checks whether more oracle and compute work is permitted.
-11. Oracle adapter executes the selected query and returns an observation.
-12. Observation and run event are persisted; candidate evaluations/evidence update.
-13. Repeat until a stopping condition or resource limit is reached.
-14. Record terminal status/reason and build the report from persisted evidence.
-15. Frontend polls and displays hypotheses, observations, report, and metrics.
-16. Separately, evaluator uses ground truth for benchmark scoring without exposing answers to discovery.
+10. Optionally, the LLM Scientist proposes new candidate hypotheses from the
+    newly committed evidence; proposals are validated locally and re-enter the
+    same fitting/evaluation/ranking pipeline.
+11. Budget manager checks whether more oracle and compute work is permitted.
+12. Oracle adapter executes the selected query and returns an observation.
+13. Observation and run event are persisted; candidate evaluations/evidence update.
+14. Repeat until a stopping condition or resource limit is reached.
+15. Record terminal status/reason and build the report from persisted evidence.
+16. Frontend polls and displays hypotheses, observations, report, and metrics.
+17. Separately, evaluator uses ground truth for benchmark scoring without exposing answers to discovery.
 
 ## Data isolation and failure rules
 
@@ -133,6 +137,7 @@ The evaluator is separate from discovery. It may access hidden rules/labels to c
 - Record real vs mocked remote execution accurately.
 - Bound retries and prevent duplicate events from creating duplicate records where idempotency is required.
 - The discovery loop reserves query budget before every oracle call, never commits an invalid oracle response, and marks `ranking_is_fresh = false` instead of presenting a stale ranking as current ([discovery-loop.md](discovery-loop.md)).
+- The optional LLM Scientist receives only permitted evidence, cannot execute generated code, call an oracle, or mutate committed state, and records every round (including failures and fallbacks) without credentials ([llm-scientist.md](llm-scientist.md)).
 
 ## Suggested code boundaries
 
@@ -144,6 +149,7 @@ backend/
     domain/          # hypotheses, observations, experiments, policies
     adapters/
       oracle/        # black-box query adapters
+      llm/           # optional LLM Scientist provider adapters (#41)
       nodus/         # remote execution adapter
       persistence/   # MySQL/repository implementations
     config.py

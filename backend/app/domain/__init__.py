@@ -133,6 +133,28 @@ from .experiment_selection import (
     RandomBaselinePlanner,
     compute_disagreement,
 )
+from .llm_scientist_contracts import (
+    SCIENTIST_PROMPT_VERSION,
+    SCIENTIST_SCHEMA_VERSION,
+    SCIENTIST_VERSION,
+    LLMProposalProvider,
+    LLMProposalRequest,
+    LLMScientistConfig,
+    ProposalRejection,
+    ProposalRejectionCode,
+    ProviderCallResult,
+    ProviderOutcomeStatus,
+    ScientistFallbackPolicy,
+    ScientistRoundRecord,
+    ScientistRoundStatus,
+)
+from .llm_scientist import (
+    SCIENTIST_GENERATOR_NAME,
+    LLMScientist,
+    ScientistRoundOutcome,
+    render_system_prompt,
+    render_user_prompt,
+)
 
 __all__ = [
     "StructuredError",
@@ -247,4 +269,23 @@ __all__ = [
     "ActiveExperimentSelector",
     "ExperimentSelectionPlanner",
     "RandomBaselinePlanner",
+    # Issue #41: optional LLM Scientist
+    "SCIENTIST_VERSION",
+    "SCIENTIST_PROMPT_VERSION",
+    "SCIENTIST_SCHEMA_VERSION",
+    "SCIENTIST_GENERATOR_NAME",
+    "LLMScientistConfig",
+    "LLMProposalProvider",
+    "LLMProposalRequest",
+    "ProviderCallResult",
+    "ProviderOutcomeStatus",
+    "ProposalRejection",
+    "ProposalRejectionCode",
+    "ScientistFallbackPolicy",
+    "ScientistRoundRecord",
+    "ScientistRoundStatus",
+    "ScientistRoundOutcome",
+    "LLMScientist",
+    "render_system_prompt",
+    "render_user_prompt",
 ]
