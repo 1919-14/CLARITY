@@ -120,6 +120,7 @@ class DiscoveryTerminationReason(str, Enum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     EXPERIMENT_POOL_EXHAUSTED = "experiment_pool_exhausted"
+    NO_INFORMATIVE_EXPERIMENT_AVAILABLE = "no_informative_experiment_available"
     CONSECUTIVE_ORACLE_FAILURES = "consecutive_oracle_failures"
     COMPONENT_FAILURE = "component_failure"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
