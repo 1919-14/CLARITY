@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from .candidate_generator import CandidateGenerationError, CandidateGenerator
@@ -46,6 +47,7 @@ from .contracts import (
     Observation,
     ObservationStatus,
     OracleInterface,
+    OracleQueryError,
     StructuredError,
     freeze_payload,
     generate_id,
@@ -236,8 +238,17 @@ class DiscoveryEngine:
         self._attempted_queries = 0
         self._successful_queries = 0
         self._failed_queries = 0
+        self._rejected_queries = 0
+        self._duplicate_queries = 0
+        self._retry_count = 0
+        self._in_flight_queries = 0
+        # Query reservations are atomic so concurrent callers cannot reserve
+        # more invocations than the configured run budget.
+        self._query_lock = Lock()
+        self._lifecycle_lock = Lock()
         self._consecutive_failures = 0
         self._iterations_completed = 0
+        self._no_informative_experiment = False
 
         # History.
         self._experiment_history: List[ExperimentExecutionRecord] = []
@@ -305,16 +316,17 @@ class DiscoveryEngine:
         invalid initial observations or candidate generation failure) is
         reported inside the returned result as FAILED, before any oracle call.
         """
-        if self._started:
-            raise DiscoveryRunError(
-                make_structured_error(
-                    ERROR_INVALID_DISCOVERY_CONFIG,
-                    "This DiscoveryEngine instance has already been started; create a new "
-                    "engine for a new run.",
+        with self._lifecycle_lock:
+            if self._started:
+                raise DiscoveryRunError(
+                    make_structured_error(
+                        ERROR_INVALID_DISCOVERY_CONFIG,
+                        "This DiscoveryEngine instance has already been started; create a new "
+                        "engine for a new run.",
+                    )
                 )
-            )
-        self._started = True
-        self._started_at = utc_now_iso()
+            self._started = True
+            self._started_at = utc_now_iso()
 
         try:
             self._initialize_candidates()
@@ -597,9 +609,14 @@ class DiscoveryEngine:
                 )
 
             if execution is None:
+                reason = (
+                    DiscoveryTerminationReason.NO_INFORMATIVE_EXPERIMENT_AVAILABLE
+                    if self._no_informative_experiment
+                    else DiscoveryTerminationReason.EXPERIMENT_POOL_EXHAUSTED
+                )
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_NO_EXPERIMENTS,
-                    DiscoveryTerminationReason.EXPERIMENT_POOL_EXHAUSTED,
+                    reason,
                 )
 
             iteration_warnings: List[StructuredError] = []
@@ -652,6 +669,22 @@ class DiscoveryEngine:
                         DiscoveryTerminationReason.COMPONENT_FAILURE,
                     )
 
+            # Stopping precedence order:
+            # 1. Configured stopping criterion satisfied
+            criterion = self._satisfied_stopping_criterion()
+            if criterion is not None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION, criterion
+                )
+
+            # 2. Query budget exhausted (takes precedence over consecutive failures)
+            if self._attempted_queries >= self._config.max_query_budget:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
+
+            # 3. Repeated consecutive oracle failures when budget remains
             if (
                 execution.outcome == ExperimentExecutionOutcome.INVOKED_FAILED
                 and self._consecutive_failures >= self._config.stopping_criteria.consecutive_failure_limit
@@ -703,6 +736,7 @@ class DiscoveryEngine:
                     selection_diagnostics is not None
                     and selection_diagnostics.get("status") == "no_selection"
                 ):
+                    self._no_informative_experiment = True
                     self._warnings.append(
                         make_structured_error(
                             WARNING_EXPERIMENT_SELECTION_UNAVAILABLE,
@@ -722,6 +756,7 @@ class DiscoveryEngine:
                 candidate.candidate_id == selected.candidate_id for candidate in batch.candidates
             )
             if not in_batch or selected.status != CandidateExperimentStatus.ELIGIBLE:
+                self._rejected_queries += 1
                 self._record_experiment(
                     iteration,
                     selected,
@@ -738,6 +773,7 @@ class DiscoveryEngine:
             if not self._config.allow_duplicate_queries and self._is_duplicate_input(
                 selected.input_data
             ):
+                self._duplicate_queries += 1
                 self._warnings.append(
                     make_structured_error(
                         WARNING_DUPLICATE_QUERY_SKIPPED,
@@ -770,12 +806,19 @@ class DiscoveryEngine:
                     )
                 ) from None
             if validation_error is not None:
-                self._warnings.append(validation_error)
+                self._rejected_queries += 1
+                cause_code = getattr(validation_error, "code", None) or "INVALID_INPUT"
+                sanitized_error = make_structured_error(
+                    cause_code if isinstance(cause_code, str) else "INVALID_INPUT",
+                    f"Oracle rejected candidate input ({cause_code}).",
+                    cause_code=cause_code,
+                )
+                self._warnings.append(sanitized_error)
                 self._record_experiment(
                     iteration,
                     selected,
                     ExperimentExecutionOutcome.REJECTED_PRE_INVOCATION,
-                    error=validation_error,
+                    error=sanitized_error,
                     selection_diagnostics=selection_diagnostics,
                 )
                 continue
@@ -1079,49 +1122,121 @@ class DiscoveryEngine:
         iteration: int,
         selection_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> ExperimentExecutionRecord:
-        self._attempted_queries += 1
-        try:
-            observation = self._oracle.query(selected.input_data)
-        except Exception as exc:  # noqa: BLE001 - oracle failures are recoverable data
-            self._failed_queries += 1
-            self._consecutive_failures += 1
-            error = make_structured_error(
-                ERROR_ORACLE_QUERY_FAILURE,
-                f"Oracle query raised ({type(exc).__name__}).",
-                exception_type=type(exc).__name__,
-            )
-            self._warnings.append(error)
+        """Invoke the oracle under an atomic query-budget reservation.
+
+        Only transient transport failures are retryable. Every retry is a new
+        oracle invocation and consumes budget; invalid responses and other
+        failures are not retried. Existing observations are committed only
+        after a successful, validated response.
+        """
+        last_error: Optional[StructuredError] = None
+        for attempt_index in range(self._config.max_query_retries + 1):
+            with self._query_lock:
+                if self._attempted_queries >= self._config.max_query_budget:
+                    if last_error is None:
+                        raise _BudgetExhausted()
+                    break
+                self._attempted_queries += 1
+                self._in_flight_queries = 1
+
+            try:
+                observation = self._oracle.query(selected.input_data)
+            except Exception as exc:  # noqa: BLE001 - oracle boundary
+                with self._query_lock:
+                    self._failed_queries += 1
+                    self._in_flight_queries = 0
+                    self._consecutive_failures += 1
+                if isinstance(exc, OracleQueryError):
+                    cause = exc.error
+                    # Do not forward arbitrary oracle error details: the
+                    # adapter is an untrusted boundary and may include data
+                    # that must not enter discovery diagnostics.
+                    error = make_structured_error(
+                        ERROR_ORACLE_QUERY_FAILURE,
+                        f"Oracle query failed ({cause.code}).",
+                        cause_code=cause.code,
+                    )
+                else:
+                    error = make_structured_error(
+                        ERROR_ORACLE_QUERY_FAILURE,
+                        f"Oracle query raised ({type(exc).__name__}).",
+                        exception_type=type(exc).__name__,
+                    )
+                last_error = error
+                self._warnings.append(error)
+                if (
+                    self._is_retryable_oracle_exception(exc)
+                    and attempt_index < self._config.max_query_retries
+                    # Fast-path guard only — not the authoritative reservation.
+                    # The loop is sequential (one oracle call active at a time per
+                    # engine instance), so this read outside the lock is safe.
+                    # The authoritative atomic budget check happens under
+                    # ``_query_lock`` at the top of the next loop iteration.
+                    and self._attempted_queries < self._config.max_query_budget
+                ):
+                    with self._query_lock:
+                        self._retry_count += 1
+                    continue
+                return self._record_experiment(
+                    iteration,
+                    selected,
+                    ExperimentExecutionOutcome.INVOKED_FAILED,
+                    error=error,
+                    selection_diagnostics=selection_diagnostics,
+                )
+
+            validation_error = self._validate_oracle_response(observation, selected.input_data)
+            if validation_error is not None:
+                with self._query_lock:
+                    self._failed_queries += 1
+                    self._in_flight_queries = 0
+                    self._consecutive_failures += 1
+                self._warnings.append(validation_error)
+                return self._record_experiment(
+                    iteration,
+                    selected,
+                    ExperimentExecutionOutcome.INVOKED_FAILED,
+                    error=validation_error,
+                    selection_diagnostics=selection_diagnostics,
+                )
+
+            with self._query_lock:
+                self._successful_queries += 1
+                self._in_flight_queries = 0
+                self._consecutive_failures = 0
+            self._observations[observation.observation_id] = self._frozen_observation(observation)
             return self._record_experiment(
                 iteration,
                 selected,
-                ExperimentExecutionOutcome.INVOKED_FAILED,
-                error=error,
+                ExperimentExecutionOutcome.INVOKED_SUCCESS,
+                observation=observation,
                 selection_diagnostics=selection_diagnostics,
             )
 
-        validation_error = self._validate_oracle_response(observation, selected.input_data)
-        if validation_error is not None:
-            self._failed_queries += 1
-            self._consecutive_failures += 1
-            self._warnings.append(validation_error)
-            return self._record_experiment(
-                iteration,
-                selected,
-                ExperimentExecutionOutcome.INVOKED_FAILED,
-                error=validation_error,
-                selection_diagnostics=selection_diagnostics,
-            )
-
-        self._successful_queries += 1
-        self._consecutive_failures = 0
-        self._observations[observation.observation_id] = self._frozen_observation(observation)
+        # A previous failed attempt consumed the remaining budget. Preserve
+        # its structured failure rather than submitting another oracle call.
+        assert last_error is not None
         return self._record_experiment(
             iteration,
             selected,
-            ExperimentExecutionOutcome.INVOKED_SUCCESS,
-            observation=observation,
+            ExperimentExecutionOutcome.INVOKED_FAILED,
+            error=last_error,
             selection_diagnostics=selection_diagnostics,
         )
+
+    @staticmethod
+    def _is_retryable_oracle_exception(exc: Exception) -> bool:
+        """Retry only explicit transient transport failures."""
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        if isinstance(exc, OracleQueryError):
+            return exc.error.code in {
+                "ORACLE_TIMEOUT",
+                "ORACLE_RATE_LIMITED",
+                "ORACLE_TEMPORARY_FAILURE",
+                "ORACLE_UNAVAILABLE",
+            }
+        return False
 
     def _record_experiment(
         self,
@@ -1419,12 +1534,17 @@ class DiscoveryEngine:
                 received_type=type(observation).__name__,
             )
         if observation.status != ObservationStatus.SUCCESS:
+            cause_code = (
+                observation.error.code
+                if (observation.error is not None and getattr(observation.error, "code", None))
+                else None
+            )
             return make_structured_error(
                 ERROR_ORACLE_QUERY_FAILURE,
                 f"Oracle returned status {observation.status.value!r}; the response is not "
                 "committed as evidence.",
                 status=observation.status.value,
-                cause=observation.error.to_dict() if observation.error is not None else None,
+                cause_code=cause_code,
             )
         if observation.observation_id in self._observations:
             return make_structured_error(
@@ -1726,12 +1846,17 @@ class DiscoveryEngine:
     # ------------------------------------------------------------------
 
     def _accounting(self) -> QueryAccounting:
-        return QueryAccounting(
-            max_query_budget=self._config.max_query_budget,
-            attempted_queries=self._attempted_queries,
-            successful_queries=self._successful_queries,
-            failed_queries=self._failed_queries,
-        )
+        with self._query_lock:
+            return QueryAccounting(
+                max_query_budget=self._config.max_query_budget,
+                attempted_queries=self._attempted_queries,
+                successful_queries=self._successful_queries,
+                failed_queries=self._failed_queries,
+                rejected_queries=self._rejected_queries,
+                duplicate_queries=self._duplicate_queries,
+                retry_count=self._retry_count,
+                in_flight_queries=self._in_flight_queries,
+            )
 
     def _limitations(self) -> Tuple[str, ...]:
         limitations = list(RUN_LIMITATIONS)

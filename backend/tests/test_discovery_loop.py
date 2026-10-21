@@ -699,8 +699,8 @@ def test_raising_oracle_consumes_budget_and_stops_at_failure_limit():
 def test_invalid_oracle_response_is_not_committed_and_preserves_prior_data():
     oracle = FakeOracle(invalid_input_id_on_calls={2})
     config = make_config(
-        max_query_budget=2,
-        max_iterations=2,
+        max_query_budget=3,
+        max_iterations=3,
         stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
     )
     initial = [make_observation(-1.5, 2.0, observation_id="obs-initial")]
@@ -740,8 +740,8 @@ def test_non_success_oracle_observation_is_a_failed_query():
 def test_invalid_output_value_is_rejected():
     oracle = FakeOracle(invalid_output_on_calls={1})
     config = make_config(
-        max_query_budget=1,
-        max_iterations=1,
+        max_query_budget=2,
+        max_iterations=2,
         stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
     )
     result = DiscoveryEngine(oracle, config).run()
@@ -1297,3 +1297,120 @@ def test_ungrid_strategy_still_respects_budget():
     assert len(oracle.submitted) == 2
     assert result.query_accounting.attempted_queries == 2
     assert len(set(tuple(sorted(v.items())) for v in oracle.submitted)) == 2
+
+
+# ==============================================================================
+# Additional Reviewer-Required Tests (T-04, T-05, T-06, T-07, Duplicate ID)
+# ==============================================================================
+
+
+def test_plausibility_criterion_takes_precedence_over_budget():
+    """T-04: Stopping criterion takes precedence when both plausibility and budget ceiling are reached."""
+    oracle = FakeOracle(lambda x: 2.0 * x + 1.0)
+    config = make_config(
+        max_query_budget=1,
+        max_iterations=3,
+        hypothesis_config=HypothesisGenerationConfig(
+            min_degree=0, max_degree=1, candidate_count=2, seed=5
+        ),
+        ranking_policy=RankingPolicyConfig(
+            min_samples_for_plausibility=4,
+            tolerance_absolute=1e-9,
+            tolerance_relative=0.0,
+            performance_acceptance_threshold=1e-6,
+        ),
+        stopping_criteria=StoppingCriteriaConfig(target_plausible_candidate_count=1),
+    )
+    initial_3 = _linear_initial_observations()[:3]
+    result = DiscoveryEngine(oracle, config).run(initial_3)
+
+    assert result.query_accounting.attempted_queries == 1
+    assert result.query_accounting.remaining_queries == 0
+    assert result.status == DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION
+    assert (
+        result.termination_reason
+        == DiscoveryTerminationReason.STOPPING_CRITERION_PLAUSIBILITY_REACHED
+    )
+
+
+def test_consecutive_failure_not_triggered_after_successful_retry():
+    """T-05: Successful retry resets consecutive failure counter so limit is not tripped."""
+    class FailOnceThenSucceedOracle(FakeOracle):
+        def __init__(self):
+            super().__init__(lambda x: 2.0 * x + 1.0)
+            self._attempt = 0
+
+        def query(self, experiment_input):
+            self._attempt += 1
+            if self._attempt == 1:
+                raise TimeoutError("transient timeout on first query")
+            return super().query(experiment_input)
+
+    oracle = FailOnceThenSucceedOracle()
+    config = make_config(
+        max_query_budget=3,
+        max_iterations=3,
+        max_query_retries=2,
+        stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
+    )
+    result = DiscoveryEngine(oracle, config).run()
+
+    assert result.status != DiscoveryLifecycleStatus.FAILED
+    assert result.termination_reason != DiscoveryTerminationReason.CONSECUTIVE_ORACLE_FAILURES
+    assert result.query_accounting.successful_queries >= 1
+    assert result.query_accounting.failed_queries == 1
+    assert result.query_accounting.retry_count == 1
+
+
+def test_committed_observation_is_frozen_and_immutable():
+    """T-06: Committed observation payload mappings are frozen and reject in-place mutation."""
+    engine = DiscoveryEngine(CountingOracle(), make_config(max_query_budget=1, max_iterations=1))
+    result = engine.run([make_observation(0.0, 1.0, observation_id="obs-frozen")])
+
+    with pytest.raises(TypeError):
+        result.observations[0].input_values["x"] = 9.0
+    with pytest.raises(TypeError):
+        result.observations[0].output_values["y"] = 9.0
+
+
+def test_failed_response_does_not_overwrite_committed_observation():
+    """T-07: A failed second oracle call does not mutate or overwrite previously committed observations."""
+    class FailOnSecondCallOracle(FakeOracle):
+        def __init__(self):
+            super().__init__(lambda x: 2.0 * x + 1.0)
+            self._calls = 0
+
+        def query(self, experiment_input):
+            self._calls += 1
+            if self._calls == 2:
+                raise RuntimeError("Oracle crashed on query 2")
+            return super().query(experiment_input)
+
+    oracle = FailOnSecondCallOracle()
+    config = make_config(
+        max_query_budget=3,
+        max_iterations=3,
+        max_query_retries=0,
+        stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
+    )
+    result = DiscoveryEngine(oracle, config).run()
+
+    assert result.status == DiscoveryLifecycleStatus.FAILED
+    assert result.termination_reason == DiscoveryTerminationReason.CONSECUTIVE_ORACLE_FAILURES
+    assert len(result.observations) == 1
+    committed = result.observations[0]
+    assert committed.output_values["y"] is not None
+
+
+def test_duplicate_observation_id_is_rejected_without_overwriting_original():
+    oracle = CountingOracle()
+    config = make_config(max_query_budget=2, max_iterations=2)
+    obs1 = make_observation(0.0, 1.0, observation_id="same-id")
+    obs2 = make_observation(1.0, 3.0, observation_id="same-id")
+    result = DiscoveryEngine(oracle, config).run([obs1, obs2])
+
+    assert result.status == DiscoveryLifecycleStatus.FAILED
+    assert any(err.code == ERROR_DUPLICATE_OBSERVATION_ID for err in result.errors)
+    assert len(result.observations) == 1
+    assert result.observations[0].input_values["x"] == 0.0
+
