@@ -1,9 +1,11 @@
 # CLARITY REST API Specification
 
-**Document Version:** 1.0.0 (Issue #19 Baseline)  
+**Document Version:** 1.1.0 (Issue #19 & Issue #20 Baseline)  
 **Status:** Confirmed  
 **Implementation References:**
-- Route Blueprints: [backend/app/routes/runs.py](../backend/app/routes/runs.py), [backend/app/routes/health.py](../backend/app/routes/health.py)
+- Unversioned Blueprints: [backend/app/routes/runs.py](../backend/app/routes/runs.py), [backend/app/routes/health.py](../backend/app/routes/health.py)
+- Versioned v1 Blueprints: [backend/app/routes/v1/](../backend/app/routes/v1/)
+- OpenAPI Specification: [docs/openapi_v1.yaml](openapi_v1.yaml)
 - Application Factory: [backend/app/__init__.py](../backend/app/__init__.py)
 - Persistence Adapter: [backend/app/adapters/persistence/](../backend/app/adapters/persistence/)
 
@@ -287,3 +289,155 @@
       "count": 1
     }
     ```
+
+---
+
+## 3. Versioned REST API v1 (`/api/v1`)
+
+The v1 API expands and stabilizes the endpoint surface for React frontend and external integrations under the `/api/v1` namespace.
+
+An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](openapi_v1.yaml).
+
+### 3.1 Key Guarantees & Differences
+
+1. **Version Isolation**: All endpoints are prefixed with `/api/v1` and registered via modular blueprints (`backend/app/routes/v1/`).
+2. **Explicit Allowlist Serialization**: Serializers in `backend/app/routes/v1/shared.py` define strict output fields. Hidden ground truth formulas, private oracle states, evaluator internal weights, and database infrastructure strings are completely filtered out.
+3. **Database Health Probe**: `GET /api/v1/health` executes a `SELECT 1` probe against the database. If unreachable, it returns HTTP 503 (`status: "degraded"`) without leaking internal error tracebacks or connection strings.
+4. **Distinction of Measured Zero vs Unavailable**: Usage metrics strictly return `null` (`None`) when data is unavailable and `0` when measured as zero. Settled costs are `null` until confirmed by billing.
+5. **Asynchronous Re-evaluation Enqueuing**: `POST /api/v1/hypotheses/{id}/reevaluate` records a pending evaluation result and emits an audit event (`HYPOTHESIS_REEVALUATE_REQUESTED`), returning HTTP 202 Accepted. Work is picked up asynchronously by discovery workers.
+6. **Bounded Pagination**: All collection listing routes enforce limits between 1 and 200 (default 50) and offset >= 0.
+
+### 3.2 Endpoint Summary Table
+
+| Method | Endpoint | Description | Status Codes |
+|---|---|---|---|
+| `GET` | `/api/v1/health` | Health check with database connectivity check | 200, 503 |
+| `POST` | `/api/v1/runs` | Create a new discovery run | 201, 400, 409, 500 |
+| `GET` | `/api/v1/runs` | List runs (pagination: `limit`, `offset`, `status`) | 200, 400, 500 |
+| `GET` | `/api/v1/runs/{run_id}` | Retrieve run metadata and lifecycle state | 200, 404, 500 |
+| `POST` | `/api/v1/runs/{run_id}/cancel` | Cancel an active or pending run | 200, 404, 409, 500 |
+| `GET` | `/api/v1/runs/{run_id}/metrics` | Usage counters, budget limits, and tiered costs | 200, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/report` | Final scientific summary report (or pending state) | 200, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/benchmarks` | Ground-truth benchmark evaluations | 200, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/observations` | List observations (`only_training`, `limit`, `offset`) | 200, 400, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/hypotheses` | List candidate hypotheses (`include_excluded`) | 200, 404, 500 |
+| `POST` | `/api/v1/runs/{run_id}/hypotheses` | Submit researcher-proposed hypothesis | 201, 400, 404, 409, 500 |
+| `GET` | `/api/v1/hypotheses/{hypothesis_id}` | Retrieve hypothesis with full revisions and latest evaluation | 200, 404, 500 |
+| `PATCH` | `/api/v1/hypotheses/{hypothesis_id}` | Update flags (`is_pinned`, `is_excluded`) non-destructively | 200, 400, 404, 500 |
+| `POST` | `/api/v1/hypotheses/{hypothesis_id}/reevaluate` | Enqueue asynchronous re-evaluation (returns 202) | 202, 404, 422, 500 |
+| `GET` | `/api/v1/hypotheses/{hypothesis_id}/evaluations` | Historical evaluation runs for current revision | 200, 404, 500 |
+| `GET` | `/api/v1/observations/{observation_id}` | Single observation details (no ground truth leakage) | 200, 404, 500 |
+
+### 3.3 New Resource Endpoints in v1
+
+#### 3.3.1 Resource-Level Hypotheses
+
+* **`GET /api/v1/hypotheses/{hypothesis_id}`**
+  - Response (200 OK):
+    ```json
+    {
+      "hypothesis": {
+        "hypothesis_id": "hyp-01",
+        "run_id": "run-01",
+        "model_family": "1d_polynomial",
+        "current_revision": 1,
+        "is_pinned": false,
+        "is_excluded": false,
+        "created_at": "2026-10-21T16:00:00+00:00",
+        "updated_at": "2026-10-21T16:00:00+00:00",
+        "latest_revision": {
+          "revision_id": "rev-01",
+          "revision_number": 1,
+          "formula": "y = 2.0 * x",
+          "parameters": {"slope": 2.0},
+          "complexity": 1,
+          "creation_source": "researcher",
+          "created_at": "2026-10-21T16:00:00+00:00"
+        },
+        "latest_evaluation": {
+          "evaluation_id": "eva-01",
+          "status": "completed",
+          "sample_count": 10,
+          "dataset_version": 10,
+          "metrics": {"mae": 0.05, "rmse": 0.06},
+          "held_out_metrics": null,
+          "error_message": null,
+          "evaluated_at": "2026-10-21T16:02:00+00:00"
+        },
+        "revisions": [...]
+      }
+    }
+    ```
+
+* **`PATCH /api/v1/hypotheses/{hypothesis_id}`**
+  - Request Body:
+    ```json
+    { "is_pinned": true }
+    ```
+  - Response (200 OK): Updated hypothesis object with new flag state. Emits audit events (`HYPOTHESIS_PINNED`, `HYPOTHESIS_UNPINNED`, `HYPOTHESIS_EXCLUDED`, or `HYPOTHESIS_RESTORED`).
+
+* **`POST /api/v1/hypotheses/{hypothesis_id}/reevaluate`**
+  - Enqueues a candidate for re-evaluation with updated observations.
+  - Response (202 Accepted):
+    ```json
+    {
+      "evaluation": {
+        "evaluation_id": "eva-pending-01",
+        "status": "pending",
+        "sample_count": 0,
+        "dataset_version": 0,
+        "metrics": {},
+        "held_out_metrics": null,
+        "error_message": null,
+        "evaluated_at": null
+      },
+      "message": "Re-evaluation enqueued. Poll the evaluation history for results."
+    }
+    ```
+
+* **`GET /api/v1/hypotheses/{hypothesis_id}/evaluations`**
+  - Returns evaluation history for the latest revision sorted newest first.
+  - Response (200 OK):
+    ```json
+    {
+      "hypothesis_id": "hyp-01",
+      "revision_id": "rev-01",
+      "evaluations": [
+        {
+          "evaluation_id": "eva-02",
+          "status": "completed",
+          "sample_count": 25,
+          "dataset_version": 25,
+          "metrics": {"mae": 0.012, "rmse": 0.015},
+          "held_out_metrics": {"mae": 0.02, "rmse": 0.024},
+          "error_message": null,
+          "evaluated_at": "2026-10-21T16:20:00+00:00"
+        }
+      ],
+      "count": 1
+    }
+    ```
+
+#### 3.3.2 Resource-Level Observations
+
+* **`GET /api/v1/observations/{observation_id}`**
+  - Response (200 OK):
+    ```json
+    {
+      "observation": {
+        "observation_id": "obs-01",
+        "run_id": "run-01",
+        "input_id": "inp-01",
+        "input_values": {"x": 3.0},
+        "output_values": {"y": 6.0},
+        "status": "success",
+        "sequence_number": 1,
+        "is_held_out": false,
+        "error_code": null,
+        "error_message": null,
+        "noise_metadata": null,
+        "created_at": "2026-10-21T16:01:00+00:00"
+      }
+    }
+    ```
+
