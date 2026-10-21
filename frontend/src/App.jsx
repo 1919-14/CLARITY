@@ -20,7 +20,7 @@ function App() {
 
   // Health and backend status state
   const [backendHealth, setBackendHealth] = useState(null);
-  const [healthError, setHealthError] = useState(null);
+  const [_healthError, setHealthError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   // Polling tracker ref

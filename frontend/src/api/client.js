@@ -53,7 +53,7 @@ async function request(endpoint, options = {}, timeoutMs = 10000) {
     if (contentType && contentType.includes('application/json')) {
       try {
         json = await response.json();
-      } catch (err) {
+      } catch (_err) {
         json = null;
       }
     }
