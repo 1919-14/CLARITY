@@ -639,3 +639,208 @@ routes (#19), Nodus integration (#12), and React UI (#21, #22).
 ### 6.5 Scientific Isolation Guarantee
 The experiment generator imports only domain contracts; it has zero dependencies on `app.adapters.oracle` or `app.evaluator` and does not access ground truth.
 
+---
+
+## 7. Discovery Loop (Issue #8)
+
+**Code references:**
+- [backend/app/domain/discovery_engine.py](../backend/app/domain/discovery_engine.py) — `DiscoveryEngine`
+- [backend/app/domain/discovery_contracts.py](../backend/app/domain/discovery_contracts.py) — run configuration, lifecycle statuses, history records, planner protocol, `DiscoveryRunResult`
+- [docs/discovery-loop.md](discovery-loop.md) — architecture, lifecycle, and limitations
+- [backend/tests/test_discovery_loop.py](../backend/tests/test_discovery_loop.py) — integration suite
+
+### 7.1 Run configuration (`DiscoveryRunConfig`)
+```json
+{
+  "max_query_budget": 4,
+  "max_iterations": 4,
+  "stopping_criteria": {
+    "target_plausible_candidate_count": null,
+    "target_primary_metric_threshold": null,
+    "consecutive_failure_limit": 3
+  },
+  "domain_bounds": {"variable_name": "x", "min_val": -2.0, "max_val": 2.0, "domain_name": "1d_polynomial"},
+  "hypothesis_config": {"family_id": "polynomial", "min_degree": 0, "max_degree": 3, "candidate_count": 6, "seed": 7},
+  "fitting_config": {"method": "least_squares", "rank_tolerance": 1e-10},
+  "ranking_policy": {"primary_metric": "mae", "secondary_metric": "rmse", "metric_direction": "minimize", "performance_acceptance_threshold": null},
+  "experiment_pool_size": 5,
+  "experiment_strategy": "grid",
+  "allow_duplicate_queries": false,
+  "allow_duplicate_external_observations": false,
+  "query_exclusion_tolerance": 1e-05,
+  "experiment_seed": null,
+  "dataset_id": null,
+  "max_experiment_candidates_per_iteration": 25
+}
+```
+Invalid values (negative budget, `max_iterations < 1`, pool size outside 1..500,
+non-finite tolerance, wrong types) raise `ValueError` during construction, before
+any oracle call. `max_query_budget = 0` is valid and performs no queries.
+
+### 7.2 Lifecycle and termination
+`DiscoveryLifecycleStatus`: `initializing`, `running`,
+`terminated_stopping_criterion`, `terminated_budget_exhausted`,
+`terminated_max_iterations`, `terminated_no_experiments`, `failed`.
+
+`DiscoveryTerminationReason`: `stopping_criterion_plausibility_reached`,
+`stopping_criterion_metric_threshold_reached`, `budget_exhausted`,
+`max_iterations_reached`, `experiment_pool_exhausted`,
+`consecutive_oracle_failures`, `component_failure`, `unrecoverable_error`.
+
+Deterministic precedence at the start of each iteration: satisfied configured
+stopping criterion → budget exhausted → max iterations → no valid experiment.
+Component/oracle failures terminate immediately when they occur. No stopping
+criterion is inferred: ranking first is not success, and a policy without
+`performance_acceptance_threshold` cannot produce `PLAUSIBLE`.
+
+The metric-threshold criterion applies only to the best candidate the ranking
+policy already accepts as `PLAUSIBLE` in a rankable comparability tier, so a low
+metric value alone can never terminate a run as a scientific success.
+
+**Terminal immutability and resume.** A finalized run is immutable by default:
+`add_observation()` raises `RUN_NOT_ACTIVE`. `resume(observations)` explicitly
+reopens a terminated, non-failed run: it validates the batch, preserves IDs,
+ingests without consuming oracle budget, refreshes evaluation/ranking, and
+continues the bounded loop without resetting budget or iteration counters.
+`FAILED` runs are not resumable (`RUN_TERMINAL_FAILURE`), and resuming before a
+run finishes raises `RUN_NOT_FINISHED`. Duplicate policy is split:
+`allow_duplicate_queries` governs oracle re-querying;
+`allow_duplicate_external_observations` governs repeated external inputs.
+
+### 7.3 Query accounting (`QueryAccounting`)
+```json
+{
+  "max_query_budget": 4,
+  "attempted_queries": 4,
+  "successful_queries": 4,
+  "failed_queries": 0,
+  "remaining_queries": 0
+}
+```
+`attempted_queries` counts every `oracle.query` call. Raised, non-success, and
+contract-invalid responses consume budget; pre-invocation rejections, duplicate
+skips, and external ingestion (`add_observation`/`resume`) do not. The invariant
+`attempted_queries <= max_query_budget` holds on every path, and
+`successful_queries + failed_queries == attempted_queries`.
+
+### 7.4 Experiment planner boundary
+```python
+class ExperimentPlanner(Protocol):
+    def select_experiment(
+        self,
+        candidates: Sequence[HypothesisRepresentation],
+        evaluations: Mapping[str, EvaluationResult],
+        observations: Sequence[Observation],
+        candidate_batch: CandidateExperimentBatch,
+        ranking: Optional[RankingResult],
+    ) -> Optional[CandidateExperiment]: ...
+```
+`DeterministicOrderPlanner` (default) returns the first eligible candidate and
+uses no scientific scoring. Active disagreement selection is deferred to
+Issues #10–#11. A planner never receives the oracle or evaluator-only data.
+
+### 7.5 Result and history (`DiscoveryRunResult`)
+Top-level serialized fields: `run_id`, `status`, `termination_reason`, `config`,
+`iterations_completed`, `ranking_is_fresh`, `started_at`, `finished_at`,
+`query_accounting`, `hypotheses`, `evaluations`, `ranking`, `observations`,
+`experiment_history`, `iteration_history`, `ingestion_history`, `errors`,
+`warnings`, `limitations`.
+
+```json
+{
+  "run_id": "run-1a2b3c4d5e",
+  "status": "terminated_budget_exhausted",
+  "termination_reason": "budget_exhausted",
+  "iterations_completed": 2,
+  "ranking_is_fresh": true,
+  "query_accounting": {"max_query_budget": 2, "attempted_queries": 2, "successful_queries": 2, "failed_queries": 0, "remaining_queries": 0},
+  "experiment_history": [
+    {
+      "sequence": 1,
+      "iteration": 1,
+      "experiment_id": "cand-exp-1a2b3c4d5e",
+      "input_id": "inp-9f8e7d6c5b",
+      "input_values": {"x": -2.0},
+      "outcome": "invoked_success",
+      "observation_id": "obs-0a1b2c3d4e",
+      "oracle_sequence_number": 1,
+      "strategy": "grid",
+      "recorded_at": "2026-10-21T00:00:00.000000+00:00"
+    }
+  ],
+  "iteration_history": [
+    {
+      "iteration": 1,
+      "selected_experiment_id": "cand-exp-1a2b3c4d5e",
+      "observation_id": "obs-0a1b2c3d4e",
+      "outcome": "invoked_success",
+      "attempted_queries_before": 0,
+      "attempted_queries_after": 1,
+      "successful_queries_after": 1,
+      "failed_queries_after": 0,
+      "top_hypothesis_id": "hyp-003",
+      "top_primary_metric": 0.0,
+      "ranking_is_fresh": true,
+      "recorded_at": "2026-10-21T00:00:00.000000+00:00"
+    }
+  ],
+  "ingestion_history": [],
+  "errors": [],
+  "warnings": [],
+  "limitations": []
+}
+```
+IDs, metric values, and timestamps above are illustrative. `termination_reason`
+is `null` only for a snapshot taken while the run is still active. `to_dict()`
+returns a JSON-compatible payload and re-runs `verify_no_ground_truth_leakage`;
+a forbidden key raises `ValueError` instead of being serialized.
+
+Snapshots are deep, not shallow. Observation payloads in the engine and in a
+returned result are frozen read-only mappings, so nested mutation raises
+`TypeError`. Observations supplied by callers are copied at commit. Returned
+`EvaluationResult` snapshots freeze every nested mapping as well (`metrics`,
+`held_out_metrics`, `fitting_config`, `fitted_specification`,
+`observation_counts`, `exclusion_codes`, `metric_definitions`, `dataset_ids`,
+plus error/warning `details`), so post-run mutation cannot alter committed
+evidence, evaluations, ranking, or the serialized result.
+
+### 7.6 Failure semantics
+A successful observation is committed immediately. If the subsequent
+evaluation/ranking refresh raises, the observation stays committed, the previous
+evaluation and ranking snapshots are preserved, `ranking_is_fresh` becomes
+`false`, and the run ends `failed` / `component_failure`. Invalid oracle
+responses and non-success statuses are never committed and always consume the
+query they used. No automatic oracle retries are performed.
+
+Structured codes include: `CANDIDATE_GENERATION_FAILURE`,
+`EXPERIMENT_GENERATION_FAILURE`, `EVALUATION_FAILURE`, `RANKING_FAILURE`,
+`PLANNER_FAILURE`, `INVALID_PLANNER_SELECTION`, `DUPLICATE_QUERY`,
+`ORACLE_QUERY_FAILURE`, `INVALID_ORACLE_RESPONSE`, `INVALID_OBSERVATION`,
+`INVALID_INITIAL_OBSERVATION`, `DUPLICATE_OBSERVATION_ID`,
+`DUPLICATE_OBSERVATION_INPUT`, `RUN_NOT_ACTIVE`, `RUN_NOT_FINISHED`,
+`RUN_TERMINAL_FAILURE`, `UNEXPECTED_DISCOVERY_ERROR`; warnings include
+`DUPLICATE_QUERY_SKIPPED`, `EXPERIMENT_POOL_UNDERSIZED`, `RANKING_STALE`.
+Evaluation results must contain exactly one entry per requested hypothesis ID;
+duplicate, unknown, or missing IDs fail the refresh instead of being accepted.
+
+### 7.7 Ground-truth isolation
+The engine receives only `OracleInterface.validate_input` / `query`. It never
+imports `GroundTruthRule`, never calls evaluator-only oracle accessors, and
+passes only candidates, evaluations, observations, experiment batches, and the
+ranking to the planner. Tests assert the dependency wiring and that a canary
+value held in evaluator-only metadata never appears in results, history,
+errors, warnings, or planner arguments.
+
+### 7.8 Tests
+
+```bash
+cd backend
+python -m pytest tests/test_discovery_loop.py -q   # focused
+python -m pytest -q                                # full backend regression
+```
+
+### 7.9 Out of scope for Issue #8
+Active disagreement/information-gain selection (#10, #11), held-out benchmark
+procedures, MySQL persistence (#18), Flask routes (#19), Nodus integration
+(#12), and React UI (#21, #22).
+

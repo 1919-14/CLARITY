@@ -95,6 +95,23 @@ from .ranking_engine import (
     MetricComparabilityValidator,
     rank_candidates,
 )
+from .discovery_contracts import (
+    DISCOVERY_ENGINE_VERSION,
+    DeterministicOrderPlanner,
+    DiscoveryIngestionRecord,
+    DiscoveryIterationRecord,
+    DiscoveryLifecycleStatus,
+    DiscoveryRunConfig,
+    DiscoveryRunError,
+    DiscoveryRunResult,
+    DiscoveryTerminationReason,
+    ExperimentExecutionOutcome,
+    ExperimentExecutionRecord,
+    ExperimentPlanner,
+    QueryAccounting,
+    StoppingCriteriaConfig,
+)
+from .discovery_engine import DiscoveryEngine
 
 __all__ = [
     "StructuredError",
@@ -175,4 +192,20 @@ __all__ = [
     "HypothesisRanker",
     "RANKING_VERSION",
     "rank_candidates",
+    # Issue #8: end-to-end discovery loop
+    "DiscoveryEngine",
+    "DiscoveryRunConfig",
+    "DiscoveryRunResult",
+    "DiscoveryRunError",
+    "DiscoveryLifecycleStatus",
+    "DiscoveryTerminationReason",
+    "StoppingCriteriaConfig",
+    "QueryAccounting",
+    "ExperimentExecutionOutcome",
+    "ExperimentExecutionRecord",
+    "DiscoveryIterationRecord",
+    "DiscoveryIngestionRecord",
+    "ExperimentPlanner",
+    "DeterministicOrderPlanner",
+    "DISCOVERY_ENGINE_VERSION",
 ]

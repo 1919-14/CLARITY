@@ -10,7 +10,7 @@ Before an issue, read [README](../README.md), [master context](../context.md), [
 CLARITY/
 ├── README.md
 ├── context.md
-├── docs/{architecture,contracts,development,decisions}.md
+├── docs/{architecture,contracts,discovery-loop,development,decisions,ranking-and-evidence,persistence}.md
 ├── backend/{app,tests,requirements.txt}
 ├── frontend/{src,package.json}
 └── .github/{workflows,pull_request_template.md}
@@ -97,7 +97,8 @@ Example commands, subject to the actual repository scripts:
 
 ```bash
 cd backend
-python -m pytest -q
+python -m pytest tests/test_discovery_loop.py -q   # discovery-loop integration
+python -m pytest -q                                # full backend suite
 ```
 
 ```bash

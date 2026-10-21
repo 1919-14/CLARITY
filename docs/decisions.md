@@ -174,6 +174,62 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Validation:** Leakage invariants A/B/E and failure-isolation tests in `backend/tests/test_evaluation.py`.
 
+## D-017 — The discovery engine coordinates; it does not reimplement science
+
+**Status:** Confirmed (Issue #8)
+
+**Decision:** Add `DiscoveryEngine` as a thin orchestrator over the existing components: `CandidateGenerator` (#5), `EvaluationPipeline` (#6), `HypothesisRanker` (#7), `CandidateExperimentGenerator` (#9), and `OracleInterface` (#4). The engine owns lifecycle, immutable run state, budget accounting, deduplication, history, and result assembly. Experiment selection sits behind a narrow `ExperimentPlanner` protocol with a `DeterministicOrderPlanner` default. Terminal precedence is deterministic: satisfied configured stopping criterion → budget exhausted → max iterations → no valid experiment, with component/oracle failures terminating immediately.
+
+**Rationale:** One coordinator prevents duplicated fitting/ranking logic and keeps the loop testable with deterministic local components. A narrow planner protocol lets Issues #10–#11 land active selection without changing the orchestrator.
+
+**Trade-off:** The default planner spends queries deterministically rather than informatively, so early query efficiency is not a benchmark claim. The engine evaluates all candidates on every refresh (no incremental evaluation cache); this is cheap for the supported candidate-count ceiling.
+
+**Rejected alternatives:** Putting selection or ranking formulas in the orchestrator (duplicates #7/#10); a generic workflow framework with configurable stages (speculative for one loop); doing the run inside a Flask service or persistence layer (couples domain logic to infrastructure).
+
+**Validation:** `backend/tests/test_discovery_loop.py`; [discovery-loop.md](discovery-loop.md); [contracts.md](contracts.md) section 7.
+
+## D-018 — Query budget and observation commit semantics
+
+**Status:** Confirmed (Issue #8)
+
+**Decision:** Reserve one unit of `max_query_budget` immediately before every `oracle.query` call. Raised calls, non-success responses, and contract-invalid responses consume that unit; pre-invocation validation rejections, duplicate skips, and externally supplied observations do not. A successful observation is committed immediately. If evaluation/ranking then raises, the observation and the previous ranking snapshot are kept, `ranking_is_fresh` becomes false, and the run terminates as `component_failure`. No automatic oracle retries exist.
+
+**Rationale:** Budget must be a hard ceiling on real oracle invocations, and valid scientific evidence must never be discarded because a downstream recomputation failed. Recording staleness is more honest than presenting an unchanged ranking as current.
+
+**Trade-off:** A failed query still costs budget, so a flaky oracle reduces the useful experiment count. The loop is training-only: all committed observations fit and test the candidates, so held-out metrics are unavailable inside the loop.
+
+**Rejected alternatives:** Refunding budget for failed calls (understates real usage); retrying inside the engine (spends unbudgeted queries, risks duplicate side effects); rolling back committed observations on ranking failure (destroys valid evidence); silently continuing after a component failure (reports a ranking that was never computed).
+
+**Validation:** Budget-ceiling, failure, and partial-result tests in `backend/tests/test_discovery_loop.py`; [discovery-loop.md](discovery-loop.md) sections 5, 7, and 8.
+
+## D-019 — Terminal runs are immutable; resume is the explicit reopen path
+
+**Status:** Confirmed (Issue #8 review follow-up)
+
+**Decision:** A finalized discovery run is immutable. `add_observation()` raises `RUN_NOT_ACTIVE` once a result has been produced, leaving observations, ranking, and query accounting untouched. Post-terminal updates use `resume(observations)`, which is allowed only for a non-failed terminal run: it validates the whole batch before mutating state, ingests without consuming oracle budget, refreshes evaluation/ranking, and continues the bounded loop without resetting budget or iteration counters. Failed runs raise `RUN_TERMINAL_FAILURE` and are not resumable. Metric-threshold stopping now requires the candidate to be `PLAUSIBLE` in a rankable comparability tier, so a low metric alone can never be reported as scientific success. Duplicate policy is split: `allow_duplicate_queries` governs oracle re-querying, while `allow_duplicate_external_observations` governs repeated externally supplied inputs.
+
+**Rationale:** A terminal result must describe one coherent state. Silent mutation after termination produces a result whose status/reason no longer explain its data. An explicit resume keeps incremental evidence support while making the lifecycle transition auditable. Requiring policy-level acceptance for metric stopping prevents an unconfigured acceptance threshold from being bypassed by a numeric target.
+
+**Trade-off:** Resume cannot recover a failed run; callers start a new run with the accumulated observations instead. Resume also cannot extend beyond the original budget or iteration bounds, so a budget-exhausted run can ingest evidence but cannot query again.
+
+**Rejected alternatives:** Allowing `add_observation()` after finalization (incoherent terminal snapshots); resuming failed runs (state may be deliberately stale, e.g. preserved ranking); treating a low training error as acceptance without the ranking policy's threshold (bypasses plausibility/comparability).
+
+**Validation:** `backend/tests/test_discovery_loop.py` (post-terminal rejection, resume identity/budget preservation, failed-run resume rejection, metric-threshold regression, duplicate-policy split); [discovery-loop.md](discovery-loop.md) sections 3, 4, 8; [contracts.md](contracts.md) section 7.
+
+## D-020 — Run snapshots freeze observation payloads
+
+**Status:** Confirmed (Issue #8 follow-up review)
+
+**Decision:** Freeze nested observation payloads (`input_values`, `output_values`, `noise_metadata`, and error `details`) whenever the engine takes ownership of an observation, and return those frozen snapshots from `engine.observations` and `DiscoveryRunResult.observations`. Caller-supplied `Observation` objects are copied at commit. Returned `EvaluationResult` snapshots freeze their nested mappings too (`metrics`, `held_out_metrics`, `fitting_config`, `fitted_specification`, `observation_counts`, `exclusion_codes`, `metric_definitions`, `dataset_ids`, plus error and warning details). `Observation.to_dict`, `EvaluationResult.to_dict`, and `StructuredError.to_dict` thaw frozen payloads so serialization stays JSON-compatible.
+
+**Rationale:** Frozen dataclasses only protect their top-level fields. Without deep freezing, a caller could mutate `result.observations[0].output_values` after a run and silently rewrite evidence that the lifecycle contract declares immutable, bypassing `RUN_NOT_ACTIVE`.
+
+**Trade-off:** Observation and evaluation payloads are `Mapping` objects rather than plain dicts inside the engine and result APIs; consumers that need plain values use `to_dict()` or `dict(obs.input_values)`. Frozen evaluation snapshots still go through `dataclasses.replace` at result assembly, which is a small per-candidate cost paid only when a result snapshot is built.
+
+**Rejected alternatives:** Returning defensive copies only from `engine.observations` (result snapshots would remain aliased); freezing every `Observation` at construction globally (broader contract change than this boundary requires); copying `EvaluationResult` objects without freezing their mappings (a returned result could still mutate its own serialization and break the documented immutability guarantee).
+
+**Validation:** `backend/tests/test_discovery_loop.py::test_terminal_observation_snapshots_reject_nested_mutation`; [discovery-loop.md](discovery-loop.md) section 8; [contracts.md](contracts.md) section 7.5.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
@@ -182,7 +238,7 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 4. Disagreement and uncertainty score.
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.
-7. Exact run states/transitions, cancellation, recovery.
+7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019; run-level cancellation and durable recovery remain open for the API/persistence layer.
 8. Required report export formats.
 9. Deployment target and clean-start procedure.
 10. Target accuracy/error threshold and trial count for query-efficiency benchmarks.
