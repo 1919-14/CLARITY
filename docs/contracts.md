@@ -719,7 +719,7 @@ run finishes raises `RUN_NOT_FINISHED`. Duplicate policy is split:
 ```
 `attempted_queries` counts every `oracle.query` call. Raised, non-success, and
 contract-invalid responses consume budget; pre-invocation rejections, duplicate
-skips, and external `add_observation` calls do not. The invariant
+skips, and external ingestion (`add_observation`/`resume`) do not. The invariant
 `attempted_queries <= max_query_budget` holds on every path, and
 `successful_queries + failed_queries == attempted_queries`.
 
