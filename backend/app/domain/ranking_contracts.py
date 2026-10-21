@@ -164,6 +164,13 @@ class EvidenceRecord:
     evaluation_id       EvaluationResult.evaluation_id that produced this record.
     dataset_version     Numeric dataset version at evaluation time, when available.
     timestamp           UTC ISO-8601 timestamp when this record was created.
+    membership_verified Whether this observation's partition membership was confirmed
+                        against the evaluation's accepted observation-ID lists.
+                        False when the evaluation carries no membership lists (absent
+                        dataset_ids.observation_ids / held_out_observation_ids) or when
+                        the observation ID is absent from the applicable list.
+                        Classification is still computed from residuals for display, but
+                        status derivation treats unverified records as uncertain.
     """
 
     evidence_id: str
@@ -182,6 +189,7 @@ class EvidenceRecord:
     timestamp: str
 
     experiment_id: Optional[str] = None
+    membership_verified: bool = True
 
     @staticmethod
     def make_evidence_id(
@@ -224,6 +232,7 @@ class EvidenceRecord:
             "evaluation_id": self.evaluation_id,
             "dataset_version": self.dataset_version,
             "timestamp": self.timestamp,
+            "membership_verified": self.membership_verified,
         }
 
 
@@ -248,6 +257,13 @@ class EvidenceSummary:
                                 Stable tuple of contradicting observation IDs.
     indeterminate_observation_ids
                                 Stable tuple of indeterminate observation IDs.
+    unverified_membership_count Number of observations whose partition membership
+                                could not be confirmed against the evaluation's accepted
+                                ID lists.  Status derivation treats these as uncertain
+                                evidence: a candidate cannot be PLAUSIBLE when this
+                                count is > 0, because the evaluation population is
+                                unknown.  Defaults to 0 for backwards compatibility
+                                when constructing summaries directly (e.g. in tests).
     """
 
     hypothesis_id: str
@@ -258,6 +274,7 @@ class EvidenceSummary:
     supporting_observation_ids: Tuple[str, ...]
     contradicting_observation_ids: Tuple[str, ...]
     indeterminate_observation_ids: Tuple[str, ...]
+    unverified_membership_count: int = 0
 
     @property
     def total_observations(self) -> int:
@@ -275,6 +292,7 @@ class EvidenceSummary:
             "supporting_observation_ids": list(self.supporting_observation_ids),
             "contradicting_observation_ids": list(self.contradicting_observation_ids),
             "indeterminate_observation_ids": list(self.indeterminate_observation_ids),
+            "unverified_membership_count": self.unverified_membership_count,
         }
 
 
@@ -324,6 +342,20 @@ class RankingPolicyConfig:
                             status becomes CONTRADICTED.  Default: 0 (strict:
                             any validated contradiction triggers CONTRADICTED).
                             Set > 0 for noisy or bounded-error environments.
+
+    performance_acceptance_threshold
+                            Task-specific upper (minimize) or lower (maximize) bound
+                            on the primary metric that a candidate must meet for its
+                            status to be PLAUSIBLE.  When None (the default), a
+                            finite metric is necessary but not sufficient: no
+                            threshold has been agreed, so the status remains UNCERTAIN
+                            even when all other criteria pass.  This is intentional:
+                            PLAUSIBLE must mean "meets an agreed performance criterion",
+                            not merely "has a finite error and enough samples".
+
+                            Set an explicit value that is appropriate for the task
+                            (e.g. 0.10 for MAE meaning "error below 10 units is
+                            acceptable") before relying on PLAUSIBLE status.
     """
 
     primary_metric: str = "mae"
@@ -335,6 +367,7 @@ class RankingPolicyConfig:
     min_samples_for_plausibility: int = 5
     max_tolerated_contradictions: int = 0
     complexity_penalty_threshold: Optional[float] = None
+    performance_acceptance_threshold: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.complexity_penalty_threshold is not None:
@@ -354,6 +387,22 @@ class RankingPolicyConfig:
             raise ValueError("min_samples_for_plausibility must be >= 1.")
         if self.max_tolerated_contradictions < 0:
             raise ValueError("max_tolerated_contradictions must be >= 0.")
+
+    def metric_meets_acceptance(self, metric_value: float) -> bool:
+        """Return True when metric_value satisfies the performance acceptance policy.
+
+        When performance_acceptance_threshold is configured (not None), metric_value
+        must meet the configured bound (<= threshold for minimize, >= threshold for maximize).
+        When performance_acceptance_threshold is None, any finite metric is accepted
+        (no universal threshold is imposed).
+        """
+        if metric_value is None or not math.isfinite(metric_value):
+            return False
+        if self.performance_acceptance_threshold is None:
+            return True
+        if self.metric_direction == "minimize":
+            return metric_value <= self.performance_acceptance_threshold
+        return metric_value >= self.performance_acceptance_threshold
 
     def is_better(self, score_a: float, score_b: float) -> bool:
         """Return True if score_a is strictly better than score_b under metric_direction."""
@@ -381,7 +430,14 @@ class RankedCandidate:
 
     Fields
     ------
-    rank                    1-based rank within the ranking result.
+    rank                    1-based display position across ALL candidates (global).
+                            This is a presentation order number, not a scientific
+                            rank claim across cohorts.  Use within_cohort_rank for
+                            scientifically meaningful ordering.
+    within_cohort_rank      1-based rank within the candidate's comparability cohort
+                            (same tier + dataset_id + metric_version + metric_def).
+                            None when the candidate is in a non-rankable tier
+                            (INCOMPARABLE, EVALUATION_FAILED, UNEVALUATED).
     hypothesis_id           Candidate identifier.
     status                  Scientific plausibility status.
     evaluation_tier         Comparability tier (determines which candidates are
@@ -398,7 +454,7 @@ class RankedCandidate:
     dataset_id              Dataset identifier used for this evaluation.
     evaluation_id           Evaluation execution ID from EvaluationResult.
     explanation             Deterministic human-readable explanation of why this
-                            candidate has this rank and status.
+                            candidate has this display position and status.
     limitations             Tuple of known limitations for this candidate's ranking.
     comparability_notes     Notes explaining why comparisons against other tiers
                             are qualified.
@@ -421,10 +477,12 @@ class RankedCandidate:
     explanation: str
     limitations: Tuple[str, ...]
     comparability_notes: Tuple[str, ...]
+    within_cohort_rank: Optional[int] = None
 
     def to_dict(self) -> Dict:
         return {
             "rank": self.rank,
+            "within_cohort_rank": self.within_cohort_rank,
             "hypothesis_id": self.hypothesis_id,
             "status": self.status.value,
             "evaluation_tier": self.evaluation_tier.value,

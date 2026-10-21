@@ -118,11 +118,13 @@ def make_evaluation_result(
     held_out_rmse: Optional[float] = None,
     sample_count: int = 5,
     held_out_sample_count: Optional[int] = None,
-    dataset_id: str = "dataset-default",
+    dataset_id: Optional[str] = "dataset-default",
     status: EvaluationStatus = EvaluationStatus.COMPLETED,
     fitting_status: Optional[FittingStatus] = FittingStatus.SUCCESS,
     complexity: int = 2,
     coefficients: Optional[Dict[str, float]] = None,
+    observation_ids: Optional[Sequence[str]] = None,
+    held_out_observation_ids: Optional[Sequence[str]] = None,
 ) -> EvaluationResult:
     if coefficients is None:
         coefficients = {"c0": 0.0, "c1": 2.0}
@@ -140,6 +142,15 @@ def make_evaluation_result(
 
     err = None if status == EvaluationStatus.COMPLETED else StructuredError(code="EVAL_FAIL", message="Failed")
 
+    dataset_ids_dict: Optional[Dict[str, Any]] = None
+    if dataset_id is not None:
+        dataset_ids_dict = {"dataset_id": dataset_id}
+        if observation_ids is not None:
+            dataset_ids_dict["observation_ids"] = list(observation_ids)
+            dataset_ids_dict["training_observation_ids"] = list(observation_ids)
+        if held_out_observation_ids is not None:
+            dataset_ids_dict["held_out_observation_ids"] = list(held_out_observation_ids)
+
     return EvaluationResult(
         hypothesis_id=hyp_id,
         evaluation_id=eval_id,
@@ -152,7 +163,7 @@ def make_evaluation_result(
         fitting_status=fitting_status,
         fitted_specification=fitted_spec,
         complexity=complexity,
-        dataset_ids={"dataset_id": dataset_id},
+        dataset_ids=dataset_ids_dict,
         error=err,
     )
 
@@ -254,7 +265,7 @@ class TestEvidenceStoreAndIdempotency:
     def test_repeated_observation_does_not_duplicate_evidence(self):
         policy = RankingPolicyConfig()
         hyp = make_candidate("hyp-1")
-        eval_res1 = make_evaluation_result("hyp-1", eval_id="eval-v1")
+        eval_res1 = make_evaluation_result("hyp-1", eval_id="eval-v1", observation_ids=["obs-1"])
         obs = make_observation("obs-1", x=2.0, y=4.0)
 
         # First evaluation
@@ -267,7 +278,7 @@ class TestEvidenceStoreAndIdempotency:
         assert store.count() == 1
 
         # Second evaluation of the same observation with a new evaluation_id (e.g. revision)
-        eval_res2 = make_evaluation_result("hyp-1", eval_id="eval-v2")
+        eval_res2 = make_evaluation_result("hyp-1", eval_id="eval-v2", observation_ids=["obs-1"])
         records2 = collect_evidence(eval_res2, [obs], policy, dataset_version=2)
         assert len(records2) == 1
         assert records2[0].evidence_id == records1[0].evidence_id
@@ -284,7 +295,7 @@ class TestEvidenceStoreAndIdempotency:
     def test_summary_preserves_both_supporting_and_contradicting_lists(self):
         policy = RankingPolicyConfig()
         hyp = make_candidate("hyp-1")
-        eval_res = make_evaluation_result("hyp-1")
+        eval_res = make_evaluation_result("hyp-1", observation_ids=["obs-s", "obs-c"])
         obs_supp = make_observation("obs-s", x=2.0, y=4.0)
         obs_contra = make_observation("obs-c", x=3.0, y=10.0)
 
@@ -557,8 +568,20 @@ class TestHypothesisRankerService:
         c1 = make_candidate("hyp-1", formula="y = 2*x")
         c2 = make_candidate("hyp-2", formula="y = 3*x", coefficients={"c0": 0.0, "c1": 3.0})
 
-        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, coefficients={"c0": 0.0, "c1": 2.0})
-        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, coefficients={"c0": 0.0, "c1": 3.0})
+        obs_ids_1 = [f"obs-{i}" for i in range(1, 6)]
+        obs_ids_2 = [f"obs-{i}" for i in range(1, 6)]
+        e1 = make_evaluation_result(
+            "hyp-1",
+            held_out_mae=0.02,
+            coefficients={"c0": 0.0, "c1": 2.0},
+            observation_ids=obs_ids_1 + ["obs-contra"],
+        )
+        e2 = make_evaluation_result(
+            "hyp-2",
+            held_out_mae=0.03,
+            coefficients={"c0": 0.0, "c1": 3.0},
+            observation_ids=obs_ids_2,
+        )
 
         # Initial observations: both have clean supporting data
         obs_initial = [make_observation(f"obs-{i}", x=float(i), y=2.0 * i) for i in range(1, 6)]
@@ -595,7 +618,8 @@ class TestHypothesisRankerService:
 class TestScientificTransparency:
     def test_no_fabricated_confidence_percentages(self):
         c1 = make_candidate("hyp-1")
-        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02)
+        obs_ids = [f"o{i}" for i in range(1, 7)]
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, observation_ids=obs_ids)
         obs = [make_observation(f"o{i}", x=float(i), y=2.0 * i) for i in range(1, 7)]
 
         res = rank_candidates([c1], {"hyp-1": e1}, {"hyp-1": obs})
@@ -782,8 +806,8 @@ class TestEvidenceStoreAuditRevisions:
         obs_supp = make_observation("obs-1", x=2.0, y=4.0)       # SUPPORTING for y=2x
         obs_contra = make_observation("obs-1", x=2.0, y=100.0)   # CONTRADICTING
 
-        eval_v1 = make_evaluation_result("hyp-1", eval_id="eval-v1")
-        eval_v2 = make_evaluation_result("hyp-1", eval_id="eval-v2")
+        eval_v1 = make_evaluation_result("hyp-1", eval_id="eval-v1", observation_ids=["obs-1"])
+        eval_v2 = make_evaluation_result("hyp-1", eval_id="eval-v2", observation_ids=["obs-1"])
 
         r_supp = collect_evidence(eval_v1, [obs_supp], policy, dataset_version=1)
         r_contra = collect_evidence(eval_v2, [obs_contra], policy, dataset_version=2)
@@ -970,7 +994,7 @@ class TestObservationMembershipValidation:
 
     def test_membership_unverified_when_no_id_lists(self):
         """When dataset_ids contains no observation_ids list, membership cannot be
-        verified but evidence collection should still proceed (backwards compatibility)."""
+        verified and records must be marked unverified/indeterminate."""
         policy = RankingPolicyConfig()
         eval_res = make_evaluation_result("hyp-1")
         obs = make_observation("obs-any", x=2.0, y=4.0)
@@ -978,8 +1002,14 @@ class TestObservationMembershipValidation:
         records = collect_evidence(eval_res, [obs], policy)
         # Should still produce a record (not crash).
         assert len(records) == 1
-        # Without membership lists, observation is treated as verified → SUPPORTING.
-        assert records[0].classification == EvidenceClassification.SUPPORTING
+        # Without membership lists, record is unverified and INDETERMINATE.
+        assert records[0].membership_verified is False
+        assert records[0].classification == EvidenceClassification.INDETERMINATE
+
+        # And status derivation does not silently treat it as confirmed evidence
+        summary = summarize_evidence("hyp-1", records)
+        assert summary.unverified_membership_count == 1
+        assert derive_plausibility_status(eval_res, summary, policy) == PlausibilityStatus.UNCERTAIN
 
 
 # ==============================================================================
@@ -1022,7 +1052,8 @@ class TestRerankAuditBoundary:
         RankingResult; the prior snapshot (current_ranking) is not mutated."""
         ranker = HypothesisRanker()
         c1 = make_candidate("hyp-1")
-        e1 = make_evaluation_result("hyp-1", held_out_mae=0.05)
+        obs_ids = [f"o{i}" for i in range(1, 6)] + ["o99"]
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.05, observation_ids=obs_ids)
 
         initial_obs = [make_observation(f"o{i}", x=float(i), y=2.0 * i) for i in range(1, 6)]
         initial_res = ranker.rank_candidates(
@@ -1045,4 +1076,132 @@ class TestRerankAuditBoundary:
         new_rc = reranked.ranked_candidates[0]
         assert new_rc.evidence_summary.contradicting_count == 1
         assert reranked.ranking_version == RANKING_VERSION
+
+
+# ==============================================================================
+# 19. Follow-Up Review Findings Regression Suite
+# ==============================================================================
+
+class TestFollowUpReviewFindings:
+    def test_unacceptable_performance_remains_uncertain_under_configured_criterion(self):
+        """Finding #1: When performance_acceptance_threshold is configured in policy,
+        a candidate with finite metric that fails the threshold remains UNCERTAIN."""
+        policy = RankingPolicyConfig(
+            min_samples_for_plausibility=5,
+            max_tolerated_contradictions=0,
+            performance_acceptance_threshold=0.10,  # Max acceptable MAE is 0.10
+        )
+        # eval_res has MAE = 0.50 (finite, but clearly unacceptable under 0.10 threshold)
+        eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.50)
+        summary = EvidenceSummary("hyp-1", 6, 0, 0, 6, tuple(f"o{i}" for i in range(6)), (), ())
+        status = derive_plausibility_status(eval_res, summary, policy)
+        assert status == PlausibilityStatus.UNCERTAIN
+
+        # When the metric meets the criterion, it becomes PLAUSIBLE
+        eval_pass = make_evaluation_result("hyp-1", sample_count=6, mae=0.05)
+        status_pass = derive_plausibility_status(eval_pass, summary, policy)
+        assert status_pass == PlausibilityStatus.PLAUSIBLE
+
+    def test_missing_dataset_ids_classified_incomparable_and_not_metric_ranked(self):
+        """Finding #2: Candidates with missing dataset IDs must be classified as
+        INCOMPARABLE and must not be metric-ranked together."""
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        e1 = make_evaluation_result("hyp-1", mae=0.01, dataset_id=None)
+        e2 = make_evaluation_result("hyp-2", mae=0.50, dataset_id=None)
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {})
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        assert rc1.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc2.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc1.within_cohort_rank is None
+        assert rc2.within_cohort_rank is None
+
+    def test_cross_cohort_display_order_does_not_imply_scientific_rank(self):
+        """Finding #3: Output assigns a display position, but within_cohort_rank
+        provides the scientific rank within each comparability cohort."""
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        # hyp-1 on ds-1 with higher MAE, hyp-2 on ds-2 with lower MAE
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.10, dataset_id="ds-1")
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.01, dataset_id="ds-2")
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {})
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        # Both are rank 1 in their respective cohorts
+        assert rc1.within_cohort_rank == 1
+        assert rc2.within_cohort_rank == 1
+        # Display positions exist for ordering, but comparability notes warn about cross-dataset
+        assert rc1.rank != rc2.rank
+        assert any("different datasets" in note.lower() for note in rc1.comparability_notes)
+        assert any("different datasets" in note.lower() for note in rc2.comparability_notes)
+
+    def test_differing_metric_definitions_prevent_pairwise_comparison_and_split_cohorts(self):
+        """Finding #5: Two results sharing the same dataset and version but having
+        differing metric definitions must fail comparability validation and be split into cohorts."""
+        import dataclasses
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1")
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1")
+
+        e1v = dataclasses.replace(e1, metric_version="v1", metric_definitions={"mae": "standard_mae"})
+        e2v = dataclasses.replace(e2, metric_version="v1", metric_definitions={"mae": "median_absolute_error"})
+
+        validator = MetricComparabilityValidator()
+        comparable, reasons = validator.validate_pairwise_comparability(e1v, e2v)
+        assert comparable is False
+        assert any("Primary metric definitions differ" in r for r in reasons)
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1v, "hyp-2": e2v}, {})
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        # They are placed in different cohorts, each with within_cohort_rank == 1
+        assert rc1.within_cohort_rank == 1
+        assert rc2.within_cohort_rank == 1
+
+    def test_conflicting_payload_same_evaluation_identity_raises(self):
+        """Finding #6: EvidenceStore.add() must raise ValueError when a record with the
+        same (evaluation_id, dataset_version) has a conflicting payload."""
+        from app.domain.evidence_tracker import EvidenceStore
+        store = EvidenceStore()
+        rec1 = EvidenceRecord(
+            evidence_id=EvidenceRecord.make_evidence_id("hyp-1", "obs-1", "training"),
+            hypothesis_id="hyp-1",
+            observation_id="obs-1",
+            experiment_id="exp-1",
+            partition="training",
+            classification=EvidenceClassification.SUPPORTING,
+            observed_value=2.0,
+            predicted_value=2.0,
+            residual=0.0,
+            tolerance=0.05,
+            is_held_out=False,
+            dataset_id="ds-1",
+            evaluation_id="eval-1",
+            dataset_version=1,
+            timestamp="2026-10-21T12:00:00Z",
+        )
+        store.add(rec1)
+
+        # Re-adding identical payload is idempotent no-op
+        store.add(rec1)
+        assert store.count() == 1
+        assert store.revision_count() == 1
+
+        # Adding same eval_id and dataset_version with different residual / classification must raise
+        import dataclasses
+        rec_conflict = dataclasses.replace(
+            rec1,
+            classification=EvidenceClassification.CONTRADICTING,
+            residual=5.0,
+        )
+        import pytest
+        with pytest.raises(ValueError, match="conflicting payload"):
+            store.add(rec_conflict)
 

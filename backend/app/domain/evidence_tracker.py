@@ -10,26 +10,26 @@ Design constraints
   Stable across evaluation revisions; reprocessing the same observation does
   NOT duplicate evidence.
 - EvidenceStore stores an append-only revision log per evidence key.
-  Each revision records the full EvidenceRecord so changes in model specification
-  or dataset version remain auditable.  The *current view* always uses the most
-  recent revision per identity key, guaranteeing exactly-one-count semantics.
-  Identical reprocessing (same evaluation_id + dataset_version) does not append
-  a duplicate revision.
-- Residual computation is overflow-guarded at every step.
-- Evidence counts do NOT affect metric-based ranking; they establish status
-  and traceability only.
-- Evidence from training observations and held-out observations are tracked
-  separately (partition = "training" | "held_out").
-- collect_evidence() validates that each supplied observation's partition
-  membership is consistent with the evaluation's observation membership records
-  where available.  Observations whose membership cannot be verified are flagged
-  with INDETERMINATE classification.
-- The output_variable used for comparison is extracted from the fitted model
-  specification (output_variable key) where available, falling back to the
-  first key in observation.output_values.
-- The model registry is injected into public API functions so callers using
-  extended model families can supply a custom registry without monkey-patching
-  a module-level singleton.
+  Revision identity = (evaluation_id, dataset_version, content_fingerprint)
+  where content_fingerprint encodes (classification, residual, predicted_value).
+  Same fingerprint → no-op (idempotent).  Same (eval_id, dataset_version) but
+  different content → ValueError (caller violated revision-identity contract).
+  Different (eval_id, dataset_version) → new revision appended.
+- Membership verification (Finding #4): collect_evidence() checks whether each
+  supplied observation's ID appears in EvaluationResult.dataset_ids membership
+  lists.  When no lists are present, ALL observations are unverified
+  (membership_verified=False).  Classification is still computed from residuals
+  for display, but EvidenceSummary.unverified_membership_count and status
+  derivation treat such records as uncertain.
+- PLAUSIBLE requires an explicit performance_acceptance_threshold in policy
+  (Finding #1).  Without a configured threshold, even a finite metric with
+  enough samples remains UNCERTAIN, because no agreed acceptance criterion has
+  been established.
+- Evidence counts do NOT participate in metric-based ranking.  Evidence
+  establishes PlausibilityStatus and traces why a candidate holds its position;
+  it does not double-count observations already reflected in MAE/RMSE.
+- No confidence percentages, probability-of-correctness claims, or hidden-rule
+  knowledge are produced here.
 """
 
 from __future__ import annotations
@@ -114,18 +114,11 @@ def _resolve_output_variable(
     specification: Optional[Mapping[str, Any]],
     output_values: Dict[str, Any],
 ) -> Optional[str]:
-    """Determine the output variable name to use for comparison.
-
-    Preference order:
-    1. specification["output_variable"] when the fitted specification exists.
-    2. The first key in output_values when the dict has exactly one key.
-    3. None — cannot resolve; evidence will be INDETERMINATE.
-    """
+    """Determine the output variable name to use for comparison."""
     if specification is not None:
         var = _extract_output_variable(specification)
         if var is not None:
             return var
-    # Fall back to the single-key case to support bare observations without specs.
     keys = list(output_values.keys())
     if len(keys) == 1:
         return keys[0]
@@ -138,19 +131,12 @@ def _predict_for_observation(
     observation: Observation,
     registry: ModelFamilyRegistry,
 ) -> Optional[float]:
-    """Attempt to produce a scalar numeric prediction for one observation.
-
-    Returns None if:
-    - model_family_id is absent or not in the registry.
-    - specification is absent.
-    - The prediction raises or returns non-finite.
-    - The output variable cannot be resolved.
-    """
+    """Attempt to produce a scalar numeric prediction for one observation."""
     if model_family_id is None or specification is None:
         return None
     try:
         outputs, error = registry.predict(specification, observation.input_values)
-    except Exception:  # pragma: no cover — defensive against registry bugs
+    except Exception:  # pragma: no cover
         return None
     if error is not None or outputs is None:
         return None
@@ -163,6 +149,24 @@ def _predict_for_observation(
             return None
     raw = outputs.get(output_var)
     return _safe_float(raw)
+
+
+def _content_fingerprint(
+    classification: EvidenceClassification,
+    residual: Optional[float],
+    predicted_value: Optional[float],
+) -> Tuple:
+    """Stable content fingerprint for revision identity (Finding #6).
+
+    Two records with the same (classification, residual, predicted_value) at
+    the same (evaluation_id, dataset_version) are considered the same revision.
+    If any of these differ under the same evaluation identity, the payload has
+    mutated and the caller has violated the revision-identity contract.
+    """
+    # Round to 15 significant digits to avoid float representation drift.
+    r = round(residual, 15) if residual is not None else None
+    p = round(predicted_value, 15) if predicted_value is not None else None
+    return (classification.value, r, p)
 
 
 # ---------------------------------------------------------------------------
@@ -188,32 +192,16 @@ def classify_observation_evidence(
 
     Parameters
     ----------
-    hypothesis_id
-        Stable ID of the candidate being evaluated.
-    observation
-        Source observation from the run's observation history.
-    evaluation_id
-        EvaluationResult.evaluation_id that triggered this classification.
-    policy
-        RankingPolicyConfig supplying tolerance parameters.
-    model_family_id
-        Registered family identifier for prediction.  None → INDETERMINATE.
-    fitted_specification
-        Fitted model specification from EvaluationResult.  None → INDETERMINATE.
-    dataset_id
-        Dataset identifier for provenance.
-    dataset_version
-        Numeric dataset version, when available.
-    registry
-        Model family registry to use for prediction.  Defaults to
-        ``default_registry()`` when not supplied.  Inject a custom registry
-        when using model families beyond the built-in set.
     membership_verified
         When False, the observation's partition membership in the evaluation
-        being summarised could not be confirmed and the record is classified
-        INDETERMINATE regardless of predicted vs observed values.  Callers
-        should set this to False when the observation ID is absent from
-        EvaluationResult.observation_counts or equivalent provenance.
+        being summarised could not be confirmed.  Classification is still
+        computed from residuals (for display), but EvidenceSummary will count
+        this record in unverified_membership_count, and derive_plausibility_status
+        will keep the candidate at UNCERTAIN regardless of other criteria.
+
+        Callers should set this to False when the observation ID is absent
+        from EvaluationResult.dataset_ids.observation_ids / held_out_observation_ids,
+        or when those lists are entirely absent from the evaluation result.
     """
     if registry is None:
         registry = default_registry()
@@ -224,26 +212,36 @@ def classify_observation_evidence(
     )
     now = utc_now_iso()
 
-    def _indeterminate(obs_val: Optional[float] = None, pred_val: Optional[float] = None) -> EvidenceRecord:
+    def _make_record(
+        cls: EvidenceClassification,
+        obs_val: Optional[float] = None,
+        pred_val: Optional[float] = None,
+        res: Optional[float] = None,
+        tol: Optional[float] = None,
+    ) -> EvidenceRecord:
         return EvidenceRecord(
             evidence_id=evidence_id,
             hypothesis_id=hypothesis_id,
             observation_id=observation.observation_id,
             experiment_id=observation.input_id,
             partition=partition,
-            classification=EvidenceClassification.INDETERMINATE,
+            classification=cls,
             observed_value=obs_val,
             predicted_value=pred_val,
-            residual=None,
-            tolerance=None,
+            residual=res,
+            tolerance=tol,
             is_held_out=observation.is_held_out,
             dataset_id=dataset_id,
             evaluation_id=evaluation_id,
             dataset_version=dataset_version,
             timestamp=now,
+            membership_verified=membership_verified,
         )
 
-    # Membership must be verifiable before we can classify.
+    def _indeterminate(obs_val: Optional[float] = None, pred_val: Optional[float] = None) -> EvidenceRecord:
+        return _make_record(EvidenceClassification.INDETERMINATE, obs_val, pred_val)
+
+    # Membership must be verifiable before we can compute supporting/contradicting evidence.
     if not membership_verified:
         return _indeterminate()
 
@@ -286,23 +284,7 @@ def classify_observation_evidence(
         else EvidenceClassification.CONTRADICTING
     )
 
-    return EvidenceRecord(
-        evidence_id=evidence_id,
-        hypothesis_id=hypothesis_id,
-        observation_id=observation.observation_id,
-        experiment_id=observation.input_id,
-        partition=partition,
-        classification=classification,
-        observed_value=observed,
-        predicted_value=predicted,
-        residual=residual,
-        tolerance=tolerance,
-        is_held_out=observation.is_held_out,
-        dataset_id=dataset_id,
-        evaluation_id=evaluation_id,
-        dataset_version=dataset_version,
-        timestamp=now,
-    )
+    return _make_record(classification, observed, predicted, residual, tolerance)
 
 
 def collect_evidence(
@@ -314,40 +296,23 @@ def collect_evidence(
 ) -> List[EvidenceRecord]:
     """Produce evidence records for all observations associated with one evaluation.
 
-    Idempotent: the evidence_id for each (hypothesis_id, observation_id, partition)
-    triple is deterministic.  Callers that store records to a persistent store
-    should upsert on evidence_id to avoid duplication.
+    Membership verification (Finding #4)
+    ------------------------------------
+    Each observation's partition membership is validated against
+    ``EvaluationResult.dataset_ids.observation_ids`` (training) and
+    ``held_out_observation_ids`` (held-out).
 
-    Only SUCCESS observations with output_values are eligible for classification.
-    All others produce INDETERMINATE records that preserve traceability without
-    fabricating classification.
+    * When BOTH lists are absent → no observations can be verified →
+      ALL records carry ``membership_verified=False``.
+    * When a list IS present for a partition, observations in that partition
+      are verified individually (present in list → True, absent → False).
+    * When only one partition's list is present, only that partition benefits
+      from verified membership; the other partition's observations are unverified.
 
-    Membership validation
-    ---------------------
-    Each observation's partition label (``is_held_out``) is validated against
-    the evaluation's provenance when ``EvaluationResult.dataset_ids`` contains
-    explicit observation-ID lists under the keys ``"observation_ids"`` (training)
-    and ``"held_out_observation_ids"`` (held-out).  If such lists are present,
-    any observation whose ID is absent from the corresponding list is classified
-    INDETERMINATE with a note recorded in the reason.  When the lists are absent
-    (e.g. legacy results), membership is treated as unverified but not rejected,
-    so evidence collection still proceeds — this is equivalent to ``membership_verified=True``
-    for backwards compatibility.
-
-    Parameters
-    ----------
-    evaluation_result
-        Completed or failed evaluation result.  When FAILED, all records are
-        INDETERMINATE (no fitted specification is available for prediction).
-    observations
-        All observations passed to the evaluator for this candidate, both
-        training and held-out.
-    policy
-        Tolerance policy for residual classification.
-    dataset_version
-        Optional dataset version number for provenance.
-    registry
-        Optional custom model family registry.  Defaults to ``default_registry()``.
+    Records with ``membership_verified=False`` are classified normally for
+    display, but ``EvidenceSummary.unverified_membership_count`` counts them,
+    and ``derive_plausibility_status`` cannot grant PLAUSIBLE when this count
+    is > 0.
     """
     hypothesis_id = evaluation_result.hypothesis_id
     evaluation_id = evaluation_result.evaluation_id
@@ -363,27 +328,39 @@ def collect_evidence(
         if isinstance(ds, str) and ds:
             dataset_id = ds
 
-    # Build membership sets from evaluation provenance (when available).
-    # These are the observation IDs that were *accepted* into the respective partition.
+    # Build membership sets from evaluation provenance.
     known_training_ids: Optional[frozenset] = None
     known_held_out_ids: Optional[frozenset] = None
     if evaluation_result.dataset_ids is not None:
-        raw_training = evaluation_result.dataset_ids.get("observation_ids")
+        raw_training = (
+            evaluation_result.dataset_ids.get("training_observation_ids")
+            or evaluation_result.dataset_ids.get("observation_ids")
+        )
         raw_held_out = evaluation_result.dataset_ids.get("held_out_observation_ids")
         if isinstance(raw_training, (list, tuple, set, frozenset)):
             known_training_ids = frozenset(str(x) for x in raw_training)
         if isinstance(raw_held_out, (list, tuple, set, frozenset)):
             known_held_out_ids = frozenset(str(x) for x in raw_held_out)
 
+    # When NEITHER list is present, no observation can be verified.
+    has_any_membership_lists = (known_training_ids is not None) or (known_held_out_ids is not None)
+
     records: List[EvidenceRecord] = []
     for obs in observations:
-        # Validate partition membership against evaluation provenance.
-        membership_verified = True
-        if obs.is_held_out:
-            if known_held_out_ids is not None:
+        if not has_any_membership_lists:
+            # No membership information at all — all observations unverified.
+            membership_verified = False
+        elif obs.is_held_out:
+            if known_held_out_ids is None:
+                # Held-out list absent; cannot verify held-out observation.
+                membership_verified = False
+            else:
                 membership_verified = obs.observation_id in known_held_out_ids
         else:
-            if known_training_ids is not None:
+            if known_training_ids is None:
+                # Training list absent; cannot verify training observation.
+                membership_verified = False
+            else:
                 membership_verified = obs.observation_id in known_training_ids
 
         record = classify_observation_evidence(
@@ -410,8 +387,10 @@ def summarize_evidence(
 
     Deduplication: when multiple records share the same (observation_id,
     partition) pair, only the most recent one (by timestamp, then stable sort)
-    is used.  This handles idempotent re-processing without re-counting.
+    is used.
 
+    Records with ``membership_verified=False`` are counted in
+    ``unverified_membership_count`` in addition to their classification bucket.
     Observation IDs are preserved in sorted order for deterministic output.
     """
     # Deduplicate: keep last record per (observation_id, partition).
@@ -425,8 +404,11 @@ def summarize_evidence(
     supporting_ids: List[str] = []
     contradicting_ids: List[str] = []
     indeterminate_ids: List[str] = []
+    unverified_ids: List[str] = []
 
     for rec in seen.values():
+        if not rec.membership_verified:
+            unverified_ids.append(rec.observation_id)
         if rec.classification == EvidenceClassification.SUPPORTING:
             supporting_ids.append(rec.observation_id)
         elif rec.classification == EvidenceClassification.CONTRADICTING:
@@ -437,6 +419,7 @@ def summarize_evidence(
     supporting_ids.sort()
     contradicting_ids.sort()
     indeterminate_ids.sort()
+    unverified_ids.sort()
 
     s = len(supporting_ids)
     c = len(contradicting_ids)
@@ -451,6 +434,7 @@ def summarize_evidence(
         supporting_observation_ids=tuple(supporting_ids),
         contradicting_observation_ids=tuple(contradicting_ids),
         indeterminate_observation_ids=tuple(indeterminate_ids),
+        unverified_membership_count=len(unverified_ids),
     )
 
 
@@ -467,27 +451,25 @@ def derive_plausibility_status(
     2. evaluation_result.status is FAILED → UNEVALUABLE.
     3. evaluation_result.sample_count < policy.min_samples_for_plausibility → UNCERTAIN.
     4. evidence_summary.contradicting_count > policy.max_tolerated_contradictions → CONTRADICTED.
-    5. evidence_summary.indeterminate_count > 0 and no contradictions → UNCERTAIN
-       (because we cannot confirm full consistency without finite predictions).
-    6. Accepted performance criterion check: the evaluation must have a finite
-       primary metric (MAE by default) on either held-out or training data.
-       Without a validated metric we cannot assert acceptable predictive
-       performance, so the candidate remains UNCERTAIN.
-    7. Otherwise → PLAUSIBLE.
+    5. evidence_summary.unverified_membership_count > 0 → UNCERTAIN.
+       The observation population is unknown; we cannot confirm the evidence base
+       is correct for this evaluation, so PLAUSIBLE is not granted.
+    6. evidence_summary.indeterminate_count > 0 → UNCERTAIN.
+    7. Accepted performance criterion (Finding #1):
+       A finite primary metric must exist AND must satisfy
+       policy.performance_acceptance_threshold.  When the threshold is None,
+       PLAUSIBLE is NOT granted — no agreed acceptance criterion exists, so
+       we cannot assert acceptable performance.  When set, the best available
+       metric (held-out preferred) must meet it.
+    8. Otherwise → PLAUSIBLE.
 
-    Note: evidence counts do NOT override metric scores; they only affect status
-    classification.  A CONTRADICTED candidate may still have a low MAE on
-    training data — the status makes the contradiction visible without discarding
-    the metric.
-
-    Plausibility criterion (step 6)
-    --------------------------------
-    PLAUSIBLE requires at least one finite primary metric value (held-out
-    preferred, training accepted).  This ensures that agreement on supplied
-    observations alone — without a measurable predictive error — is not
-    sufficient to label a candidate as scientifically plausible.  If neither
-    partition produces a finite metric the candidate is UNCERTAIN even when
-    all evidence is SUPPORTING.
+    PLAUSIBLE therefore requires ALL of:
+    - Enough samples (>= min_samples_for_plausibility).
+    - No contradictions exceeding the tolerance.
+    - All evidence with verified membership.
+    - No INDETERMINATE residuals.
+    - An explicit performance threshold configured in policy AND the metric
+      value meets that threshold.
     """
     if evaluation_result is None:
         return PlausibilityStatus.UNEVALUATED
@@ -495,34 +477,51 @@ def derive_plausibility_status(
     if evaluation_result.status == EvaluationStatus.FAILED:
         return PlausibilityStatus.UNEVALUABLE
 
-    # Require sufficient training observations for plausibility determination.
     if evaluation_result.sample_count < policy.min_samples_for_plausibility:
         return PlausibilityStatus.UNCERTAIN
 
-    # Any validated contradiction exceeding the tolerance → CONTRADICTED.
     if evidence_summary.contradicting_count > policy.max_tolerated_contradictions:
         return PlausibilityStatus.CONTRADICTED
 
-    # Indeterminate evidence means we cannot confirm full consistency.
+    # Unverified membership means we cannot confirm the evidence population
+    # matches the evaluation, so PLAUSIBLE cannot be granted.
+    if evidence_summary.unverified_membership_count > 0:
+        return PlausibilityStatus.UNCERTAIN
+
     if evidence_summary.indeterminate_count > 0:
         return PlausibilityStatus.UNCERTAIN
 
-    # Require at least one accepted, finite primary metric to confirm
-    # acceptable predictive performance (finding #3).
+    # Finding #1: require explicit, task-appropriate performance criterion.
+    # Pick best available metric (held-out preferred over training).
     primary = policy.primary_metric
-    has_held_out_metric = (
+    best_metric: Optional[float] = None
+    if (
         evaluation_result.held_out_metrics is not None
         and primary in evaluation_result.held_out_metrics
         and evaluation_result.held_out_metrics[primary] is not None
-        and math.isfinite(float(evaluation_result.held_out_metrics[primary]))  # type: ignore[arg-type]
-    )
-    has_training_metric = (
-        evaluation_result.metrics is not None
-        and primary in evaluation_result.metrics
-        and evaluation_result.metrics[primary] is not None
-        and math.isfinite(float(evaluation_result.metrics[primary]))  # type: ignore[arg-type]
-    )
-    if not (has_held_out_metric or has_training_metric):
+    ):
+        try:
+            v = float(evaluation_result.held_out_metrics[primary])  # type: ignore[arg-type]
+            if math.isfinite(v):
+                best_metric = v
+        except (TypeError, ValueError):
+            pass
+    if best_metric is None and primary in evaluation_result.metrics:
+        try:
+            v = float(evaluation_result.metrics[primary])  # type: ignore[arg-type]
+            if math.isfinite(v):
+                best_metric = v
+        except (TypeError, ValueError):
+            pass
+
+    if best_metric is None:
+        # No finite primary metric available at all.
+        return PlausibilityStatus.UNCERTAIN
+
+    # Apply the explicit acceptance threshold (if configured).
+    if not policy.metric_meets_acceptance(best_metric):
+        # threshold is None → "not configured" → UNCERTAIN
+        # threshold set but metric fails → UNCERTAIN
         return PlausibilityStatus.UNCERTAIN
 
     return PlausibilityStatus.PLAUSIBLE
@@ -537,44 +536,65 @@ class EvidenceStore:
     *current view* always reflects the most recent revision per identity key
     so evidence counts each observation identity exactly once.
 
-    Revision auditability
-    ---------------------
-    Every distinct evaluation produces a revision entry.  Two calls with
-    identical (evidence_id, evaluation_id, dataset_version) are deduplicated
-    as the same logical revision and do not create a second entry.  Calls with
-    a different evaluation_id or dataset_version are appended as new revisions
-    so specification changes and dataset upgrades remain auditable.
+    Revision identity (Finding #6)
+    --------------------------------
+    Revision identity = (evaluation_id, dataset_version, content_fingerprint)
+    where content_fingerprint encodes (classification, residual, predicted_value).
 
-    This design satisfies finding #2: the previous prediction, residual,
-    classification, and provenance are never overwritten and can be recovered
-    from the revision log.
+    * Same revision identity → no-op (idempotent re-ingest).
+    * Same (evaluation_id, dataset_version) but DIFFERENT content fingerprint
+      → ValueError: the caller has violated the revision-identity contract by
+      mutating payload under a stable identity key.  This prevents silent
+      corruption of the audit log.
+    * Different (evaluation_id, dataset_version) → new revision appended;
+      prior revisions are preserved for auditability.
     """
 
     def __init__(self, initial_records: Optional[Sequence[EvidenceRecord]] = None):
         # Current view: (hypothesis_id, observation_id, partition) → latest record
         self._current: Dict[Tuple[str, str, str], EvidenceRecord] = {}
-        # Revision log: same key → list of distinct revision records in ingestion order
-        self._revisions: Dict[Tuple[str, str, str], List[EvidenceRecord]] = {}
+        # Revision log: same key → list of (fingerprint_tuple, record)
+        self._revisions: Dict[Tuple[str, str, str], List[Tuple[Tuple, EvidenceRecord]]] = {}
         if initial_records:
             self.add_many(initial_records)
 
     def add(self, record: EvidenceRecord) -> None:
         """Add or update an evidence record, preserving prior revisions.
 
-        If an identical revision (same evidence_id + evaluation_id +
-        dataset_version) already exists it is not duplicated.
+        Revision identity = (evaluation_id, dataset_version, content_fingerprint).
+        Identical revision → no-op.
+        Same (eval_id, dataset_version) with different fingerprint → ValueError.
         """
         key = (record.hypothesis_id, record.observation_id, record.partition)
-
-        # Append to revision log only when the revision is new.
-        existing_revisions = self._revisions.setdefault(key, [])
-        revision_is_new = not any(
-            r.evaluation_id == record.evaluation_id
-            and r.dataset_version == record.dataset_version
-            for r in existing_revisions
+        fingerprint = _content_fingerprint(
+            record.classification, record.residual, record.predicted_value
         )
-        if revision_is_new:
-            existing_revisions.append(record)
+        revision_tuple = (record.evaluation_id, record.dataset_version, fingerprint)
+
+        existing_revisions = self._revisions.setdefault(key, [])
+
+        for stored_fp, _ in existing_revisions:
+            stored_eval_id, stored_ds_ver, stored_content_fp = stored_fp
+            if (stored_eval_id == record.evaluation_id
+                    and stored_ds_ver == record.dataset_version):
+                if stored_content_fp == fingerprint:
+                    # Identical revision — idempotent no-op.
+                    return
+                else:
+                    # Same (eval_id, dataset_version), different content.
+                    raise ValueError(
+                        f"EvidenceStore: conflicting payload for revision identity "
+                        f"(evaluation_id={record.evaluation_id!r}, "
+                        f"dataset_version={record.dataset_version!r}) "
+                        f"on key (hypothesis={record.hypothesis_id!r}, "
+                        f"observation={record.observation_id!r}, "
+                        f"partition={record.partition!r}).  "
+                        f"Stored fingerprint={stored_content_fp!r}, "
+                        f"incoming fingerprint={fingerprint!r}.  "
+                        f"A revision identity must not produce different evidence payloads."
+                    )
+
+        existing_revisions.append((revision_tuple, record))
 
         # Update the current view if this revision is newer (by timestamp).
         current = self._current.get(key)
@@ -582,7 +602,7 @@ class EvidenceStore:
             self._current[key] = record
 
     def add_many(self, records: Sequence[EvidenceRecord]) -> None:
-        """Add multiple evidence records idempotently."""
+        """Add multiple evidence records, honouring the revision-identity contract."""
         for r in records:
             self.add(r)
 
@@ -595,7 +615,7 @@ class EvidenceStore:
         revisions: List[EvidenceRecord] = []
         for (hid, _, _), recs in self._revisions.items():
             if hid == hypothesis_id:
-                revisions.extend(recs)
+                revisions.extend(r for _, r in recs)
         return revisions
 
     def get_summary(self, hypothesis_id: str) -> EvidenceSummary:

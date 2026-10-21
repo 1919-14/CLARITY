@@ -83,41 +83,55 @@ graph TD
     F -- No --> G[UNCERTAIN: Insufficient data]
     F -- Yes --> H{Contradictions > N_max?}
     H -- Yes --> I[CONTRADICTED]
-    H -- No --> J{Indeterminate > 0?}
-    J -- Yes --> K[UNCERTAIN: Ambiguous evidence]
-    J -- No --> L[PLAUSIBLE]
+    H -- No --> J{Unverified / Indeterminate > 0?}
+    J -- Yes --> K[UNCERTAIN: Unverified membership or ambiguous evidence]
+    J -- No --> L{Meets Acceptance Criterion?}
+    L -- No --> M[UNCERTAIN: Metric fails performance acceptance threshold]
+    L -- Yes --> N[PLAUSIBLE]
 ```
 
 - **`UNEVALUATED`**: No evaluation has been performed.
 - **`UNEVALUABLE`**: Fitter or evaluator failed (e.g. unregistered family, rank deficiency).
-- **`UNCERTAIN`**: Fewer than `min_samples_for_plausibility` (default: 5) samples, or non-finite indeterminate comparisons.
+- **`UNCERTAIN`**: Fewer than `min_samples_for_plausibility` (default: 5) samples, unverified observation membership, non-finite indeterminate comparisons, or primary metric failing configured `performance_acceptance_threshold`.
 - **`CONTRADICTED`**: Contradictions exceed `max_tolerated_contradictions` (default: 0).
-- **`PLAUSIBLE`**: Sufficient sample count, zero intolerable contradictions, and fully verified residuals.
+- **`PLAUSIBLE`**: Sufficient sample count, zero intolerable contradictions, verified observation membership, no indeterminate residuals, and validated acceptable predictive metric performance.
 
 ---
 
 ## 4. Hypothesis Ranking Engine
 
-### Tiered Transitive Total Ordering
+### Comparability Cohorts & Presentation Tiers
+
+Candidates evaluated across incompatible datasets, metric versions, or metric definitions are grouped into distinct **comparability cohorts** keyed by:
+$$(EvaluationTier, \text{dataset\_id}, \text{metric\_version}, \text{metric\_definition})$$
+
+Candidates are strictly ranked by predictive metric magnitude **only within their own comparability cohort**.
 
 Candidates are ordered across distinct presentation tiers to prevent invalid comparisons:
 
-1. **`VALID_HELD_OUT`** (Priority 0): Candidates with completed evaluation and finite primary metric on held-out data.
-2. **`VALID_TRAINING_ONLY`** (Priority 1): Candidates with completed evaluation on training data only (generalization unverified).
-3. **`INCOMPARABLE`** (Priority 2): Completed evaluations with non-finite primary metrics or incompatible datasets.
+1. **`VALID_HELD_OUT`** (Priority 0): Candidates with completed evaluation and finite primary metric on held-out data with verified dataset identity.
+2. **`VALID_TRAINING_ONLY`** (Priority 1): Candidates with completed evaluation on training data only (generalization unverified) with verified dataset identity.
+3. **`INCOMPARABLE`** (Priority 2): Completed evaluations with non-finite primary metrics, missing dataset identifiers, or unverified comparability.
 4. **`EVALUATION_FAILED`** (Priority 3): Evaluations that aborted with structured errors.
 5. **`UNEVALUATED`** (Priority 4): Candidates awaiting evaluation.
 
-### Within-Tier Complexity Window & Sorting
+### Display Position vs. Scientific Rank
 
-Within comparable tiers (`VALID_HELD_OUT` or `VALID_TRAINING_ONLY`) sharing a dataset identifier:
+To prevent misleading cross-cohort comparisons:
+- **`within_cohort_rank`**: The scientifically meaningful rank (1-based integer) within the candidate's comparability cohort. `None` for non-rankable tiers (`INCOMPARABLE`, `EVALUATION_FAILED`, `UNEVALUATED`).
+- **`rank`**: The global presentation order / display position across all cohorts.
+- Cross-cohort display order is annotated with `comparability_notes` and limitations.
+
+### Within-Cohort Complexity Window & Sorting
+
+Within a comparable cohort (`VALID_HELD_OUT` or `VALID_TRAINING_ONLY`):
 
 1. **Anchor Group Best Metric**: Identify $s_{\text{best}}$ (e.g. minimum $MAE$).
 2. **Equivalence Banding**:
    $$\text{band} = \left\lfloor \frac{|s - s_{\text{best}}|}{\max(|s_{\text{best}}|, 1e-9) \cdot \epsilon_{\text{comp}}} \right\rfloor$$
    Candidates within $\epsilon_{\text{comp}}$ (default: 1% relative threshold) share $\text{band} = 0$.
 3. **Total Sort Key**:
-   $$(\text{tier\_priority}, \text{band}, \text{complexity}, \text{primary\_metric}, \text{secondary\_metric}, \text{hypothesis\_id})$$
+   $$(\text{cohort\_priority}, \text{band}, \text{complexity}, \text{primary\_metric}, \text{secondary\_metric}, \text{hypothesis\_id})$$
    - **Simplicity Preference**: When candidates are in the same relative performance band, the simpler model (lower complexity) ranks ahead.
    - **Performance Distinction**: When candidates differ materially ($> \epsilon_{\text{comp}}$), the candidate with the lower error ranks ahead regardless of complexity.
    - **Deterministic Tie-Breaking**: Remaining exact ties are broken deterministically using lexicographical `hypothesis_id`.
