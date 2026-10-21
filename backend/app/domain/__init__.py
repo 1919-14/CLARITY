@@ -71,6 +71,30 @@ from .evaluation import (
     root_mean_squared_error,
     select_samples,
 )
+from .ranking_contracts import (
+    EvaluationTier,
+    EvidenceClassification,
+    EvidenceRecord,
+    EvidenceSummary,
+    PlausibilityStatus,
+    RankedCandidate,
+    RankingCohort,
+    RankingPolicyConfig,
+    RankingResult,
+)
+from .evidence_tracker import (
+    EvidenceStore,
+    classify_observation_evidence,
+    collect_evidence,
+    derive_plausibility_status,
+    summarize_evidence,
+)
+from .ranking_engine import (
+    RANKING_VERSION,
+    HypothesisRanker,
+    MetricComparabilityValidator,
+    rank_candidates,
+)
 
 __all__ = [
     "StructuredError",
@@ -132,4 +156,23 @@ __all__ = [
     "METRIC_DEFINITIONS",
     "METRIC_VERSION",
     "SUPPORTED_METRICS",
+    # Issue #7: ranking and evidence tracking
+    "PlausibilityStatus",
+    "EvidenceClassification",
+    "EvaluationTier",
+    "EvidenceRecord",
+    "EvidenceSummary",
+    "RankingPolicyConfig",
+    "RankedCandidate",
+    "RankingResult",
+    "RankingCohort",
+    "EvidenceStore",
+    "classify_observation_evidence",
+    "collect_evidence",
+    "derive_plausibility_status",
+    "summarize_evidence",
+    "MetricComparabilityValidator",
+    "HypothesisRanker",
+    "RANKING_VERSION",
+    "rank_candidates",
 ]
