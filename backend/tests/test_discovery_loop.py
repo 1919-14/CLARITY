@@ -1063,6 +1063,38 @@ def test_evaluation_with_duplicate_hypothesis_ids_fails_safely():
     assert result.ranking_is_fresh is False
 
 
+def test_terminal_observation_snapshots_reject_nested_mutation():
+    engine = DiscoveryEngine(CountingOracle(), make_config(max_query_budget=1, max_iterations=1))
+    initial = make_observation(-1.0, 2.0, observation_id="obs-init")
+    result = engine.run([initial])
+
+    committed_y = engine.observations[0].output_values["y"]
+    snapshot_before = json.dumps(result.to_dict(), sort_keys=True)
+
+    # Engine-owned snapshots expose read-only payloads.
+    with pytest.raises(TypeError):
+        engine.observations[0].output_values["y"] = 999.0
+    with pytest.raises(TypeError):
+        engine.observations[0].input_values["x"] = 999.0
+
+    # Result snapshots are equally immutable and cannot alias committed data.
+    with pytest.raises(TypeError):
+        result.observations[0].output_values["y"] = 999.0
+    with pytest.raises(TypeError):
+        result.observations[0].input_values["x"] = 999.0
+
+    # Mutating the caller's original object cannot rewrite committed evidence.
+    initial.output_values["y"] = 12345.0
+    assert engine.observations[0].output_values["y"] == committed_y
+    assert json.dumps(result.to_dict(), sort_keys=True) == snapshot_before
+
+    # Evaluation results are snapshotted too: mutating a returned snapshot does
+    # not change the engine's committed ranking.
+    score_before = engine.ranking.ranked_candidates[0].training_score
+    result.evaluations[0].metrics["mae"] = 999.0
+    assert engine.ranking.ranked_candidates[0].training_score == score_before
+
+
 def test_add_observation_requires_an_initialized_run():
     engine = DiscoveryEngine(CountingOracle(), make_config())
     with pytest.raises(DiscoveryRunError) as error:

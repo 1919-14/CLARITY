@@ -31,6 +31,7 @@ previously committed observations.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +47,7 @@ from .contracts import (
     ObservationStatus,
     OracleInterface,
     StructuredError,
+    freeze_payload,
     generate_id,
     utc_now_iso,
 )
@@ -246,7 +248,12 @@ class DiscoveryEngine:
 
     @property
     def observations(self) -> Tuple[Observation, ...]:
-        return tuple(self._observations.values())
+        """Committed observations as read-only snapshots.
+
+        Payloads are frozen, so nested mutation raises instead of altering
+        committed evidence.
+        """
+        return tuple(self._frozen_observation(o) for o in self._observations.values())
 
     @property
     def candidates(self) -> Tuple[HypothesisRepresentation, ...]:
@@ -353,7 +360,7 @@ class DiscoveryEngine:
         if error is not None:
             raise DiscoveryRunError(error)
 
-        self._observations[observation.observation_id] = observation
+        self._observations[observation.observation_id] = self._frozen_observation(observation)
         refresh_ok = self._refresh_evaluation_and_ranking()
         self._append_ingestion_record(observation, refresh_ok)
         if not refresh_ok:
@@ -411,7 +418,7 @@ class DiscoveryEngine:
         self._termination_reason = None
         self._finished = False
         for observation in validated:
-            self._observations[observation.observation_id] = observation
+            self._observations[observation.observation_id] = self._frozen_observation(observation)
 
         refresh_ok = self._refresh_evaluation_and_ranking()
         for observation in validated:
@@ -452,7 +459,7 @@ class DiscoveryEngine:
                         observation_id=observation.observation_id,
                     )
                 )
-            self._observations[observation.observation_id] = observation
+            self._observations[observation.observation_id] = self._frozen_observation(observation)
 
     def _initialize_candidates(self) -> None:
         try:
@@ -583,7 +590,7 @@ class DiscoveryEngine:
                 top_hypothesis_id=top_id,
                 top_primary_metric=top_metric,
                 ranking_is_fresh=self._ranking_is_fresh and refresh_ok,
-                warnings=tuple(iteration_warnings),
+                warnings=tuple(self._frozen_error(item) for item in iteration_warnings),
             )
             self._iteration_history.append(record)
 
@@ -816,7 +823,7 @@ class DiscoveryEngine:
 
         self._successful_queries += 1
         self._consecutive_failures = 0
-        self._observations[observation.observation_id] = observation
+        self._observations[observation.observation_id] = self._frozen_observation(observation)
         return self._record_experiment(
             iteration,
             selected,
@@ -840,7 +847,7 @@ class DiscoveryEngine:
             input_values=dict(selected.input_data.values),
             outcome=outcome,
             observation_id=observation.observation_id if observation is not None else None,
-            error=error,
+            error=self._frozen_error(error) if error is not None else None,
             oracle_sequence_number=(
                 observation.sequence_number if observation is not None else None
             ),
@@ -903,6 +910,39 @@ class DiscoveryEngine:
                 input_values=dict(observation.input_values),
             )
         return None
+
+    def _frozen_error(self, error: StructuredError) -> StructuredError:
+        """Return a snapshot whose details cannot be mutated in place."""
+        return StructuredError(
+            code=error.code,
+            message=error.message,
+            details=(
+                freeze_payload(dict(error.details)) if error.details is not None else None
+            ),
+        )
+
+    def _frozen_observation(self, observation: Observation) -> Observation:
+        """Return an engine-owned observation with read-only nested payloads."""
+        return Observation(
+            observation_id=observation.observation_id,
+            input_id=observation.input_id,
+            input_values=freeze_payload(dict(observation.input_values)),
+            output_values=(
+                freeze_payload(dict(observation.output_values))
+                if observation.output_values is not None
+                else None
+            ),
+            status=observation.status,
+            sequence_number=observation.sequence_number,
+            timestamp=observation.timestamp,
+            error=self._frozen_error(observation.error) if observation.error is not None else None,
+            noise_metadata=(
+                freeze_payload(dict(observation.noise_metadata))
+                if observation.noise_metadata is not None
+                else None
+            ),
+            is_held_out=observation.is_held_out,
+        )
 
     def _validate_external_observation_batch(
         self, observations: Optional[Sequence[Observation]]
@@ -1391,7 +1431,7 @@ class DiscoveryEngine:
         reason: Optional[DiscoveryTerminationReason],
     ) -> DiscoveryRunResult:
         evaluations = tuple(
-            self._evaluations[candidate.hypothesis_id]
+            copy.deepcopy(self._evaluations[candidate.hypothesis_id])
             for candidate in self._candidates
             if candidate.hypothesis_id in self._evaluations
         )
@@ -1405,12 +1445,15 @@ class DiscoveryEngine:
             hypotheses=tuple(self._candidates),
             evaluations=evaluations,
             ranking=self._ranking,
-            observations=tuple(self._observations.values()),
+            observations=tuple(
+                self._frozen_observation(observation)
+                for observation in self._observations.values()
+            ),
             experiment_history=tuple(self._experiment_history),
             iteration_history=tuple(self._iteration_history),
             ingestion_history=tuple(self._ingestion_history),
-            errors=tuple(self._errors),
-            warnings=tuple(self._warnings),
+            errors=tuple(self._frozen_error(error) for error in self._errors),
+            warnings=tuple(self._frozen_error(warning) for warning in self._warnings),
             ranking_is_fresh=self._ranking_is_fresh,
             limitations=self._limitations(),
             started_at=self._started_at,

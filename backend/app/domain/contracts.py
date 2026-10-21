@@ -42,7 +42,9 @@ class StructuredError:
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {"code": self.code, "message": self.message}
         if self.details is not None:
-            result["details"] = self.details
+            # Details may be a frozen snapshot (read-only mapping); thaw it so
+            # serialization always produces plain JSON-compatible values.
+            result["details"] = thaw_payload(self.details)
         return result
 
     @classmethod
@@ -168,8 +170,8 @@ class Observation:
         data: Dict[str, Any] = {
             "observation_id": self.observation_id,
             "input_id": self.input_id,
-            "input_values": self.input_values,
-            "output_values": self.output_values,
+            "input_values": thaw_payload(self.input_values),
+            "output_values": thaw_payload(self.output_values),
             "status": self.status.value,
             "sequence_number": self.sequence_number,
             "timestamp": self.timestamp,
@@ -178,7 +180,7 @@ class Observation:
         if self.error is not None:
             data["error"] = self.error.to_dict()
         if self.noise_metadata is not None:
-            data["noise_metadata"] = self.noise_metadata
+            data["noise_metadata"] = thaw_payload(self.noise_metadata)
         return data
 
     @classmethod

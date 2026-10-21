@@ -795,6 +795,12 @@ is `null` only for a snapshot taken while the run is still active. `to_dict()`
 returns a JSON-compatible payload and re-runs `verify_no_ground_truth_leakage`;
 a forbidden key raises `ValueError` instead of being serialized.
 
+Snapshots are deep, not shallow. Observation payloads in the engine and in a
+returned result are frozen read-only mappings, so nested mutation raises
+`TypeError`. Observations supplied by callers are copied at commit, and returned
+`EvaluationResult` objects are deep copies, so post-run mutation cannot alter
+committed evidence, evaluations, or ranking.
+
 ### 7.6 Failure semantics
 A successful observation is committed immediately. If the subsequent
 evaluation/ranking refresh raises, the observation stays committed, the previous

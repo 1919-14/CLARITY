@@ -307,6 +307,16 @@ previous ranking snapshot is preserved, `ranking_is_fresh=False`, and the result
 is `FAILED` / `COMPONENT_FAILURE`. Rejected updates raise `DiscoveryRunError`
 and leave state unchanged.
 
+**Snapshot ownership.** Engine-owned observations and the observations exposed
+by `engine.observations` / `DiscoveryRunResult` have frozen nested payloads
+(`input_values`, `output_values`, `noise_metadata`, error `details` are read-only
+mappings). Mutating them raises `TypeError`, and caller-supplied `Observation`
+objects are copied at commit, so later mutation of the caller's object cannot
+rewrite committed evidence. Returned `EvaluationResult` objects are deep copies,
+so mutating them cannot change the engine's committed evaluations or ranking.
+This is what makes the terminal-immutability contract hold below the dataclass
+level.
+
 Duplicate policies are intentionally separate:
 
 - `allow_duplicate_queries` governs **oracle** re-querying only.
@@ -329,7 +339,7 @@ Both default to `False`, and neither flag implies the other.
 | `hypotheses` | Candidate tuple with stable IDs. |
 | `evaluations` | Latest `EvaluationResult` per candidate, candidate order. |
 | `ranking` | Latest valid `RankingResult` (or `None`). |
-| `observations` | Committed observations in ingestion order. |
+| `observations` | Committed observations in ingestion order, as frozen snapshots. |
 | `experiment_history` | `ExperimentExecutionRecord` per proposal. |
 | `iteration_history` | `DiscoveryIterationRecord` per completed iteration. |
 | `ingestion_history` | `DiscoveryIngestionRecord` per external update. |

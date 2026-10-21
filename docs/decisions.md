@@ -216,6 +216,20 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Validation:** `backend/tests/test_discovery_loop.py` (post-terminal rejection, resume identity/budget preservation, failed-run resume rejection, metric-threshold regression, duplicate-policy split); [discovery-loop.md](discovery-loop.md) sections 3, 4, 8; [contracts.md](contracts.md) section 7.
 
+## D-020 — Run snapshots freeze observation payloads
+
+**Status:** Confirmed (Issue #8 follow-up review)
+
+**Decision:** Freeze nested observation payloads (`input_values`, `output_values`, `noise_metadata`, and error `details`) whenever the engine takes ownership of an observation, and return those frozen snapshots from `engine.observations` and `DiscoveryRunResult.observations`. Caller-supplied `Observation` objects are copied at commit, and `EvaluationResult` objects in a result are deep copies. `Observation.to_dict` and `StructuredError.to_dict` thaw frozen payloads so serialization stays JSON-compatible.
+
+**Rationale:** Frozen dataclasses only protect their top-level fields. Without deep freezing, a caller could mutate `result.observations[0].output_values` after a run and silently rewrite evidence that the lifecycle contract declares immutable, bypassing `RUN_NOT_ACTIVE`.
+
+**Trade-off:** Observation payloads are `Mapping` objects rather than plain dicts inside the engine and result APIs; consumers that need a plain dict use `to_dict()` or `dict(obs.input_values)`. Evaluation snapshots are independent copies rather than frozen mappings, so mutating a returned evaluation cannot affect the engine but can still alter that caller-local object.
+
+**Rejected alternatives:** Returning defensive copies only from `engine.observations` (result snapshots would remain aliased); freezing every `Observation` at construction globally (broader contract change than this boundary requires); freezing `EvaluationResult` payloads (its serializer and downstream consumers currently assume plain dicts).
+
+**Validation:** `backend/tests/test_discovery_loop.py::test_terminal_observation_snapshots_reject_nested_mutation`; [discovery-loop.md](discovery-loop.md) section 8; [contracts.md](contracts.md) section 7.5.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
