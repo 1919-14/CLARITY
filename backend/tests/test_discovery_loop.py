@@ -1088,10 +1088,17 @@ def test_terminal_observation_snapshots_reject_nested_mutation():
     assert engine.observations[0].output_values["y"] == committed_y
     assert json.dumps(result.to_dict(), sort_keys=True) == snapshot_before
 
-    # Evaluation results are snapshotted too: mutating a returned snapshot does
-    # not change the engine's committed ranking.
+    # Returned evaluation snapshots are frozen too, including nested metadata,
+    # so the serialized result cannot drift after it was returned.
     score_before = engine.ranking.ranked_candidates[0].training_score
-    result.evaluations[0].metrics["mae"] = 999.0
+    snapshot_before_evaluation_attempt = json.dumps(result.to_dict(), sort_keys=True)
+    with pytest.raises(TypeError):
+        result.evaluations[0].metrics["mae"] = 999.0
+    with pytest.raises(TypeError):
+        result.evaluations[0].observation_counts["accepted_training"] = 0
+    with pytest.raises(TypeError):
+        result.evaluations[0].dataset_ids["dataset_id"] = "tampered"
+    assert json.dumps(result.to_dict(), sort_keys=True) == snapshot_before_evaluation_attempt
     assert engine.ranking.ranked_candidates[0].training_score == score_before
 
 

@@ -31,9 +31,9 @@ previously committed observations.
 
 from __future__ import annotations
 
-import copy
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .candidate_generator import CandidateGenerationError, CandidateGenerator
@@ -921,6 +921,58 @@ class DiscoveryEngine:
             ),
         )
 
+    def _frozen_evaluation(self, evaluation: EvaluationResult) -> EvaluationResult:
+        """Return an evaluation snapshot with read-only nested mappings."""
+        return replace(
+            evaluation,
+            metrics=freeze_payload(dict(evaluation.metrics)),
+            held_out_metrics=(
+                freeze_payload(dict(evaluation.held_out_metrics))
+                if evaluation.held_out_metrics is not None
+                else None
+            ),
+            error=(
+                self._frozen_error(evaluation.error)
+                if evaluation.error is not None
+                else None
+            ),
+            fitting_config=(
+                freeze_payload(dict(evaluation.fitting_config))
+                if evaluation.fitting_config is not None
+                else None
+            ),
+            fitted_specification=(
+                freeze_payload(dict(evaluation.fitted_specification))
+                if evaluation.fitted_specification is not None
+                else None
+            ),
+            observation_counts=(
+                freeze_payload(dict(evaluation.observation_counts))
+                if evaluation.observation_counts is not None
+                else None
+            ),
+            exclusion_codes=(
+                freeze_payload(dict(evaluation.exclusion_codes))
+                if evaluation.exclusion_codes is not None
+                else None
+            ),
+            metric_definitions=(
+                freeze_payload(dict(evaluation.metric_definitions))
+                if evaluation.metric_definitions is not None
+                else None
+            ),
+            dataset_ids=(
+                freeze_payload(dict(evaluation.dataset_ids))
+                if evaluation.dataset_ids is not None
+                else None
+            ),
+            warnings=(
+                tuple(self._frozen_error(warning) for warning in evaluation.warnings)
+                if evaluation.warnings is not None
+                else None
+            ),
+        )
+
     def _frozen_observation(self, observation: Observation) -> Observation:
         """Return an engine-owned observation with read-only nested payloads."""
         return Observation(
@@ -1431,7 +1483,7 @@ class DiscoveryEngine:
         reason: Optional[DiscoveryTerminationReason],
     ) -> DiscoveryRunResult:
         evaluations = tuple(
-            copy.deepcopy(self._evaluations[candidate.hypothesis_id])
+            self._frozen_evaluation(self._evaluations[candidate.hypothesis_id])
             for candidate in self._candidates
             if candidate.hypothesis_id in self._evaluations
         )

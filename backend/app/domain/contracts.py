@@ -544,12 +544,12 @@ class EvaluationResult:
             "evaluation_id": self.evaluation_id,
             "hypothesis_id": self.hypothesis_id,
             "status": self.status.value,
-            "metrics": self.metrics,
+            "metrics": thaw_payload(self.metrics),
             "sample_count": self.sample_count,
             "evaluated_at": self.evaluated_at,
         }
         if self.held_out_metrics is not None:
-            data["held_out_metrics"] = self.held_out_metrics
+            data["held_out_metrics"] = thaw_payload(self.held_out_metrics)
         if self.error is not None:
             data["error"] = self.error.to_dict()
         if self.model_family is not None:

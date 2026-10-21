@@ -797,9 +797,12 @@ a forbidden key raises `ValueError` instead of being serialized.
 
 Snapshots are deep, not shallow. Observation payloads in the engine and in a
 returned result are frozen read-only mappings, so nested mutation raises
-`TypeError`. Observations supplied by callers are copied at commit, and returned
-`EvaluationResult` objects are deep copies, so post-run mutation cannot alter
-committed evidence, evaluations, or ranking.
+`TypeError`. Observations supplied by callers are copied at commit. Returned
+`EvaluationResult` snapshots freeze every nested mapping as well (`metrics`,
+`held_out_metrics`, `fitting_config`, `fitted_specification`,
+`observation_counts`, `exclusion_codes`, `metric_definitions`, `dataset_ids`,
+plus error/warning `details`), so post-run mutation cannot alter committed
+evidence, evaluations, ranking, or the serialized result.
 
 ### 7.6 Failure semantics
 A successful observation is committed immediately. If the subsequent

@@ -312,10 +312,13 @@ by `engine.observations` / `DiscoveryRunResult` have frozen nested payloads
 (`input_values`, `output_values`, `noise_metadata`, error `details` are read-only
 mappings). Mutating them raises `TypeError`, and caller-supplied `Observation`
 objects are copied at commit, so later mutation of the caller's object cannot
-rewrite committed evidence. Returned `EvaluationResult` objects are deep copies,
-so mutating them cannot change the engine's committed evaluations or ranking.
-This is what makes the terminal-immutability contract hold below the dataclass
-level.
+rewrite committed evidence. Returned `EvaluationResult` objects are frozen
+snapshots too: `metrics`, `held_out_metrics`, `fitting_config`,
+`fitted_specification`, `observation_counts`, `exclusion_codes`,
+`metric_definitions`, `dataset_ids`, error `details`, and warning details are
+read-only mappings. Mutating any of them raises `TypeError` and cannot change
+the engine's committed evaluations or ranking. This is what makes the
+terminal-immutability contract hold below the dataclass level.
 
 Duplicate policies are intentionally separate:
 
