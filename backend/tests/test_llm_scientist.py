@@ -261,6 +261,7 @@ def test_valid_proposal_becomes_supported_hypothesis_contract() -> None:
     assert hypothesis.provenance.generator == "llm_scientist"
     metadata = hypothesis.generation_metadata
     assert metadata["proposal_round_id"] == outcome.record.round_id
+    assert isinstance(metadata["accepted_at"], str) and metadata["accepted_at"]
     assert metadata["provider_id"] == "fake_provider"
     assert metadata["prompt_version"] == SCIENTIST_PROMPT_VERSION
     assert metadata["schema_version"] == SCIENTIST_SCHEMA_VERSION
@@ -435,12 +436,14 @@ def test_disabled_config_never_calls_the_provider() -> None:
     assert outcome.hypotheses == ()
 
 
-def test_missing_provider_is_reported_as_disabled() -> None:
+def test_missing_provider_is_reported_as_not_configured() -> None:
     scientist = LLMScientist(make_config(), None)
     outcome = run_round(scientist)
 
-    assert outcome.record.status == ScientistRoundStatus.DISABLED
-    assert outcome.record.outcome_status == ProviderOutcomeStatus.DISABLED
+    assert outcome.record.status == ScientistRoundStatus.PROVIDER_FAILURE
+    assert outcome.record.outcome_status == ProviderOutcomeStatus.NOT_CONFIGURED
+    assert outcome.record.error.code == "LLM_PROVIDER_NOT_CONFIGURED"
+    assert outcome.record.fallback_applied is True
 
 
 def test_provider_failure_is_structured_and_secret_free() -> None:

@@ -299,6 +299,7 @@ scientist = build_llm_scientist_from_environment()  # None when disabled
 
 | Symptom | Meaning |
 | --- | --- |
+| `LLM_PROVIDER_NOT_CONFIGURED` | LLM mode enabled but no provider adapter was supplied. |
 | `LLM_MISSING_CREDENTIALS` | LLM mode enabled without the named environment variable. |
 | `LLM_SDK_UNAVAILABLE` | Provider package/client could not be created. |
 | `LLM_AUTHENTICATION_FAILED` | Credential rejected; not retried. |

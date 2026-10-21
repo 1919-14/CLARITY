@@ -497,7 +497,7 @@ class LLMScientist:
             "iteration": iteration,
         }
 
-        if not self._config.enabled or self._provider is None:
+        if not self._config.enabled:
             return self._failed_outcome(
                 round_id=round_id,
                 index=index,
@@ -509,9 +509,28 @@ class LLMScientist:
                 outcome_status=ProviderOutcomeStatus.DISABLED,
                 error=StructuredError(
                     code="LLM_SCIENTIST_DISABLED",
-                    message="The LLM Scientist is disabled or has no configured provider.",
+                    message="The LLM Scientist is disabled by configuration.",
                 ),
                 fallback_reason="llm_scientist_disabled",
+            )
+
+        if self._provider is None:
+            # Distinct from disabled: the feature is requested but no provider
+            # adapter was configured, so the round fails explicitly.
+            return self._failed_outcome(
+                round_id=round_id,
+                index=index,
+                run_id=run_id,
+                started_at=started_at,
+                start=start,
+                evidence_summary=evidence_summary,
+                status=ScientistRoundStatus.PROVIDER_FAILURE,
+                outcome_status=ProviderOutcomeStatus.NOT_CONFIGURED,
+                error=StructuredError(
+                    code="LLM_PROVIDER_NOT_CONFIGURED",
+                    message="The LLM Scientist is enabled but no provider is configured.",
+                ),
+                fallback_reason="provider_not_configured",
             )
 
         if self._rounds_disabled_reason is not None or self.rounds_remaining <= 0:
@@ -1053,6 +1072,7 @@ class LLMScientist:
                 "generator_version": SCIENTIST_VERSION,
                 "proposal_round_id": round_id,
                 "round_index": request.round_index,
+                "accepted_at": utc_now_iso(),
                 "provider_id": self._provider.provider_id if self._provider else None,
                 "model_id": call_model or (self._provider.model_id if self._provider else None),
                 "configured_model_id": self._config.model,
