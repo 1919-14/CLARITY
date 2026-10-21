@@ -247,6 +247,7 @@ class DiscoveryEngine:
         self._lifecycle_lock = Lock()
         self._consecutive_failures = 0
         self._iterations_completed = 0
+        self._no_informative_experiment = False
 
         # History.
         self._experiment_history: List[ExperimentExecutionRecord] = []
@@ -607,9 +608,14 @@ class DiscoveryEngine:
                 )
 
             if execution is None:
+                reason = (
+                    DiscoveryTerminationReason.NO_INFORMATIVE_EXPERIMENT_AVAILABLE
+                    if self._no_informative_experiment
+                    else DiscoveryTerminationReason.EXPERIMENT_POOL_EXHAUSTED
+                )
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_NO_EXPERIMENTS,
-                    DiscoveryTerminationReason.EXPERIMENT_POOL_EXHAUSTED,
+                    reason,
                 )
 
             iteration_warnings: List[StructuredError] = []
@@ -713,6 +719,7 @@ class DiscoveryEngine:
                     selection_diagnostics is not None
                     and selection_diagnostics.get("status") == "no_selection"
                 ):
+                    self._no_informative_experiment = True
                     self._warnings.append(
                         make_structured_error(
                             WARNING_EXPERIMENT_SELECTION_UNAVAILABLE,
