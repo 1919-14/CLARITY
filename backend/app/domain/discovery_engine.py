@@ -65,6 +65,9 @@ from .discovery_contracts import (
     ERROR_ORACLE_QUERY_FAILURE,
     ERROR_PLANNER_FAILURE,
     ERROR_RANKING_FAILURE,
+    ERROR_RUN_NOT_ACTIVE,
+    ERROR_RUN_NOT_FINISHED,
+    ERROR_RUN_TERMINAL_FAILURE,
     ERROR_UNEXPECTED_DISCOVERY_ERROR,
     WARNING_DUPLICATE_QUERY_SKIPPED,
     WARNING_EXPERIMENT_POOL_UNDERSIZED,
@@ -94,7 +97,7 @@ from .experiment_generator import (
     ExperimentGenerationConfig,
 )
 from .hypothesis_models import ModelFamilyRegistry, default_registry
-from .ranking_contracts import PlausibilityStatus, RankingResult
+from .ranking_contracts import EvaluationTier, PlausibilityStatus, RankingResult
 from .ranking_engine import HypothesisRanker
 
 DEFAULT_METRIC_NAMES: Tuple[str, ...] = ("mae", "rmse")
@@ -312,14 +315,18 @@ class DiscoveryEngine:
         return self._run_iterations()
 
     def add_observation(self, observation: Observation) -> DiscoveryRunResult:
-        """Ingest one externally authorized observation into this run.
+        """Ingest one observation while the run is still active.
 
-        The update preserves existing observation and hypothesis IDs, rejects
-        invalid or duplicate identities explicitly (``DiscoveryRunError``), and
-        recomputes evaluation and ranking without consuming oracle budget. If
-        recomputation fails, the observation and the previous ranking snapshot
-        are preserved, ``ranking_is_fresh`` becomes False, and the returned
-        result is marked FAILED.
+        Lifecycle contract: a run is mutable only until it terminates. Once a
+        result has been finalized, this method raises ``DiscoveryRunError`` with
+        ``RUN_NOT_ACTIVE`` and does not touch state. Use ``resume()`` for a
+        deliberate post-terminal update of a non-failed run.
+
+        While active, the update preserves existing observation and hypothesis
+        IDs, rejects invalid or duplicate identities explicitly, and refreshes
+        evaluation/ranking without consuming oracle budget. If the refresh
+        fails, the observation and the previous ranking snapshot are preserved
+        and the run ends FAILED.
         """
         if not self._started:
             raise DiscoveryRunError(
@@ -328,40 +335,93 @@ class DiscoveryEngine:
                     "add_observation() requires an initialized run; call run() first.",
                 )
             )
+        if self._finished:
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_RUN_NOT_ACTIVE,
+                    "add_observation() is not permitted after the run has terminated; "
+                    "use resume() for a deliberate post-terminal update.",
+                    status=self._status.value,
+                    termination_reason=(
+                        self._termination_reason.value
+                        if self._termination_reason is not None
+                        else None
+                    ),
+                )
+            )
         error = self._validate_external_observation(observation, ERROR_INVALID_OBSERVATION)
         if error is not None:
             raise DiscoveryRunError(error)
 
         self._observations[observation.observation_id] = observation
-        sequence = len(self._ingestion_history) + 1
+        refresh_ok = self._refresh_evaluation_and_ranking()
+        self._append_ingestion_record(observation, refresh_ok)
+        if not refresh_ok:
+            return self._finalize(
+                DiscoveryLifecycleStatus.FAILED,
+                DiscoveryTerminationReason.COMPONENT_FAILURE,
+            )
+        return self._build_result(self._status, self._termination_reason)
 
-        if not self._refresh_evaluation_and_ranking():
-            self._status = DiscoveryLifecycleStatus.FAILED
-            self._termination_reason = DiscoveryTerminationReason.COMPONENT_FAILURE
-            self._ingestion_history.append(
-                DiscoveryIngestionRecord(
-                    sequence=sequence,
-                    observation_id=observation.observation_id,
-                    input_values=dict(observation.input_values),
-                    ranking_is_fresh=False,
-                    evaluation_count=len(self._evaluations),
+    def resume(self, observations: Sequence[Observation] = ()) -> DiscoveryRunResult:
+        """Explicitly reopen a terminated, non-failed run with new observations.
+
+        This is the supported incremental-update lifecycle after a run has
+        ended. It validates every observation before mutating state, preserves
+        existing observation and hypothesis IDs, ingests the observations
+        without consuming oracle budget, refreshes evaluation/ranking, and then
+        continues the same bounded loop. Budget and iteration counters are not
+        reset, so resume can never exceed the configured limits.
+
+        A FAILED run is not resumable because its state may be inconsistent;
+        such calls raise ``DiscoveryRunError`` with ``RUN_TERMINAL_FAILURE`` and
+        leave all state untouched. Calls before the run finishes raise
+        ``RUN_NOT_FINISHED``.
+        """
+        if not self._started:
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_INVALID_DISCOVERY_CONFIG,
+                    "resume() requires an initialized run; call run() first.",
                 )
             )
-        else:
-            self._ingestion_history.append(
-                DiscoveryIngestionRecord(
-                    sequence=sequence,
-                    observation_id=observation.observation_id,
-                    input_values=dict(observation.input_values),
-                    ranking_is_fresh=True,
-                    evaluation_count=len(self._evaluations),
+        if not self._finished:
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_RUN_NOT_FINISHED,
+                    "resume() can only reopen a terminated run.",
+                    status=self._status.value,
                 )
             )
+        if self._status == DiscoveryLifecycleStatus.FAILED:
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_RUN_TERMINAL_FAILURE,
+                    "A failed discovery run is not resumable.",
+                    termination_reason=(
+                        self._termination_reason.value
+                        if self._termination_reason is not None
+                        else None
+                    ),
+                )
+            )
+        validated = self._validate_external_observation_batch(observations)
 
-        return self._build_result(
-            self._status,
-            self._termination_reason or DiscoveryTerminationReason.COMPONENT_FAILURE,
-        )
+        self._status = DiscoveryLifecycleStatus.RUNNING
+        self._termination_reason = None
+        self._finished = False
+        for observation in validated:
+            self._observations[observation.observation_id] = observation
+
+        refresh_ok = self._refresh_evaluation_and_ranking()
+        for observation in validated:
+            self._append_ingestion_record(observation, refresh_ok)
+        if not refresh_ok:
+            return self._finalize(
+                DiscoveryLifecycleStatus.FAILED,
+                DiscoveryTerminationReason.COMPONENT_FAILURE,
+            )
+        return self._run_iterations()
 
     # ------------------------------------------------------------------
     # Initialization
@@ -833,8 +893,9 @@ class DiscoveryEngine:
         )
         if output_error is not None:
             return output_error
-        if not self._config.allow_duplicate_queries and self._is_duplicate_input_values(
-            observation.input_values
+        if (
+            not self._config.allow_duplicate_external_observations
+            and self._is_duplicate_input_values(observation.input_values)
         ):
             return make_structured_error(
                 ERROR_DUPLICATE_OBSERVATION_INPUT,
@@ -842,6 +903,82 @@ class DiscoveryEngine:
                 input_values=dict(observation.input_values),
             )
         return None
+
+    def _validate_external_observation_batch(
+        self, observations: Optional[Sequence[Observation]]
+    ) -> List[Observation]:
+        """Validate a whole update batch before any state mutation."""
+        if observations is None:
+            return []
+        if isinstance(observations, (str, bytes)) or isinstance(observations, Mapping):
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_INVALID_OBSERVATION,
+                    "Observations must be supplied as a sequence of Observation instances.",
+                    received_type=type(observations).__name__,
+                )
+            )
+        validated: List[Observation] = []
+        for observation in observations:
+            error = self._validate_external_observation(observation, ERROR_INVALID_OBSERVATION)
+            if error is not None:
+                raise DiscoveryRunError(error)
+            if any(
+                existing.observation_id == observation.observation_id
+                for existing in validated
+            ):
+                raise DiscoveryRunError(
+                    make_structured_error(
+                        ERROR_DUPLICATE_OBSERVATION_ID,
+                        f"Observation ID {observation.observation_id!r} appears twice "
+                        "in the update batch.",
+                        observation_id=observation.observation_id,
+                    )
+                )
+            if not self._config.allow_duplicate_external_observations:
+                for existing in validated:
+                    if self._inputs_match(observation.input_values, existing.input_values):
+                        raise DiscoveryRunError(
+                            make_structured_error(
+                                ERROR_DUPLICATE_OBSERVATION_INPUT,
+                                "Two observations in the update batch share the same input values.",
+                                input_values=dict(observation.input_values),
+                            )
+                        )
+            validated.append(observation)
+        return validated
+
+    def _inputs_match(
+        self, first: Mapping[str, Any], second: Mapping[str, Any]
+    ) -> bool:
+        variable = self._config.domain_bounds.variable_name
+        first_value = first.get(variable)
+        second_value = second.get(variable)
+        for value in (first_value, second_value):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+        try:
+            return math.isclose(
+                float(first_value),
+                float(second_value),
+                rel_tol=0.0,
+                abs_tol=float(self._config.query_exclusion_tolerance),
+            )
+        except OverflowError:
+            return False
+
+    def _append_ingestion_record(
+        self, observation: Observation, ranking_is_fresh: bool
+    ) -> DiscoveryIngestionRecord:
+        record = DiscoveryIngestionRecord(
+            sequence=len(self._ingestion_history) + 1,
+            observation_id=observation.observation_id,
+            input_values=dict(observation.input_values),
+            ranking_is_fresh=ranking_is_fresh,
+            evaluation_count=len(self._evaluations),
+        )
+        self._ingestion_history.append(record)
+        return record
 
     def _validate_numeric_payload(
         self,
@@ -1034,6 +1171,7 @@ class DiscoveryEngine:
             return False
 
         evaluations: Dict[str, EvaluationResult] = {}
+        expected_ids = {candidate.hypothesis_id for candidate in self._candidates}
         for result in results:
             if not isinstance(result, EvaluationResult):
                 self._ranking_is_fresh = False
@@ -1046,7 +1184,42 @@ class DiscoveryEngine:
                     )
                 )
                 return False
+            if result.hypothesis_id in evaluations:
+                self._ranking_is_fresh = False
+                self._errors.append(
+                    make_structured_error(
+                        ERROR_EVALUATION_FAILURE,
+                        "Evaluation returned duplicate results for one hypothesis ID; the "
+                        "previous results and ranking snapshot were preserved.",
+                        hypothesis_id=result.hypothesis_id,
+                    )
+                )
+                return False
+            if result.hypothesis_id not in expected_ids:
+                self._ranking_is_fresh = False
+                self._errors.append(
+                    make_structured_error(
+                        ERROR_EVALUATION_FAILURE,
+                        "Evaluation returned a result for an unknown hypothesis ID; the "
+                        "previous results and ranking snapshot were preserved.",
+                        hypothesis_id=result.hypothesis_id,
+                    )
+                )
+                return False
             evaluations[result.hypothesis_id] = result
+
+        missing_ids = sorted(expected_ids - set(evaluations))
+        if missing_ids:
+            self._ranking_is_fresh = False
+            self._errors.append(
+                make_structured_error(
+                    ERROR_EVALUATION_FAILURE,
+                    "Evaluation did not return a result for every requested hypothesis; the "
+                    "previous results and ranking snapshot were preserved.",
+                    missing_hypothesis_ids=missing_ids,
+                )
+            )
+            return False
 
         observations = list(self._observations.values())
         observations_by_hypothesis = {
@@ -1121,22 +1294,38 @@ class DiscoveryEngine:
 
         threshold = criteria.target_primary_metric_threshold
         if threshold is not None:
+            # A low training error alone is not scientific acceptance. The
+            # metric criterion applies only to the best candidate that the
+            # ranking policy already accepts as PLAUSIBLE in a rankable,
+            # comparable tier. PLAUSIBLE requires an explicit policy
+            # performance_acceptance_threshold, so an unconfigured acceptance
+            # policy can never stop a run as a success.
+            accepted = next(
+                (
+                    ranked
+                    for ranked in self._ranking.ranked_candidates
+                    if ranked.status == PlausibilityStatus.PLAUSIBLE
+                    and ranked.evaluation_tier
+                    in (EvaluationTier.VALID_HELD_OUT, EvaluationTier.VALID_TRAINING_ONLY)
+                ),
+                None,
+            )
+            if accepted is None:
+                return None
+            value = (
+                accepted.held_out_score
+                if accepted.held_out_score is not None
+                else accepted.training_score
+            )
+            if value is None or not math.isfinite(value):
+                return None
             policy = self._config.ranking_policy
-            for ranked in self._ranking.ranked_candidates:
-                value = (
-                    ranked.held_out_score
-                    if ranked.held_out_score is not None
-                    else ranked.training_score
-                )
-                if value is None or not math.isfinite(value):
-                    continue
-                if policy.metric_direction == "minimize":
-                    met = value <= float(threshold)
-                else:
-                    met = value >= float(threshold)
-                if met:
-                    return DiscoveryTerminationReason.STOPPING_CRITERION_METRIC_THRESHOLD_REACHED
-                break
+            if policy.metric_direction == "minimize":
+                met = value <= float(threshold)
+            else:
+                met = value >= float(threshold)
+            if met:
+                return DiscoveryTerminationReason.STOPPING_CRITERION_METRIC_THRESHOLD_REACHED
         return None
 
     def _top_candidate_summary(self) -> Tuple[Optional[str], Optional[float]]:
@@ -1199,7 +1388,7 @@ class DiscoveryEngine:
     def _build_result(
         self,
         status: DiscoveryLifecycleStatus,
-        reason: DiscoveryTerminationReason,
+        reason: Optional[DiscoveryTerminationReason],
     ) -> DiscoveryRunResult:
         evaluations = tuple(
             self._evaluations[candidate.hypothesis_id]

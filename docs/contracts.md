@@ -666,6 +666,7 @@ The experiment generator imports only domain contracts; it has zero dependencies
   "experiment_pool_size": 5,
   "experiment_strategy": "grid",
   "allow_duplicate_queries": false,
+  "allow_duplicate_external_observations": false,
   "query_exclusion_tolerance": 1e-05,
   "experiment_seed": null,
   "dataset_id": null,
@@ -691,6 +692,20 @@ stopping criterion → budget exhausted → max iterations → no valid experime
 Component/oracle failures terminate immediately when they occur. No stopping
 criterion is inferred: ranking first is not success, and a policy without
 `performance_acceptance_threshold` cannot produce `PLAUSIBLE`.
+
+The metric-threshold criterion applies only to the best candidate the ranking
+policy already accepts as `PLAUSIBLE` in a rankable comparability tier, so a low
+metric value alone can never terminate a run as a scientific success.
+
+**Terminal immutability and resume.** A finalized run is immutable by default:
+`add_observation()` raises `RUN_NOT_ACTIVE`. `resume(observations)` explicitly
+reopens a terminated, non-failed run: it validates the batch, preserves IDs,
+ingests without consuming oracle budget, refreshes evaluation/ranking, and
+continues the bounded loop without resetting budget or iteration counters.
+`FAILED` runs are not resumable (`RUN_TERMINAL_FAILURE`), and resuming before a
+run finishes raises `RUN_NOT_FINISHED`. Duplicate policy is split:
+`allow_duplicate_queries` governs oracle re-querying;
+`allow_duplicate_external_observations` governs repeated external inputs.
 
 ### 7.3 Query accounting (`QueryAccounting`)
 ```json
@@ -775,9 +790,10 @@ Top-level serialized fields: `run_id`, `status`, `termination_reason`, `config`,
   "limitations": []
 }
 ```
-IDs, metric values, and timestamps above are illustrative. `to_dict()` returns a
-JSON-compatible payload and re-runs `verify_no_ground_truth_leakage`; a
-forbidden key raises `ValueError` instead of being serialized.
+IDs, metric values, and timestamps above are illustrative. `termination_reason`
+is `null` only for a snapshot taken while the run is still active. `to_dict()`
+returns a JSON-compatible payload and re-runs `verify_no_ground_truth_leakage`;
+a forbidden key raises `ValueError` instead of being serialized.
 
 ### 7.6 Failure semantics
 A successful observation is committed immediately. If the subsequent
@@ -792,8 +808,11 @@ Structured codes include: `CANDIDATE_GENERATION_FAILURE`,
 `PLANNER_FAILURE`, `INVALID_PLANNER_SELECTION`, `DUPLICATE_QUERY`,
 `ORACLE_QUERY_FAILURE`, `INVALID_ORACLE_RESPONSE`, `INVALID_OBSERVATION`,
 `INVALID_INITIAL_OBSERVATION`, `DUPLICATE_OBSERVATION_ID`,
-`DUPLICATE_OBSERVATION_INPUT`, `UNEXPECTED_DISCOVERY_ERROR`; warnings include
+`DUPLICATE_OBSERVATION_INPUT`, `RUN_NOT_ACTIVE`, `RUN_NOT_FINISHED`,
+`RUN_TERMINAL_FAILURE`, `UNEXPECTED_DISCOVERY_ERROR`; warnings include
 `DUPLICATE_QUERY_SKIPPED`, `EXPERIMENT_POOL_UNDERSIZED`, `RANKING_STALE`.
+Evaluation results must contain exactly one entry per requested hypothesis ID;
+duplicate, unknown, or missing IDs fail the refresh instead of being accepted.
 
 ### 7.7 Ground-truth isolation
 The engine receives only `OracleInterface.validate_input` / `query`. It never

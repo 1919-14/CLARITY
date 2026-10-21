@@ -202,6 +202,20 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Validation:** Budget-ceiling, failure, and partial-result tests in `backend/tests/test_discovery_loop.py`; [discovery-loop.md](discovery-loop.md) sections 5, 7, and 8.
 
+## D-019 — Terminal runs are immutable; resume is the explicit reopen path
+
+**Status:** Confirmed (Issue #8 review follow-up)
+
+**Decision:** A finalized discovery run is immutable. `add_observation()` raises `RUN_NOT_ACTIVE` once a result has been produced, leaving observations, ranking, and query accounting untouched. Post-terminal updates use `resume(observations)`, which is allowed only for a non-failed terminal run: it validates the whole batch before mutating state, ingests without consuming oracle budget, refreshes evaluation/ranking, and continues the bounded loop without resetting budget or iteration counters. Failed runs raise `RUN_TERMINAL_FAILURE` and are not resumable. Metric-threshold stopping now requires the candidate to be `PLAUSIBLE` in a rankable comparability tier, so a low metric alone can never be reported as scientific success. Duplicate policy is split: `allow_duplicate_queries` governs oracle re-querying, while `allow_duplicate_external_observations` governs repeated externally supplied inputs.
+
+**Rationale:** A terminal result must describe one coherent state. Silent mutation after termination produces a result whose status/reason no longer explain its data. An explicit resume keeps incremental evidence support while making the lifecycle transition auditable. Requiring policy-level acceptance for metric stopping prevents an unconfigured acceptance threshold from being bypassed by a numeric target.
+
+**Trade-off:** Resume cannot recover a failed run; callers start a new run with the accumulated observations instead. Resume also cannot extend beyond the original budget or iteration bounds, so a budget-exhausted run can ingest evidence but cannot query again.
+
+**Rejected alternatives:** Allowing `add_observation()` after finalization (incoherent terminal snapshots); resuming failed runs (state may be deliberately stale, e.g. preserved ranking); treating a low training error as acceptance without the ranking policy's threshold (bypasses plausibility/comparability).
+
+**Validation:** `backend/tests/test_discovery_loop.py` (post-terminal rejection, resume identity/budget preservation, failed-run resume rejection, metric-threshold regression, duplicate-policy split); [discovery-loop.md](discovery-loop.md) sections 3, 4, 8; [contracts.md](contracts.md) section 7.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
@@ -210,7 +224,7 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 4. Disagreement and uncertainty score.
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.
-7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018; run-level cancellation and durable recovery remain open for the API/persistence layer.
+7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019; run-level cancellation and durable recovery remain open for the API/persistence layer.
 8. Required report export formats.
 9. Deployment target and clean-start procedure.
 10. Target accuracy/error threshold and trial count for query-efficiency benchmarks.

@@ -89,8 +89,10 @@ for ranked in result.ranked_hypotheses[:3]:
 `run(initial_observations=())` executes the whole bounded loop and returns a
 `DiscoveryRunResult`. `DiscoveryEngine` instances are single-use per run.
 
-`add_observation(observation)` ingests one externally authorized observation
-into a started run. It never calls the oracle and never consumes budget.
+Lifecycle: a run is mutable only until it terminates. `add_observation()` is the
+active-run ingestion primitive and is rejected with `RUN_NOT_ACTIVE` after a
+result has been finalized. Post-terminal updates use `resume(observations)` on a
+non-failed run (see section 8); neither path calls the oracle or consumes budget.
 
 ## 3. Configuration and validation
 
@@ -108,6 +110,7 @@ into a started run. It never calls the oracle and never consumes budget.
 | `experiment_pool_size` | `10` | Experiment candidates requested per iteration (1..500). |
 | `experiment_strategy` | `grid` | `grid`, `uniform_random`, or `stratified_random`. |
 | `allow_duplicate_queries` | `False` | Allow re-querying an already observed input. |
+| `allow_duplicate_external_observations` | `False` | Accept an externally supplied observation whose input matches a committed one. Independent of `allow_duplicate_queries`. |
 | `query_exclusion_tolerance` | `1e-5` | Pure absolute tolerance for duplicate detection. |
 | `experiment_seed` | `None` | Seed forwarded to stochastic experiment strategies. |
 | `dataset_id` | `None` | Evaluation dataset identity; defaults to the run ID. |
@@ -125,14 +128,19 @@ ranking metric or an object without `validate_input`/`query`, raising
 - `target_plausible_candidate_count: Optional[int]` — stop once at least N
   ranked candidates are `PlausibilityStatus.PLAUSIBLE`.
 - `target_primary_metric_threshold: Optional[float]` — stop once the best
-  available primary metric satisfies the bound under the ranking policy's
-  metric direction (held-out preferred, training fallback).
+  **scientifically accepted** candidate's primary metric (held-out preferred,
+  training fallback) satisfies the bound under the ranking policy's metric
+  direction. Acceptance means `PLAUSIBLE` in a rankable comparability tier,
+  which itself requires the policy's explicit
+  `performance_acceptance_threshold`. The target threshold can tighten
+  acceptance but never replaces it.
 - `consecutive_failure_limit: int = 3` — consecutive failed oracle queries
   tolerated before terminating as failed.
 
 Neither criterion is inferred. With no configured criterion, a run never stops
 because a candidate ranks first, and a policy without
-`performance_acceptance_threshold` can never produce `PLAUSIBLE`.
+`performance_acceptance_threshold` can never produce `PLAUSIBLE`. A low
+held-out/training error alone therefore never terminates a run as a success.
 
 ## 4. Lifecycle and state transitions
 
@@ -182,7 +190,7 @@ Invariants:
 - A raised, non-success, or contract-invalid response still consumes budget:
   the oracle was queried.
 - Pre-invocation rejection (`oracle.validate_input` error), duplicate skips,
-  and external `add_observation` calls do not consume budget.
+  and external ingestion (`add_observation`/`resume`) do not consume budget.
 - The oracle's own observation `sequence_number` is recorded in experiment
   history, but the engine's `attempted_queries` is authoritative.
 - With `max_query_budget == 0`, the oracle is never called; initial
@@ -266,25 +274,46 @@ Other handled failures (each produces a structured code in `errors` or
 No automatic oracle retries exist: a retry would spend another query. Bounded
 retry policy belongs to the planner/oracle adapter and its own accounting.
 
-## 8. Incremental observation ingestion
+## 8. Incremental observation ingestion and terminal lifecycle
 
-`engine.add_observation(observation)`:
+A terminated run is immutable by default. Two explicit paths exist:
 
-- requires a started run (`DiscoveryRunError` otherwise);
-- rejects non-`Observation` objects, non-success statuses, missing/non-finite
-  `x`/`y` values, an already-used `observation_id`
-  (`DUPLICATE_OBSERVATION_ID`), and an already-observed input
-  (`DUPLICATE_OBSERVATION_INPUT`, unless `allow_duplicate_queries=True`);
-- commits the observation, preserving all existing observation and hypothesis
-  IDs;
-- recomputes evaluation and ranking;
-- appends a `DiscoveryIngestionRecord`;
-- leaves query accounting untouched.
+**Active-run primitive — `add_observation(observation)`**
 
-If recomputation fails, the observation is kept, the previous ranking snapshot
-is preserved, `ranking_is_fresh=False`, and the returned result is `FAILED` /
-`COMPONENT_FAILURE`. Rejected updates raise immediately and leave state
-unchanged.
+- requires a started run and rejects calls after finalization with
+  `RUN_NOT_ACTIVE`, leaving state and the terminal result untouched;
+- validates the observation, commits it, refreshes evaluation/ranking, and
+  appends a `DiscoveryIngestionRecord`;
+- never calls the oracle and never consumes budget.
+
+**Post-terminal update — `resume(observations=())`**
+
+- only for a terminated, **non-failed** run; a FAILED run raises
+  `RUN_TERMINAL_FAILURE` and state is untouched;
+- validates the whole batch (type, status, finite `x`/`y`, duplicate IDs,
+  duplicate inputs within the batch and against committed observations) before
+  any mutation;
+- explicitly reopens the run (`RUNNING`, no termination reason), ingests the
+  observations, refreshes evaluation/ranking, and then continues the same
+  bounded loop;
+- budget and iteration counters are **not** reset, so resume can never exceed
+  the configured limits (a resume with no budget left refreshes evidence and
+  immediately terminates as `BUDGET_EXHAUSTED`);
+- preserves all existing observation and hypothesis IDs and appends one
+  `DiscoveryIngestionRecord` per observation.
+
+If recomputation fails during either path, the observation is kept, the
+previous ranking snapshot is preserved, `ranking_is_fresh=False`, and the result
+is `FAILED` / `COMPONENT_FAILURE`. Rejected updates raise `DiscoveryRunError`
+and leave state unchanged.
+
+Duplicate policies are intentionally separate:
+
+- `allow_duplicate_queries` governs **oracle** re-querying only.
+- `allow_duplicate_external_observations` governs acceptance of repeated
+  externally supplied inputs only.
+
+Both default to `False`, and neither flag implies the other.
 
 ## 9. Result and run-history schema
 
@@ -293,7 +322,7 @@ unchanged.
 | Field | Content |
 | --- | --- |
 | `run_id` | Stable run ID (also the default evaluation dataset ID). |
-| `status`, `termination_reason` | Terminal state and cause. |
+| `status`, `termination_reason` | Terminal state and cause; `termination_reason` is `null` only for a snapshot taken while the run is active. |
 | `config` | Sanitized reproducible `DiscoveryRunConfig`. |
 | `iterations_completed` | Completed outer iterations. |
 | `query_accounting` | Attempted/successful/failed/remaining. |
@@ -417,3 +446,10 @@ PY
 - **`TERMINATED_COMPLETED` does not exist.** Every terminal path has an
   explicit reason by design; a run either stops for a configured reason or
   fails.
+- **Failed runs are not resumable.** `resume()` rejects `FAILED` runs because a
+  component failure may leave evaluation/ranking state intentionally stale;
+  start a new run with the accumulated observations instead.
+- **Active-run `add_observation` is a primitive.** Because `run()` is
+  synchronous, normal incremental updates after a run use `resume()`; the
+  active-run guard exists for a future step/pause lifecycle and is enforced and
+  tested now.

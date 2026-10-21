@@ -57,6 +57,9 @@ ERROR_INVALID_INITIAL_OBSERVATION = "INVALID_INITIAL_OBSERVATION"
 ERROR_INVALID_OBSERVATION = "INVALID_OBSERVATION"
 ERROR_DUPLICATE_OBSERVATION_ID = "DUPLICATE_OBSERVATION_ID"
 ERROR_DUPLICATE_OBSERVATION_INPUT = "DUPLICATE_OBSERVATION_INPUT"
+ERROR_RUN_NOT_ACTIVE = "RUN_NOT_ACTIVE"
+ERROR_RUN_NOT_FINISHED = "RUN_NOT_FINISHED"
+ERROR_RUN_TERMINAL_FAILURE = "RUN_TERMINAL_FAILURE"
 ERROR_CANDIDATE_GENERATION_FAILURE = "CANDIDATE_GENERATION_FAILURE"
 ERROR_EVALUATION_FAILURE = "EVALUATION_FAILURE"
 ERROR_RANKING_FAILURE = "RANKING_FAILURE"
@@ -133,9 +136,14 @@ class StoppingCriteriaConfig:
       target_plausible_candidate_count: Stop once at least this many candidates
         hold ``PlausibilityStatus.PLAUSIBLE`` under the ranking policy (which
         itself requires an explicit performance acceptance threshold).
-      target_primary_metric_threshold: Stop once the best available primary
-        metric (held-out preferred, training fallback) satisfies this bound
-        under the ranking policy's metric direction.
+      target_primary_metric_threshold: Stop once the best *scientifically
+        accepted* candidate's primary metric (held-out preferred, training
+        fallback) satisfies this bound. Acceptance means
+        ``PlausibilityStatus.PLAUSIBLE`` in a rankable comparability tier,
+        which itself requires the ranking policy's explicit
+        ``performance_acceptance_threshold``. This threshold can tighten
+        acceptance but can never replace it: without a configured policy
+        acceptance threshold the criterion is never satisfied.
       consecutive_failure_limit: Consecutive failed oracle queries tolerated
         before the run terminates as a failure. Must be >= 1.
     """
@@ -195,6 +203,11 @@ class DiscoveryRunConfig:
       experiment_strategy: Experiment generation strategy.
       allow_duplicate_queries: When False (default), an experiment whose input
         matches an already-committed observation is never sent to the oracle.
+      allow_duplicate_external_observations: When False (default), an
+        externally supplied observation whose input matches an already
+        committed observation is rejected. This is deliberately independent of
+        ``allow_duplicate_queries``: re-querying the oracle and accepting a
+        repeated external measurement are different scientific decisions.
       query_exclusion_tolerance: Pure absolute tolerance used for duplicate
         detection (``rel_tol=0.0``).
       experiment_seed: Seed forwarded to stochastic experiment strategies. The
@@ -216,6 +229,7 @@ class DiscoveryRunConfig:
     experiment_pool_size: int = 10
     experiment_strategy: ExperimentGenerationStrategy = ExperimentGenerationStrategy.GRID
     allow_duplicate_queries: bool = False
+    allow_duplicate_external_observations: bool = False
     query_exclusion_tolerance: float = 1e-5
     experiment_seed: Optional[int] = None
     dataset_id: Optional[str] = None
@@ -263,6 +277,8 @@ class DiscoveryRunConfig:
             raise ValueError("experiment_strategy must be an ExperimentGenerationStrategy.")
         if not isinstance(self.allow_duplicate_queries, bool):
             raise ValueError("allow_duplicate_queries must be a bool.")
+        if not isinstance(self.allow_duplicate_external_observations, bool):
+            raise ValueError("allow_duplicate_external_observations must be a bool.")
         if (
             isinstance(self.query_exclusion_tolerance, bool)
             or not isinstance(self.query_exclusion_tolerance, (int, float))
@@ -318,6 +334,9 @@ class DiscoveryRunConfig:
             "experiment_pool_size": self.experiment_pool_size,
             "experiment_strategy": self.experiment_strategy.value,
             "allow_duplicate_queries": self.allow_duplicate_queries,
+            "allow_duplicate_external_observations": (
+                self.allow_duplicate_external_observations
+            ),
             "query_exclusion_tolerance": self.query_exclusion_tolerance,
             "experiment_seed": self.experiment_seed,
             "dataset_id": self.dataset_id,
@@ -607,7 +626,8 @@ class DiscoveryRunResult:
     Fields:
       run_id: Stable run identifier (also the default evaluation dataset ID).
       status: Lifecycle state at snapshot time.
-      termination_reason: Explicit machine-readable terminal reason.
+      termination_reason: Explicit machine-readable terminal reason. ``None``
+        only for a snapshot taken while the run is still active.
       config: Sanitized reproducibility configuration.
       iterations_completed: Completed outer iterations.
       query_accounting: Attempted/successful/failed/remaining query counters.
@@ -628,7 +648,7 @@ class DiscoveryRunResult:
 
     run_id: str
     status: DiscoveryLifecycleStatus
-    termination_reason: DiscoveryTerminationReason
+    termination_reason: Optional[DiscoveryTerminationReason]
     config: DiscoveryRunConfig
     iterations_completed: int
     query_accounting: QueryAccounting
@@ -667,7 +687,9 @@ class DiscoveryRunResult:
         data: Dict[str, Any] = {
             "run_id": self.run_id,
             "status": self.status.value,
-            "termination_reason": self.termination_reason.value,
+            "termination_reason": (
+                self.termination_reason.value if self.termination_reason is not None else None
+            ),
             "config": self.config.to_dict(),
             "iterations_completed": self.iterations_completed,
             "ranking_is_fresh": self.ranking_is_fresh,
@@ -704,6 +726,9 @@ __all__ = [
     "ERROR_INVALID_OBSERVATION",
     "ERROR_DUPLICATE_OBSERVATION_ID",
     "ERROR_DUPLICATE_OBSERVATION_INPUT",
+    "ERROR_RUN_NOT_ACTIVE",
+    "ERROR_RUN_NOT_FINISHED",
+    "ERROR_RUN_TERMINAL_FAILURE",
     "ERROR_CANDIDATE_GENERATION_FAILURE",
     "ERROR_EVALUATION_FAILURE",
     "ERROR_RANKING_FAILURE",

@@ -31,6 +31,7 @@ import pytest
 from app.adapters.oracle.local_simulator import PolynomialLocalOracle
 from app.domain.candidate_generator import HypothesisGenerationConfig
 from app.domain.contracts import (
+    EvaluationResult,
     ExperimentInput,
     Observation,
     ObservationStatus,
@@ -46,6 +47,8 @@ from app.domain.discovery_contracts import (
     ERROR_ORACLE_QUERY_FAILURE,
     ERROR_PLANNER_FAILURE,
     ERROR_RANKING_FAILURE,
+    ERROR_RUN_NOT_ACTIVE,
+    ERROR_RUN_TERMINAL_FAILURE,
     ERROR_DUPLICATE_OBSERVATION_ID,
     ERROR_DUPLICATE_OBSERVATION_INPUT,
     DiscoveryLifecycleStatus,
@@ -522,6 +525,36 @@ def test_configured_metric_threshold_stops_before_spending_budget():
     assert oracle.call_count == 0
 
 
+def test_metric_threshold_without_policy_acceptance_is_not_success():
+    """A low score must not be treated as discovery acceptance on its own."""
+    oracle = FakeOracle(lambda x: 2.0 * x + 1.0)
+    config = make_config(
+        max_query_budget=1,
+        max_iterations=2,
+        hypothesis_config=HypothesisGenerationConfig(
+            min_degree=0, max_degree=1, candidate_count=2, seed=5
+        ),
+        ranking_policy=RankingPolicyConfig(
+            min_samples_for_plausibility=3,
+            tolerance_absolute=1e-9,
+            tolerance_relative=0.0,
+            performance_acceptance_threshold=None,
+        ),
+        # The training score is exactly 0, far below this stop threshold, but
+        # the ranking policy deliberately leaves the candidate UNCERTAIN.
+        stopping_criteria=StoppingCriteriaConfig(target_primary_metric_threshold=1e-6),
+    )
+    result = DiscoveryEngine(oracle, config).run(_linear_initial_observations())
+
+    assert result.termination_reason == DiscoveryTerminationReason.BUDGET_EXHAUSTED
+    assert result.status == DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED
+    assert oracle.call_count == 1
+    assert all(
+        candidate.status != PlausibilityStatus.PLAUSIBLE
+        for candidate in result.ranked_hypotheses
+    )
+
+
 def test_unconfigured_acceptance_threshold_never_stops_as_success():
     oracle = FakeOracle(lambda x: 2.0 * x + 1.0)
     config = make_config(
@@ -809,7 +842,7 @@ def test_invalid_initial_observation_fails_before_querying():
 # ==============================================================================
 
 
-def test_external_observation_update_preserves_identities_and_budget():
+def test_resume_ingests_external_observation_and_preserves_identities_and_budget():
     oracle = CountingOracle()
     engine = DiscoveryEngine(oracle, make_config(max_query_budget=1, max_iterations=1))
     result = engine.run()
@@ -820,7 +853,7 @@ def test_external_observation_update_preserves_identities_and_budget():
 
     update = make_observation(1.25, 0.5 * 1.25 ** 3 - 1.25 ** 2 - 2.0 * 1.25 + 3.0,
                              observation_id="obs-external")
-    updated = engine.add_observation(update)
+    updated = engine.resume([update])
 
     assert [o.observation_id for o in updated.observations[: len(observation_ids)]] == observation_ids
     assert "obs-external" in [o.observation_id for o in updated.observations]
@@ -833,33 +866,33 @@ def test_external_observation_update_preserves_identities_and_budget():
     assert updated.ranked_hypotheses[0].training_sample_count == len(updated.observations)
 
 
-def test_incremental_update_rejects_identity_collisions_and_duplicate_inputs():
+def test_resume_rejects_identity_collisions_and_duplicate_inputs_without_mutation():
     engine = DiscoveryEngine(CountingOracle(), make_config(max_query_budget=1, max_iterations=1))
     result = engine.run()
     existing = result.observations[0]
 
     with pytest.raises(DiscoveryRunError) as duplicate_id:
-        engine.add_observation(
+        engine.resume([
             make_observation(
                 float(existing.input_values["x"]) + 0.5,
                 1.0,
                 observation_id=existing.observation_id,
             )
-        )
+        ])
     assert duplicate_id.value.error.code == ERROR_DUPLICATE_OBSERVATION_ID
 
     with pytest.raises(DiscoveryRunError) as duplicate_input:
-        engine.add_observation(
+        engine.resume([
             make_observation(
                 float(existing.input_values["x"]),
                 1.0,
                 observation_id="obs-other-id",
             )
-        )
+        ])
     assert duplicate_input.value.error.code == ERROR_DUPLICATE_OBSERVATION_INPUT
 
     with pytest.raises(DiscoveryRunError) as non_success:
-        engine.add_observation(
+        engine.resume([
             make_observation(
                 3.0,
                 None,
@@ -867,11 +900,167 @@ def test_incremental_update_rejects_identity_collisions_and_duplicate_inputs():
                 status=ObservationStatus.ORACLE_FAILURE,
                 error=StructuredError(code="ORACLE_FAILURE", message="failed"),
             )
-        )
+        ])
     assert non_success.value.error.code == ERROR_INVALID_OBSERVATION
 
-    # Rejected updates never mutated committed state.
+    # Rejected updates never mutated committed state or the lifecycle.
     assert len(engine.observations) == len(result.observations)
+    assert engine.status == result.status
+    assert engine.query_accounting == result.query_accounting
+
+
+def test_add_observation_after_budget_exhaustion_is_rejected_without_mutation():
+    engine = DiscoveryEngine(CountingOracle(), make_config(max_query_budget=2, max_iterations=2))
+    result = engine.run()
+    ranking = engine.ranking
+    observation_ids = [o.observation_id for o in engine.observations]
+
+    with pytest.raises(DiscoveryRunError) as error:
+        engine.add_observation(make_observation(5.0, 1.0, observation_id="obs-late"))
+
+    assert error.value.error.code == ERROR_RUN_NOT_ACTIVE
+    assert [o.observation_id for o in engine.observations] == observation_ids
+    assert engine.ranking is ranking
+    assert engine.query_accounting == result.query_accounting
+    assert engine.status == result.status
+
+
+def test_add_observation_after_failed_run_is_rejected_without_mutation():
+    oracle = FakeOracle(fail_on_calls={1})
+    engine = DiscoveryEngine(
+        oracle,
+        make_config(
+            max_query_budget=2,
+            max_iterations=2,
+            stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
+        ),
+    )
+    result = engine.run()
+    assert result.status == DiscoveryLifecycleStatus.FAILED
+    observation_ids = [o.observation_id for o in engine.observations]
+
+    with pytest.raises(DiscoveryRunError) as error:
+        engine.add_observation(make_observation(5.0, 1.0, observation_id="obs-late"))
+
+    assert error.value.error.code == ERROR_RUN_NOT_ACTIVE
+    assert [o.observation_id for o in engine.observations] == observation_ids
+    assert engine.query_accounting == result.query_accounting
+    assert engine.status == DiscoveryLifecycleStatus.FAILED
+
+
+def test_resume_is_rejected_for_failed_runs_without_mutation():
+    oracle = FakeOracle(invalid_input_id_on_calls={1})
+    engine = DiscoveryEngine(
+        oracle,
+        make_config(
+            max_query_budget=2,
+            max_iterations=2,
+            stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
+        ),
+    )
+    result = engine.run()
+    assert result.status == DiscoveryLifecycleStatus.FAILED
+    observation_ids = [o.observation_id for o in engine.observations]
+    ranking = engine.ranking
+
+    with pytest.raises(DiscoveryRunError) as error:
+        engine.resume([make_observation(5.0, 1.0, observation_id="obs-late")])
+
+    assert error.value.error.code == ERROR_RUN_TERMINAL_FAILURE
+    assert [o.observation_id for o in engine.observations] == observation_ids
+    assert engine.ranking is ranking
+    assert engine.query_accounting == result.query_accounting
+
+
+def test_resume_does_not_reset_budget_or_iteration_counters():
+    oracle = CountingOracle()
+    engine = DiscoveryEngine(oracle, make_config(max_query_budget=2, max_iterations=1))
+    first = engine.run()
+    assert first.termination_reason == DiscoveryTerminationReason.MAX_ITERATIONS_REACHED
+    assert first.query_accounting.attempted_queries == 1
+
+    updated = engine.resume([make_observation(2.5, 10.0, observation_id="obs-resume")])
+
+    # The iteration bound is global to the run, not reset by resume.
+    assert updated.termination_reason == DiscoveryTerminationReason.MAX_ITERATIONS_REACHED
+    assert updated.query_accounting == first.query_accounting
+    assert len(oracle.submitted) == 1
+    assert len(updated.observations) == len(first.observations) + 1
+
+
+def test_resume_rejects_duplicate_inputs_within_one_batch_without_mutation():
+    engine = DiscoveryEngine(CountingOracle(), make_config(max_query_budget=1, max_iterations=1))
+    result = engine.run()
+    observation_ids = [o.observation_id for o in engine.observations]
+
+    with pytest.raises(DiscoveryRunError) as error:
+        engine.resume(
+            [
+                make_observation(1.5, 1.0, observation_id="obs-batch-a"),
+                make_observation(1.5, 2.0, observation_id="obs-batch-b"),
+            ]
+        )
+
+    assert error.value.error.code == ERROR_DUPLICATE_OBSERVATION_INPUT
+    assert [o.observation_id for o in engine.observations] == observation_ids
+    assert engine.query_accounting == result.query_accounting
+
+
+def test_external_duplicate_policy_is_independent_of_query_policy():
+    # Oracle repeats allowed, external repeats rejected.
+    engine = DiscoveryEngine(
+        CountingOracle(),
+        make_config(
+            max_query_budget=1,
+            max_iterations=1,
+            allow_duplicate_queries=True,
+            allow_duplicate_external_observations=False,
+        ),
+    )
+    result = engine.run()
+    x = result.observations[0].input_values["x"]
+    with pytest.raises(DiscoveryRunError) as error:
+        engine.resume([make_observation(x, 999.0, observation_id="obs-dup")])
+    assert error.value.error.code == ERROR_DUPLICATE_OBSERVATION_INPUT
+
+    # Oracle repeats rejected (default), external repeats explicitly allowed.
+    engine2 = DiscoveryEngine(
+        CountingOracle(),
+        make_config(
+            max_query_budget=1,
+            max_iterations=1,
+            allow_duplicate_external_observations=True,
+        ),
+    )
+    result2 = engine2.run()
+    x2 = result2.observations[0].input_values["x"]
+    updated = engine2.resume([make_observation(x2, 999.0, observation_id="obs-dup-2")])
+
+    assert len(updated.observations) == len(result2.observations) + 1
+    assert updated.query_accounting == result2.query_accounting
+
+
+class DuplicateResultPipeline:
+    """Returns one result per request but reuses the first hypothesis ID."""
+
+    def evaluate_many(self, requests, observations, dataset_id=None):
+        if not requests:
+            return []
+        hypothesis_id = requests[0].hypothesis.hypothesis_id
+        return [EvaluationResult(hypothesis_id=hypothesis_id) for _ in requests]
+
+
+def test_evaluation_with_duplicate_hypothesis_ids_fails_safely():
+    result = DiscoveryEngine(
+        FakeOracle(), make_config(), evaluation_pipeline=DuplicateResultPipeline()
+    ).run([make_observation(-1.0, 3.0, observation_id="obs-initial")])
+
+    assert result.status == DiscoveryLifecycleStatus.FAILED
+    assert result.termination_reason == DiscoveryTerminationReason.COMPONENT_FAILURE
+    assert any(error.code == ERROR_EVALUATION_FAILURE for error in result.errors)
+    assert [o.observation_id for o in result.observations] == ["obs-initial"]
+    assert result.ranking is None
+    assert result.ranking_is_fresh is False
 
 
 def test_add_observation_requires_an_initialized_run():
@@ -1029,6 +1218,7 @@ def test_deterministic_scenario_is_repeatable():
         {"experiment_pool_size": 0},
         {"query_exclusion_tolerance": -0.1},
         {"experiment_seed": "not-a-seed"},
+        {"allow_duplicate_external_observations": "yes"},
     ],
 )
 def test_invalid_run_configuration_is_rejected_before_any_oracle_call(overrides):
