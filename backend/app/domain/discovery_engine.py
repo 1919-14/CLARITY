@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from threading import Lock
 from dataclasses import replace
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from .candidate_generator import CandidateGenerationError, CandidateGenerator
