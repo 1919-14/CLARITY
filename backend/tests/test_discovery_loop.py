@@ -699,8 +699,8 @@ def test_raising_oracle_consumes_budget_and_stops_at_failure_limit():
 def test_invalid_oracle_response_is_not_committed_and_preserves_prior_data():
     oracle = FakeOracle(invalid_input_id_on_calls={2})
     config = make_config(
-        max_query_budget=2,
-        max_iterations=2,
+        max_query_budget=3,
+        max_iterations=3,
         stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
     )
     initial = [make_observation(-1.5, 2.0, observation_id="obs-initial")]
@@ -740,8 +740,8 @@ def test_non_success_oracle_observation_is_a_failed_query():
 def test_invalid_output_value_is_rejected():
     oracle = FakeOracle(invalid_output_on_calls={1})
     config = make_config(
-        max_query_budget=1,
-        max_iterations=1,
+        max_query_budget=2,
+        max_iterations=2,
         stopping_criteria=StoppingCriteriaConfig(consecutive_failure_limit=1),
     )
     result = DiscoveryEngine(oracle, config).run()

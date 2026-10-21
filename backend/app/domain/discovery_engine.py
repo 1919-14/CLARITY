@@ -241,6 +241,7 @@ class DiscoveryEngine:
         self._rejected_queries = 0
         self._duplicate_queries = 0
         self._retry_count = 0
+        self._in_flight_queries = 0
         # Query reservations are atomic so concurrent callers cannot reserve
         # more invocations than the configured run budget.
         self._query_lock = Lock()
@@ -668,6 +669,22 @@ class DiscoveryEngine:
                         DiscoveryTerminationReason.COMPONENT_FAILURE,
                     )
 
+            # Stopping precedence order:
+            # 1. Configured stopping criterion satisfied
+            criterion = self._satisfied_stopping_criterion()
+            if criterion is not None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION, criterion
+                )
+
+            # 2. Query budget exhausted (takes precedence over consecutive failures)
+            if self._attempted_queries >= self._config.max_query_budget:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
+
+            # 3. Repeated consecutive oracle failures when budget remains
             if (
                 execution.outcome == ExperimentExecutionOutcome.INVOKED_FAILED
                 and self._consecutive_failures >= self._config.stopping_criteria.consecutive_failure_limit
@@ -790,12 +807,18 @@ class DiscoveryEngine:
                 ) from None
             if validation_error is not None:
                 self._rejected_queries += 1
-                self._warnings.append(validation_error)
+                cause_code = getattr(validation_error, "code", None) or "INVALID_INPUT"
+                sanitized_error = make_structured_error(
+                    cause_code if isinstance(cause_code, str) else "INVALID_INPUT",
+                    f"Oracle rejected candidate input ({cause_code}).",
+                    cause_code=cause_code,
+                )
+                self._warnings.append(sanitized_error)
                 self._record_experiment(
                     iteration,
                     selected,
                     ExperimentExecutionOutcome.REJECTED_PRE_INVOCATION,
-                    error=validation_error,
+                    error=sanitized_error,
                     selection_diagnostics=selection_diagnostics,
                 )
                 continue
@@ -1114,12 +1137,14 @@ class DiscoveryEngine:
                         raise _BudgetExhausted()
                     break
                 self._attempted_queries += 1
+                self._in_flight_queries = 1
 
             try:
                 observation = self._oracle.query(selected.input_data)
             except Exception as exc:  # noqa: BLE001 - oracle boundary
                 with self._query_lock:
                     self._failed_queries += 1
+                    self._in_flight_queries = 0
                     self._consecutive_failures += 1
                 if isinstance(exc, OracleQueryError):
                     cause = exc.error
@@ -1164,6 +1189,7 @@ class DiscoveryEngine:
             if validation_error is not None:
                 with self._query_lock:
                     self._failed_queries += 1
+                    self._in_flight_queries = 0
                     self._consecutive_failures += 1
                 self._warnings.append(validation_error)
                 return self._record_experiment(
@@ -1176,6 +1202,7 @@ class DiscoveryEngine:
 
             with self._query_lock:
                 self._successful_queries += 1
+                self._in_flight_queries = 0
                 self._consecutive_failures = 0
             self._observations[observation.observation_id] = self._frozen_observation(observation)
             return self._record_experiment(
@@ -1507,12 +1534,17 @@ class DiscoveryEngine:
                 received_type=type(observation).__name__,
             )
         if observation.status != ObservationStatus.SUCCESS:
+            cause_code = (
+                observation.error.code
+                if (observation.error is not None and getattr(observation.error, "code", None))
+                else None
+            )
             return make_structured_error(
                 ERROR_ORACLE_QUERY_FAILURE,
                 f"Oracle returned status {observation.status.value!r}; the response is not "
                 "committed as evidence.",
                 status=observation.status.value,
-                cause=observation.error.to_dict() if observation.error is not None else None,
+                cause_code=cause_code,
             )
         if observation.observation_id in self._observations:
             return make_structured_error(
@@ -1814,15 +1846,17 @@ class DiscoveryEngine:
     # ------------------------------------------------------------------
 
     def _accounting(self) -> QueryAccounting:
-        return QueryAccounting(
-            max_query_budget=self._config.max_query_budget,
-            attempted_queries=self._attempted_queries,
-            successful_queries=self._successful_queries,
-            failed_queries=self._failed_queries,
-            rejected_queries=self._rejected_queries,
-            duplicate_queries=self._duplicate_queries,
-            retry_count=self._retry_count,
-        )
+        with self._query_lock:
+            return QueryAccounting(
+                max_query_budget=self._config.max_query_budget,
+                attempted_queries=self._attempted_queries,
+                successful_queries=self._successful_queries,
+                failed_queries=self._failed_queries,
+                rejected_queries=self._rejected_queries,
+                duplicate_queries=self._duplicate_queries,
+                retry_count=self._retry_count,
+                in_flight_queries=self._in_flight_queries,
+            )
 
     def _limitations(self) -> Tuple[str, ...]:
         limitations = list(RUN_LIMITATIONS)

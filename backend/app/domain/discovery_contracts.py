@@ -384,13 +384,17 @@ class QueryAccounting:
     rejected_queries: int = 0
     duplicate_queries: int = 0
     retry_count: int = 0
+    in_flight_queries: int = 0
 
     def __post_init__(self) -> None:
         if self.attempted_queries > self.max_query_budget:
             raise ValueError("attempted_queries must not exceed max_query_budget.")
-        if self.successful_queries + self.failed_queries != self.attempted_queries:
+        if (
+            self.successful_queries + self.failed_queries + self.in_flight_queries
+            != self.attempted_queries
+        ):
             raise ValueError(
-                "successful_queries + failed_queries must equal attempted_queries."
+                "successful_queries + failed_queries + in_flight_queries must equal attempted_queries."
             )
         if min(
             self.attempted_queries,
@@ -399,6 +403,7 @@ class QueryAccounting:
             self.rejected_queries,
             self.duplicate_queries,
             self.retry_count,
+            self.in_flight_queries,
         ) < 0:
             raise ValueError("query counters must be non-negative.")
 
@@ -416,6 +421,7 @@ class QueryAccounting:
             "duplicate_queries": self.duplicate_queries,
             "retry_count": self.retry_count,
             "remaining_queries": self.remaining_queries,
+            "in_flight_queries": self.in_flight_queries,
         }
 
 
