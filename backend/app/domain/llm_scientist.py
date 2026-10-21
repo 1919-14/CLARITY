@@ -43,6 +43,7 @@ from .contracts import (
     HypothesisRepresentation,
     HypothesisStatus,
     Observation,
+    ObservationStatus,
     StructuredError,
     generate_id,
     utc_now_iso,
@@ -340,10 +341,14 @@ class LLMScientist:
     ) -> LLMProposalRequest:
         """Build the bounded, permitted request context.
 
-        Only public discovery state is serialized: committed observations,
-        candidate specifications, their evaluation metrics, ranking entries, and
-        structured failure reasons. Oracle internals, evaluator labels, hidden
-        rules, and credentials are never read or copied.
+        Only public, non-reserved discovery state is serialized: successful
+        non-held-out observations, candidate specifications, their evaluation
+        metrics, ranking entries, and structured failure reasons. Observations
+        are reduced to the declared numeric input/output task fields, so extra
+        payload keys never cross the provider boundary. Held-out observations are
+        reserved for evaluator-side metrics and are never sent to a provider.
+        Oracle internals, evaluator labels, hidden rules, and credentials are
+        never read or copied.
         """
         ranked_by_id: Dict[str, Any] = {}
         ranked_order: List[str] = []
@@ -397,16 +402,38 @@ class LLMScientist:
                 }
             hypothesis_payloads.append(entry)
 
-        observation_payloads: List[Dict[str, Any]] = []
-        committed = list(observations)
-        for observation in committed[-self._config.max_context_observations :]:
-            if observation.status.value != "success":
+        # Held-out observations are reserved for evaluation metrics and are not
+        # part of the discovery evidence context. Apply the context bound after
+        # that filter so reserved rows can never crowd out public observations.
+        eligible_observations: List[Observation] = []
+        for observation in observations:
+            if observation.status != ObservationStatus.SUCCESS:
                 continue
+            if observation.is_held_out:
+                continue
+            raw_inputs = observation.input_values
+            raw_outputs = observation.output_values or {}
+            if domain_bounds.variable_name not in raw_inputs:
+                continue
+            if output_variable not in raw_outputs:
+                continue
+            eligible_observations.append(observation)
+
+        observation_payloads: List[Dict[str, Any]] = []
+        for observation in eligible_observations[-self._config.max_context_observations :]:
             observation_payloads.append(
                 {
                     "sequence_number": observation.sequence_number,
-                    "input_values": _plain(observation.input_values),
-                    "output_values": _plain(observation.output_values),
+                    # Only the declared task fields; extra payload keys are dropped
+                    # instead of being copied to the provider.
+                    "input_values": {
+                        domain_bounds.variable_name: _plain(
+                            observation.input_values[domain_bounds.variable_name]
+                        )
+                    },
+                    "output_values": {
+                        output_variable: _plain(observation.output_values[output_variable])
+                    },
                 }
             )
 

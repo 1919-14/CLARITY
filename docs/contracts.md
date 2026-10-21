@@ -1001,10 +1001,12 @@ Frozen and leakage-checked. Permitted fields only:
   "previous_rounds": [],
   "failure_summaries": []
 }
-```
-Observations expose only `sequence_number`, `input_values`, and
-`output_values`. No oracle internals, evaluator labels, hidden rules, benchmark
-answers, credentials, or previous raw prompts are sent.
+```Observations expose only `sequence_number` plus the declared task fields in
+`input_values`/`output_values` (for the default task, `x` and `y`). Only
+successful, non-held-out observations are eligible; rows flagged
+`is_held_out` are reserved for evaluator-side metrics and extra payload keys are
+dropped rather than copied. No oracle internals, evaluator labels, hidden rules,
+benchmark answers, credentials, or previous raw prompts are sent.
 
 ### 9.3 Provider result (`ProviderCallResult`)
 `status` is one of `success`, `disabled`, `not_configured`,

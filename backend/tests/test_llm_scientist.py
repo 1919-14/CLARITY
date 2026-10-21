@@ -161,13 +161,26 @@ def make_scientist(responses: Sequence[Any], **overrides: Any):
     return LLMScientist(make_config(**overrides), provider), provider
 
 
-def make_observation(x: float, y: float, sequence: int) -> Observation:
+def make_observation(
+    x: float,
+    y: float,
+    sequence: int,
+    *,
+    held_out: bool = False,
+    extra_inputs: Optional[Dict[str, Any]] = None,
+    extra_outputs: Optional[Dict[str, Any]] = None,
+) -> Observation:
+    input_values: Dict[str, Any] = {"x": float(x)}
+    input_values.update(extra_inputs or {})
+    output_values: Dict[str, Any] = {"y": float(y)}
+    output_values.update(extra_outputs or {})
     return Observation(
         observation_id=f"obs-{sequence}",
         input_id=f"inp-{sequence}",
-        input_values={"x": float(x)},
-        output_values={"y": float(y)},
+        input_values=input_values,
+        output_values=output_values,
         sequence_number=sequence,
+        is_held_out=held_out,
     )
 
 
@@ -413,6 +426,74 @@ def test_empty_hypothesis_list_is_a_structured_fallback_round() -> None:
     assert outcome.record.fallback_applied is True
     assert outcome.record.fallback_reason == "no_valid_hypotheses"
     assert outcome.record.accepted_count == 0
+
+
+def test_held_out_observations_are_excluded_from_provider_context() -> None:
+    scientist = LLMScientist(make_config(enabled=False))
+    request = scientist.build_request(
+        run_id="run-test",
+        observations=[
+            make_observation(-1.0, 1.0, 1),
+            make_observation(0.5, 0.25, 2, held_out=True),
+        ],
+        candidates=(),
+        evaluations={},
+        ranking=None,
+        domain_bounds=BOUNDS,
+        output_variable="y",
+        max_polynomial_degree=2,
+    )
+
+    assert [item["input_values"] for item in request.observations] == [{"x": -1.0}]
+    assert [item["sequence_number"] for item in request.observations] == [1]
+
+
+def test_held_out_observations_do_not_consume_context_budget() -> None:
+    scientist = LLMScientist(make_config(enabled=False, max_context_observations=2))
+    observations_in = [
+        make_observation(-1.0, 1.0, 1),
+        make_observation(0.0, 0.0, 2),
+        make_observation(0.5, 0.25, 3, held_out=True),
+        make_observation(1.0, 1.0, 4, held_out=True),
+        make_observation(1.5, 2.25, 5, held_out=True),
+    ]
+    request = scientist.build_request(
+        run_id="run-test",
+        observations=observations_in,
+        candidates=(),
+        evaluations={},
+        ranking=None,
+        domain_bounds=BOUNDS,
+        output_variable="y",
+        max_polynomial_degree=2,
+    )
+
+    assert [item["sequence_number"] for item in request.observations] == [1, 2]
+
+
+def test_provider_context_contains_only_task_fields() -> None:
+    scientist = LLMScientist(make_config(enabled=False))
+    request = scientist.build_request(
+        run_id="run-test",
+        observations=[
+            make_observation(
+                1.0,
+                1.0,
+                1,
+                extra_inputs={"accessory": 9.0},
+                extra_outputs={"diagnostic": 7.0},
+            )
+        ],
+        candidates=(),
+        evaluations={},
+        ranking=None,
+        domain_bounds=BOUNDS,
+        output_variable="y",
+        max_polynomial_degree=2,
+    )
+
+    assert request.observations[0]["input_values"] == {"x": 1.0}
+    assert request.observations[0]["output_values"] == {"y": 1.0}
 
 
 def test_round_record_preserves_credential_slot() -> None:

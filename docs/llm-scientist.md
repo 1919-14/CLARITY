@@ -101,8 +101,10 @@ Frozen, JSON-serializable, and leakage-checked on construction. It contains only
 - supported domain, variable names, numeric bounds;
 - supported model family and maximum polynomial degree;
 - `max_proposals` and the canonical keys of existing candidates;
-- bounded committed observations (`sequence_number`, `input_values`,
-  `output_values` only);
+- bounded committed observations: successful, **non-held-out** rows only, with
+  `sequence_number` and just the declared numeric input/output task fields
+  (`x`/`y`). Reserved held-out rows and any extra payload keys never cross the
+  provider boundary;
 - bounded candidate summaries (formula, parameters, complexity, evaluation
   metrics/status, ranking status/scores, evidence counts);
 - a ranking summary;
@@ -357,7 +359,10 @@ full prompts.
 ## 10. Ground-truth isolation
 
 - The scientist receives only explicit public fields; there is no generic
-  serializer over discovery objects.
+  serializer over discovery objects. `build_request()` excludes observations
+  flagged `is_held_out` and reduces each observation to the declared task
+  variables, so evaluator-reserved rows and incidental payload keys cannot
+  reach a provider.
 - `LLMProposalRequest` and `ScientistRoundRecord` run
   `verify_no_ground_truth_leakage`, so a forbidden key fails closed.
 - `DiscoveryRunResult.to_dict()` re-checks the whole payload.
@@ -371,7 +376,7 @@ full prompts.
 
 ```bash
 cd backend
-python -m pytest tests/test_llm_scientist.py -q     # 64 offline tests
+python -m pytest tests/test_llm_scientist.py -q     # 67 offline tests
 python -m pytest -q                                 # full backend suite
 python -m compileall -q app tests
 python -m benchmarks.llm_scientist_benchmark        # offline synthetic comparison
