@@ -959,3 +959,120 @@ python -m pytest tests/test_experiment_selection.py -q
 python -m pytest -q
 ```
 
+---
+
+## 9. LLM Scientist (Issue #41)
+
+**Code references:**
+- [backend/app/domain/llm_scientist_contracts.py](../backend/app/domain/llm_scientist_contracts.py) — configuration, request, provider protocol, call result, rejection/round records
+- [backend/app/domain/llm_scientist.py](../backend/app/domain/llm_scientist.py) — versioned prompt, bounded evidence context, local validation, canonicalization, round orchestration
+- [backend/app/adapters/llm/groq_provider.py](../backend/app/adapters/llm/groq_provider.py) — Groq runtime adapter
+- [docs/llm-scientist.md](llm-scientist.md) — setup, fallback semantics, benchmark, limitations
+
+### 9.1 Trust boundary
+`LLMScientistConfig` defaults to `enabled=false`. When disabled, the discovery
+engine is constructed without a scientist, no provider is created, and no
+network call is possible. Provider output is untrusted data: it is parsed as
+strict JSON, validated into the existing Issue #5 hypothesis contract, and can
+never execute code, call an oracle, or mutate committed state.
+
+### 9.2 Proposal request (`LLMProposalRequest`)
+Frozen and leakage-checked. Permitted fields only:
+
+```json
+{
+  "request_id": "llmreq-...",
+  "round_index": 1,
+  "prompt_version": "1.0.0",
+  "schema_version": "1.0.0",
+  "domain": "1d_polynomial",
+  "variable_name": "x",
+  "output_variable": "y",
+  "domain_bounds": {"min_val": -2.0, "max_val": 2.0},
+  "model_family": "polynomial",
+  "max_polynomial_degree": 3,
+  "max_proposals": 3,
+  "observations": [{"sequence_number": 1, "input_values": {"x": -1.0}, "output_values": {"y": 1.0}}],
+  "hypotheses": [{"hypothesis_id": "hyp-...", "formula": "...", "parameters": {},
+                   "evaluation": {"status": "completed", "metrics": {}},
+                   "ranking": {"rank": 1, "status": "uncertain"}}],
+  "ranking_summary": {"available": true, "ranked_hypothesis_ids": []},
+  "existing_canonical_keys": ["{...}"],
+  "previous_rounds": [],
+  "failure_summaries": []
+}
+```
+Observations expose only `sequence_number`, `input_values`, and
+`output_values`. No oracle internals, evaluator labels, hidden rules, benchmark
+answers, credentials, or previous raw prompts are sent.
+
+### 9.3 Provider result (`ProviderCallResult`)
+`status` is one of `success`, `disabled`, `not_configured`,
+`missing_credentials`, `sdk_unavailable`, `authentication_failed`,
+`permission_denied`, `rate_limited`, `timeout`, `transient_failure`,
+`provider_error`, `malformed_response`, `response_too_large`. `attempts` counts
+real attempts (`0` when no call was possible). `usage` is present only when the
+provider actually returned token metadata; cost/latency are never invented.
+`is_live` is `false` for every fake provider, so offline tests cannot be
+reported as live execution.
+
+### 9.4 Proposal schema and rejection codes
+Required: `model_family` (only `polynomial`), `degree` (integer inside the
+run's configured maximum), `coefficients` (exactly `degree + 1` finite numbers,
+ascending powers), and non-empty `rationale`. Optional and bounded:
+`assumptions`, `competing_explanations`, `distinguishing_evidence`,
+`suggested_experiment_inputs` (inside domain bounds), and
+`self_reported_confidence` (`[0, 1]`, recorded as uncalibrated).
+
+Rejection codes: `malformed_response`, `schema_invalid`, `missing_field`,
+`invalid_type`, `unsupported_model_family`, `unsupported_representation`,
+`unsafe_field`, `non_finite_value`, `out_of_domain`, `too_many_proposals`,
+`duplicate_proposal`, `invalid_suggestion`. Unknown fields are rejected; fields
+implying code/tool execution are rejected explicitly. Above
+`max_proposals_per_round` the whole round is rejected. Duplicates are detected by
+the model family's canonical key against existing candidates and earlier
+proposals in the same round.
+
+### 9.5 Round record (`ScientistRoundRecord`)
+`round_id`, `round_index`, `run_id`, `provider_id`, `model_id`,
+`prompt_version`, `schema_version`, `status`
+(`success|no_valid_proposals|provider_failure|disabled`), timestamps, measured
+`duration_ms`, `proposals_returned`, `accepted_count`, `rejected_count`,
+`accepted_hypothesis_ids`, structured `rejected` entries, `outcome_status`,
+`error`, `attempts`, real `usage`, `is_live_provider`, `fallback_applied`,
+`fallback_reason`, and an evidence summary. Every non-success round must record
+its fallback. The record is exposed in
+`DiscoveryRunResult.scientist_history` and is leakage-checked on construction
+and serialization.
+
+### 9.6 Engine integration
+`DiscoveryEngine(..., scientist=...)` runs at most one round after the initial
+ranking pass and after each successful oracle query, bounded by
+`LLMScientistConfig.max_rounds`. Rounds consume no query budget. Accepted
+hypotheses are re-validated by the engine, then fitted, evaluated, ranked, and
+used by the planner exactly like generated candidates. Advisory inputs enter the
+next experiment batch through `ExperimentGenerationConfig.suggested_inputs`
+(same bounds/exclusion/dedup checks, tagged
+`ExperimentGenerationStrategy.SUGGESTED`) and never bypass the planner, oracle
+validation, duplicate guard, budget, or stopping policy.
+
+### 9.7 Failure and fallback semantics
+Provider failures and empty rounds never fail the discovery run by themselves.
+They produce a non-success round record plus a `SCIENTIST_FALLBACK` warning, and
+the run continues with the existing candidates under the existing stopping
+policy. `fallback_policy=disable_further_rounds` additionally suppresses later
+provider calls. Deterministic fallback output is never labelled LLM-generated.
+
+### 9.8 Isolation and tests
+Evaluator-only ground truth is absent from requests, round records, warnings,
+logs, and serialized results; both request and record construction fail closed
+on forbidden keys. Tests assert canary isolation, immutable committed state
+under malicious-looking provider output, and that no generated code is executed.
+
+```bash
+cd backend
+python -m pytest tests/test_llm_scientist.py -q
+python -m pytest -q
+python -m benchmarks.llm_scientist_benchmark
+```
+

@@ -55,6 +55,12 @@ class ExperimentGenerationStrategy(str, Enum):
     GRID = "grid"
     UNIFORM_RANDOM = "uniform_random"
     STRATIFIED_RANDOM = "stratified_random"
+    # Provenance label for caller-supplied candidate inputs (for example advisory
+    # LLM Scientist suggestions, Issue #41). It is not a selectable pool-fill
+    # strategy: suggestions are validated and deduplicated through exactly the
+    # same pipeline as generated candidates, then the configured strategy fills
+    # the rest of the pool.
+    SUGGESTED = "suggested"
 
 
 @dataclass(frozen=True)
@@ -202,6 +208,10 @@ class ExperimentGenerationConfig:
       tolerance: Pure absolute tolerance for checking if an input was already queried.
       allow_undersized: Whether to return fewer candidates than pool_size or raise error.
       precision_digits: Optional rounding precision; None preserves full float precision.
+      suggested_inputs: Optional caller-supplied input values (for example advisory
+        LLM Scientist suggestions). They are not trusted: each value passes the same
+        bounds, schema, exclusion, and deduplication checks as generated candidates
+        before it can appear in the batch. Suggestions never call an oracle.
     """
     pool_size: int = DEFAULT_EXPERIMENT_POOL_SIZE
     strategy: ExperimentGenerationStrategy = ExperimentGenerationStrategy.GRID
@@ -211,6 +221,7 @@ class ExperimentGenerationConfig:
     tolerance: float = 1e-5
     allow_undersized: bool = True
     precision_digits: Optional[int] = None
+    suggested_inputs: Sequence[float] = field(default_factory=list)
 
     def __post_init__(self):
         if not isinstance(self.pool_size, int) or isinstance(self.pool_size, bool):
@@ -234,6 +245,29 @@ class ExperimentGenerationConfig:
         if self.precision_digits is not None:
             if not isinstance(self.precision_digits, int) or isinstance(self.precision_digits, bool) or self.precision_digits < 0:
                 raise ValueError("precision_digits must be a non-negative integer or None.")
+
+        if self.strategy == ExperimentGenerationStrategy.SUGGESTED:
+            raise ValueError(
+                "SUGGESTED is a candidate provenance label, not a pool generation "
+                "strategy; choose GRID, UNIFORM_RANDOM, or STRATIFIED_RANDOM."
+            )
+
+        # Validate suggested inputs: they are untrusted advisory values, so only
+        # finite real numbers are accepted here. Out-of-bounds suggestions are
+        # dropped by the normal bounds filter rather than raising.
+        if isinstance(self.suggested_inputs, (str, bytes)) or not isinstance(
+            self.suggested_inputs, (list, tuple)
+        ):
+            raise ValueError("suggested_inputs must be a list or tuple of numbers.")
+        for value in self.suggested_inputs:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError("suggested_inputs entries must be real numbers.")
+            try:
+                numeric = float(value)
+            except OverflowError:
+                raise ValueError("suggested_inputs entries must be finite.") from None
+            if not math.isfinite(numeric):
+                raise ValueError("suggested_inputs entries must be finite.")
 
 
 @dataclass(frozen=True)
@@ -307,13 +341,17 @@ class CandidateExperimentGenerator:
                     except OverflowError:
                         pass
 
+        # Caller-supplied suggestions are candidates like any other: they enter the
+        # same filter/dedup pipeline below and never bypass validation.
+        raw_candidates = self._generate_suggested(cfg)
+
         # Dispatch generation strategy
         if cfg.strategy == ExperimentGenerationStrategy.GRID:
-            raw_candidates = self._generate_grid(cfg, excluded_scalars)
+            raw_candidates.extend(self._generate_grid(cfg, excluded_scalars))
         elif cfg.strategy == ExperimentGenerationStrategy.UNIFORM_RANDOM:
-            raw_candidates = self._generate_uniform_random(cfg, excluded_scalars)
+            raw_candidates.extend(self._generate_uniform_random(cfg, excluded_scalars))
         elif cfg.strategy == ExperimentGenerationStrategy.STRATIFIED_RANDOM:
-            raw_candidates = self._generate_stratified_random(cfg, excluded_scalars)
+            raw_candidates.extend(self._generate_stratified_random(cfg, excluded_scalars))
         else:
             raise ValueError(f"Unsupported generation strategy: {cfg.strategy}")
 
@@ -387,6 +425,36 @@ class CandidateExperimentGenerator:
         """Convenience method returning list of CandidateExperiment instances for backward compatibility."""
         batch = self.generate_batch(config_override)
         return batch.candidates
+
+    def _generate_suggested(
+        self, cfg: ExperimentGenerationConfig
+    ) -> List[CandidateExperiment]:
+        """Wrap caller-supplied suggestions as untrusted candidate experiments.
+
+        No bounds or duplicate decision is made here on purpose: the shared
+        filter in ``generate_batch`` applies the same checks generated candidates
+        receive, so one validation path governs every candidate source.
+        """
+        bounds = cfg.bounds
+        candidates: List[CandidateExperiment] = []
+        for index, value in enumerate(cfg.suggested_inputs):
+            inp = ExperimentInput(
+                values={bounds.variable_name: value},
+                domain=bounds.domain_name,
+                metadata={"strategy": ExperimentGenerationStrategy.SUGGESTED.value, "index": index},
+            )
+            candidates.append(
+                CandidateExperiment(
+                    input_data=inp,
+                    strategy=ExperimentGenerationStrategy.SUGGESTED,
+                    generation_metadata={
+                        "strategy": ExperimentGenerationStrategy.SUGGESTED.value,
+                        "source": "llm_scientist_suggestion",
+                        "index": index,
+                    },
+                )
+            )
+        return candidates
 
     def _format_value(self, val: float, cfg: ExperimentGenerationConfig) -> float:
         """Format value according to precision policy, guaranteeing bounds adherence."""
@@ -547,6 +615,7 @@ def generate_candidate_experiments(
     tolerance: float = 1e-5,
     allow_undersized: bool = True,
     precision_digits: Optional[int] = None,
+    suggested_inputs: Optional[Sequence[float]] = None,
 ) -> List[CandidateExperiment]:
     """Functional convenience entry point returning a list of candidate experiments.
 
@@ -563,6 +632,7 @@ def generate_candidate_experiments(
         tolerance=tolerance,
         allow_undersized=allow_undersized,
         precision_digits=precision_digits,
+        suggested_inputs=suggested_inputs or [],
     )
     generator = CandidateExperimentGenerator(cfg)
     return generator.generate()
@@ -577,6 +647,7 @@ def generate_batch_candidate_experiments(
     tolerance: float = 1e-5,
     allow_undersized: bool = True,
     precision_digits: Optional[int] = None,
+    suggested_inputs: Optional[Sequence[float]] = None,
 ) -> CandidateExperimentBatch:
     """Functional convenience entry point returning a :class:`CandidateExperimentBatch`.
 
@@ -598,6 +669,7 @@ def generate_batch_candidate_experiments(
         tolerance=tolerance,
         allow_undersized=allow_undersized,
         precision_digits=precision_digits,
+        suggested_inputs=suggested_inputs or [],
     )
     generator = CandidateExperimentGenerator(cfg)
     return generator.generate_batch()

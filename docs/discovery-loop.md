@@ -364,6 +364,7 @@ Both default to `False`, and neither flag implies the other.
 | `ingestion_history` | `DiscoveryIngestionRecord` per external update. |
 | `errors`, `warnings` | Structured errors and warnings. |
 | `ranking_is_fresh` | Whether the ranking reflects every committed observation. |
+| `scientist_history` | `ScientistRoundRecord` per optional LLM Scientist round (Issue #41); empty for deterministic-only runs. |
 | `limitations` | Human-readable limitations of this run. |
 | `started_at`, `finished_at` | UTC ISO-8601 timestamps. |
 
@@ -451,7 +452,35 @@ for ranked in result.ranked_hypotheses:
 PY
 ```
 
-## 12. Current limitations and deferred integration
+## 12. Optional LLM Scientist rounds (Issue #41)
+
+`DiscoveryEngine(..., scientist=...)` accepts an optional `LLMScientist`. When
+absent (the default), the loop is exactly the deterministic behavior described
+above and no provider is constructed.
+
+When present:
+
+- one round runs after the initial evaluation/ranking pass (only with at least
+  one committed observation and a non-zero query budget), and
+- one round runs after each successful oracle query, once the new observation
+  and refreshed evaluation/ranking are committed.
+
+`LLMScientistConfig.max_rounds` bounds the total number of provider calls. A
+round consumes no oracle budget and cannot select or execute an experiment. Its
+accepted hypotheses are re-validated by the engine and appended with stable IDs,
+then enter the same `evaluate_many`/`rank_candidates` refresh as generated
+candidates. Advisory experiment inputs are consumed once by the next experiment
+batch through `ExperimentGenerationConfig.suggested_inputs` and still pass the
+planner, oracle validation, duplicate guard, budget, and stopping checks.
+
+Every round is recorded in `scientist_history` with provider/model/prompt/schema
+versions, counts, rejections, attempts, real usage (when reported), and fallback
+state. Failed or empty rounds never fail the run by themselves: they emit
+`SCIENTIST_FALLBACK` and deterministic discovery continues. Provider content is
+treated as untrusted data and cannot mutate committed observations, rankings,
+counters, or terminal state. See [llm-scientist.md](llm-scientist.md).
+
+## 13. Current limitations and deferred integration
 
 - **Training-only metrics.** The engine does not reserve a held-out partition;
   every committed observation is training data for fitting and evidence, so
@@ -465,6 +494,11 @@ PY
   successfully fitted hypotheses, so an active run should start with enough
   initial observations; otherwise it reports `INSUFFICIENT_HYPOTHESES`, records
   `EXPERIMENT_SELECTION_UNAVAILABLE`, and terminates without an oracle call.
+- **Optional LLM proposals.** LLM-assisted mode is opt-in; proposals are
+  uncalibrated conjectures whose quality depends on provider/model/prompt, and
+  they are only judged by the existing fitting/evaluation/ranking components. A
+  zero query budget skips LLM rounds entirely, and the offline benchmark showed
+  no held-out error advantage over deterministic candidates.
 - **Single domain shape.** The loop is numeric 1-D: one input variable from
   `NumericalDomainBounds` and the model family's scalar output. Multi-output
   and multi-variable domains are out of scope.

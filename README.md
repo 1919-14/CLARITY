@@ -72,6 +72,7 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 - [Architecture](docs/architecture.md)
 - [Scientific data contracts](docs/contracts.md)
 - [Discovery loop](docs/discovery-loop.md)
+- [LLM Scientist (optional)](docs/llm-scientist.md)
 - [Ranking and evidence](docs/ranking-and-evidence.md)
 - [Persistence](docs/persistence.md)
 - [Development guide](docs/development.md)
@@ -106,6 +107,11 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    *(Or from within `backend/`, run `python run.py`)*
    Verify health endpoint at `http://127.0.0.1:5000/api/health`.
 
+   The optional LLM Scientist is **disabled by default**. Deterministic discovery
+   needs no credentials and no network. To enable it, copy `backend/.env.example`
+   to `backend/.env`, set `LLM_SCIENTIST_ENABLED=true`, and provide
+   `GROQ_API_KEY`. See [docs/llm-scientist.md](docs/llm-scientist.md).
+
 ### Frontend (Node.js 20+)
 
 1. Install dependencies:
@@ -126,4 +132,4 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 
 ## Development status
 
-The application skeleton and automated CI checks (Issue #3), the scientific data contracts and black-box oracle interface (Issue #4), bounded candidate hypothesis representation/generation (Issue #5), the fitting/evaluation pipeline (Issue #6), hypothesis ranking and evidence tracking (Issue #7), candidate experiment generation (Issue #9), the end-to-end discovery loop (Issue #8), and disagreement-driven active experiment selection with a seeded random baseline (Issue #10) are in place. The Flask backend, React status interface, GitHub Actions CI workflow, domain contracts, deterministic local oracle, isolated benchmark evaluator, polynomial model family, prediction interface, seeded candidate generator, least-squares fitter, train/held-out evaluation pipeline, ranking/evidence engine, experiment generator, budgeted discovery orchestrator, and opt-in active experiment selector are established. Next phase focuses on information-gain selection and stopping controls (Issue #11).
+The application skeleton and automated CI checks (Issue #3), the scientific data contracts and black-box oracle interface (Issue #4), bounded candidate hypothesis representation/generation (Issue #5), the fitting/evaluation pipeline (Issue #6), hypothesis ranking and evidence tracking (Issue #7), candidate experiment generation (Issue #9), the end-to-end discovery loop (Issue #8), disagreement-driven active experiment selection with a seeded random baseline (Issue #10), and an optional, provider-independent LLM Scientist with offline tests and a synthetic comparison (Issue #41) are in place. The Flask backend, React status interface, GitHub Actions CI workflow, domain contracts, deterministic local oracle, isolated benchmark evaluator, polynomial model family, prediction interface, seeded candidate generator, least-squares fitter, train/held-out evaluation pipeline, ranking/evidence engine, experiment generator, budgeted discovery orchestrator, and opt-in active experiment selector are established. The LLM Scientist is disabled by default: it proposes bounded, locally validated hypotheses from permitted evidence, while CLARITY retains fitting, evaluation, ranking, experiment selection, oracle access, budget, and stopping. Next phase focuses on information-gain selection and stopping controls (Issue #11).

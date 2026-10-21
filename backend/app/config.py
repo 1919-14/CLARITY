@@ -22,6 +22,20 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    @classmethod
+    def llm_scientist_config(cls):
+        """Optional LLM Scientist configuration (Issue #41), read from the environment.
+
+        Single source of truth: ``LLMScientistConfig.from_environment`` owns the
+        variable names, bounds, and defaults. Deterministic-only remains the
+        default, and no credential is read here. Invalid values raise ``ValueError``
+        so a misconfigured deployment fails loudly instead of silently running
+        with an unintended provider.
+        """
+        from .domain.llm_scientist_contracts import LLMScientistConfig
+
+        return LLMScientistConfig.from_environment()
+
 
 class DevelopmentConfig(Config):
     """Development environment configuration."""
