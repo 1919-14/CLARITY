@@ -19,7 +19,7 @@ Every selected candidate passes the oracle's public `validate_input()` contract 
 
 ## Retry policy
 
-Retries default to disabled (`max_query_retries=0)); when enabled, the value must be between 0 and 5. Only `TimeoutError`, `ConnectionError`, or `OracleQueryError` values with the explicit codes `ORACLE_TIMEOUT`, `ORACLE_RATE_LIMITED`, `ORACLE_TEMPORARY_FAILURE`, or `ORACLE_UNAVAILABLE` are retryable. Validation failures, malformed oracle responses, generic exceptions, and other oracle error codes are not retried.
+Retries default to disabled (`max_query_retries=0`); when enabled, the value must be between 0 and 5. Only `TimeoutError`, `ConnectionError`, or `OracleQueryError` values with the explicit codes `ORACLE_TIMEOUT`, `ORACLE_RATE_LIMITED`, `ORACLE_TEMPORARY_FAILURE`, or `ORACLE_UNAVAILABLE` are retryable. Validation failures, malformed oracle responses, generic exceptions, and other oracle error codes are not retried.
 
 Each retry reserves another unit of query budget before calling the oracle. A retry is not attempted when the budget is exhausted. The engine never retries indefinitely. Previously committed observations are retained if a later invocation fails.
 
