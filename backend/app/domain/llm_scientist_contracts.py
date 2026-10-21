@@ -48,6 +48,16 @@ SCIENTIST_SCHEMA_VERSION = "1.0.0"
 DEFAULT_PROVIDER_ID = "groq"
 DEFAULT_MODEL_ID = "llama-3.3-70b-versatile"
 DEFAULT_CREDENTIAL_ENV_VAR = "GROQ_API_KEY"
+# Ordered credential slots. The provider rotates to the next configured slot when
+# one is rate limited, so a run can continue within the same bounded policy.
+DEFAULT_CREDENTIAL_ENV_VARS: Tuple[str, ...] = (
+    "GROQ_API_KEY",
+    "GROQ_API_KEY_2",
+    "GROQ_API_KEY_3",
+    "GROQ_API_KEY_4",
+    "GROQ_API_KEY_5",
+)
+MAX_CREDENTIAL_ENV_VARS = 10
 
 # Hard ceilings that keep one provider call bounded regardless of configuration.
 MAX_PROPOSALS_CEILING = 10
@@ -157,6 +167,24 @@ def _parse_int(value: str, name: str) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}.") from None
 
 
+def _parse_credential_names(
+    source: Mapping[str, str], defaults: "LLMScientistConfig"
+) -> Tuple[str, ...]:
+    """Resolve ordered credential variable names from the environment.
+
+    Only names are read here; values stay in the environment until the provider
+    constructs its clients, and are never stored in configuration.
+    """
+    plural = source.get("LLM_SCIENTIST_CREDENTIAL_ENV_VARS")
+    if plural is not None and plural.strip():
+        names = tuple(item.strip() for item in plural.split(",") if item.strip())
+        return names or defaults.credential_env_vars
+    legacy = source.get("LLM_SCIENTIST_CREDENTIAL_ENV_VAR")
+    if legacy is not None and legacy.strip():
+        return (legacy.strip(),)
+    return defaults.credential_env_vars
+
+
 def _parse_float(value: str, name: str) -> float:
     try:
         number = float(value.strip())
@@ -180,9 +208,11 @@ class LLMScientistConfig:
         Provider identifier. ``groq`` is the only runtime provider implemented.
     model
         Provider model identifier, recorded as provenance.
-    credential_env_var
-        *Name* of the environment variable holding the API key. The key itself is
-        never stored in configuration, serialized, or logged.
+    credential_env_vars
+        Ordered *names* of the environment variables holding provider API keys.
+        The provider tries them in rotation and moves to the next slot when a key
+        is rate limited. Values are never stored in configuration, serialized,
+        or logged.
     max_proposals_per_round
         Upper bound on accepted proposals requested/used from one round.
     timeout_seconds
@@ -210,7 +240,7 @@ class LLMScientistConfig:
     enabled: bool = False
     provider: str = DEFAULT_PROVIDER_ID
     model: str = DEFAULT_MODEL_ID
-    credential_env_var: str = DEFAULT_CREDENTIAL_ENV_VAR
+    credential_env_vars: Tuple[str, ...] = DEFAULT_CREDENTIAL_ENV_VARS
     max_proposals_per_round: int = 3
     timeout_seconds: float = 20.0
     max_retries: int = 1
@@ -229,8 +259,23 @@ class LLMScientistConfig:
             raise ValueError("provider must be a non-empty string.")
         if not isinstance(self.model, str) or not self.model:
             raise ValueError("model must be a non-empty string.")
-        if not isinstance(self.credential_env_var, str) or not self.credential_env_var:
-            raise ValueError("credential_env_var must be a non-empty string.")
+        if isinstance(self.credential_env_vars, str) or not isinstance(
+            self.credential_env_vars, (tuple, list)
+        ):
+            raise ValueError("credential_env_vars must be a sequence of variable names.")
+        names = tuple(self.credential_env_vars)
+        if not names:
+            raise ValueError("credential_env_vars must contain at least one name.")
+        if len(names) > MAX_CREDENTIAL_ENV_VARS:
+            raise ValueError(
+                f"credential_env_vars cannot exceed {MAX_CREDENTIAL_ENV_VARS} entries."
+            )
+        if len(set(names)) != len(names):
+            raise ValueError("credential_env_vars must not contain duplicate names.")
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("credential_env_vars entries must be non-empty strings.")
+        object.__setattr__(self, "credential_env_vars", names)
         self._check_int("max_proposals_per_round", self.max_proposals_per_round, 1, MAX_PROPOSALS_CEILING)
         self._check_int("max_rounds", self.max_rounds, 1, MAX_ROUNDS_CEILING)
         self._check_int("max_retries", self.max_retries, 0, MAX_RETRIES_CEILING)
@@ -265,6 +310,11 @@ class LLMScientistConfig:
                 f"{type(self.fallback_policy).__name__}."
             )
 
+    @property
+    def credential_env_var(self) -> str:
+        """First credential slot name (backwards-compatible singular accessor)."""
+        return self.credential_env_vars[0]
+
     @staticmethod
     def _check_int(name: str, value: Any, minimum: int, maximum: int) -> None:
         if isinstance(value, bool) or not isinstance(value, int):
@@ -282,7 +332,8 @@ class LLMScientistConfig:
 
         Variables:
           LLM_SCIENTIST_ENABLED, LLM_SCIENTIST_PROVIDER, LLM_SCIENTIST_MODEL,
-          LLM_SCIENTIST_CREDENTIAL_ENV_VAR, LLM_SCIENTIST_MAX_PROPOSALS,
+          LLM_SCIENTIST_CREDENTIAL_ENV_VARS (comma-separated names; legacy
+          LLM_SCIENTIST_CREDENTIAL_ENV_VAR still works), LLM_SCIENTIST_MAX_PROPOSALS,
           LLM_SCIENTIST_TIMEOUT_SECONDS, LLM_SCIENTIST_MAX_RETRIES,
           LLM_SCIENTIST_MAX_TOKENS, LLM_SCIENTIST_MAX_RESPONSE_CHARS,
           LLM_SCIENTIST_MAX_CONTEXT_OBSERVATIONS,
@@ -319,9 +370,7 @@ class LLMScientistConfig:
             ),
             provider=get("LLM_SCIENTIST_PROVIDER") or defaults.provider,
             model=get("LLM_SCIENTIST_MODEL") or defaults.model,
-            credential_env_var=(
-                get("LLM_SCIENTIST_CREDENTIAL_ENV_VAR") or defaults.credential_env_var
-            ),
+            credential_env_vars=_parse_credential_names(source, defaults),
             max_proposals_per_round=(
                 _parse_int(get("LLM_SCIENTIST_MAX_PROPOSALS"), "LLM_SCIENTIST_MAX_PROPOSALS")
                 if get("LLM_SCIENTIST_MAX_PROPOSALS") is not None
@@ -386,6 +435,7 @@ class LLMScientistConfig:
             "provider": self.provider,
             "model": self.model,
             "credential_env_var": self.credential_env_var,
+            "credential_env_vars": list(self.credential_env_vars),
             "max_proposals_per_round": self.max_proposals_per_round,
             "timeout_seconds": float(self.timeout_seconds),
             "max_retries": self.max_retries,
@@ -531,6 +581,9 @@ class ProviderCallResult:
     is_live
         True only for a real provider client. Fixed fake providers report False
         so a test can never be described as live execution.
+    credential_slot
+        1-based credential slot that produced the final outcome, when multiple
+        configured keys are used. The key itself is never recorded.
     """
 
     status: ProviderOutcomeStatus
@@ -541,6 +594,7 @@ class ProviderCallResult:
     usage: Optional[Mapping[str, Any]] = None
     duration_ms: Optional[float] = None
     is_live: bool = False
+    credential_slot: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ProviderOutcomeStatus):
@@ -558,6 +612,13 @@ class ProviderCallResult:
             if not isinstance(self.usage, Mapping):
                 raise ValueError("usage must be a mapping or None.")
             object.__setattr__(self, "usage", freeze_payload(dict(self.usage)))
+        if self.credential_slot is not None:
+            if (
+                isinstance(self.credential_slot, bool)
+                or not isinstance(self.credential_slot, int)
+                or self.credential_slot < 1
+            ):
+                raise ValueError("credential_slot must be a positive integer or None.")
 
 
 class LLMProposalProvider(Protocol):
@@ -641,6 +702,7 @@ class ScientistRoundRecord:
     attempts: int = 0
     usage: Optional[Mapping[str, Any]] = None
     is_live_provider: bool = False
+    credential_slot: Optional[int] = None
     fallback_applied: bool = False
     fallback_reason: Optional[str] = None
     evidence_summary: Mapping[str, Any] = field(default_factory=dict)
@@ -664,6 +726,13 @@ class ScientistRoundRecord:
             raise ValueError("accepted_count cannot exceed proposals_returned.")
         if self.accepted_hypothesis_ids and len(tuple(self.accepted_hypothesis_ids)) != self.accepted_count:
             raise ValueError("accepted_hypothesis_ids must match accepted_count.")
+        if self.credential_slot is not None:
+            if (
+                isinstance(self.credential_slot, bool)
+                or not isinstance(self.credential_slot, int)
+                or self.credential_slot < 1
+            ):
+                raise ValueError("credential_slot must be a positive integer or None.")
         object.__setattr__(self, "accepted_hypothesis_ids", tuple(self.accepted_hypothesis_ids))
         object.__setattr__(self, "rejected", tuple(self.rejected))
         object.__setattr__(self, "evidence_summary", freeze_payload(dict(self.evidence_summary)))
@@ -702,6 +771,8 @@ class ScientistRoundRecord:
             data["usage"] = thaw_payload(self.usage)
         if self.fallback_reason is not None:
             data["fallback_reason"] = self.fallback_reason
+        if self.credential_slot is not None:
+            data["credential_slot"] = self.credential_slot
         return data
 
 
@@ -712,6 +783,8 @@ __all__ = [
     "DEFAULT_PROVIDER_ID",
     "DEFAULT_MODEL_ID",
     "DEFAULT_CREDENTIAL_ENV_VAR",
+    "DEFAULT_CREDENTIAL_ENV_VARS",
+    "MAX_CREDENTIAL_ENV_VARS",
     "MAX_PROPOSALS_CEILING",
     "MAX_ROUNDS_CEILING",
     "MAX_TIMEOUT_SECONDS",

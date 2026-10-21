@@ -581,6 +581,7 @@ class LLMScientist:
                     attempts=call.attempts,
                     usage=call.usage,
                     is_live=call.is_live,
+                    credential_slot=call.credential_slot,
                     fallback_reason=f"provider_{call.status.value}",
                     evidence_summary=evidence_summary,
                 )
@@ -598,6 +599,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason=f"provider_{call.status.value}",
                 record=self._records[-1],
             )
@@ -624,6 +626,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason="response_too_large",
             )
 
@@ -647,6 +650,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason="malformed_response",
             )
 
@@ -669,6 +673,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason="schema_validation_failed",
                 rejections=(ProposalRejection(
                     proposal_index=0,
@@ -702,6 +707,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason="too_many_proposals",
                 rejections=(ProposalRejection(
                     proposal_index=0,
@@ -765,6 +771,7 @@ class LLMScientist:
                 attempts=call.attempts,
                 usage=call.usage,
                 is_live=call.is_live,
+                credential_slot=call.credential_slot,
                 fallback_reason="no_valid_hypotheses",
                 rejections=tuple(rejections),
                 proposals_returned=len(raw_proposals),
@@ -781,6 +788,7 @@ class LLMScientist:
             attempts=call.attempts,
             usage=call.usage,
             is_live=call.is_live,
+            credential_slot=call.credential_slot,
             proposals_returned=len(raw_proposals),
             accepted_hypothesis_ids=tuple(hypothesis.hypothesis_id for hypothesis in accepted),
             rejections=tuple(rejections),
@@ -1132,6 +1140,7 @@ class LLMScientist:
         fallback_reason: Optional[str] = None,
         error: Optional[StructuredError] = None,
         usage: Optional[Mapping[str, Any]] = None,
+        credential_slot: Optional[int] = None,
         proposals_returned: int = 0,
         accepted_hypothesis_ids: Sequence[str] = (),
         rejections: Sequence[ProposalRejection] = (),
@@ -1161,6 +1170,7 @@ class LLMScientist:
             attempts=attempts,
             usage=usage,
             is_live_provider=is_live,
+            credential_slot=credential_slot,
             fallback_applied=status != ScientistRoundStatus.SUCCESS,
             fallback_reason=fallback_reason,
             evidence_summary=evidence_summary,
@@ -1182,6 +1192,7 @@ class LLMScientist:
         evidence_summary: Mapping[str, Any],
         error: Optional[StructuredError] = None,
         usage: Optional[Mapping[str, Any]] = None,
+        credential_slot: Optional[int] = None,
         rejections: Sequence[ProposalRejection] = (),
         proposals_returned: int = 0,
     ) -> ScientistRoundOutcome:
@@ -1197,6 +1208,7 @@ class LLMScientist:
             attempts=max(1, attempts),
             usage=usage,
             is_live=is_live,
+            credential_slot=credential_slot,
             fallback_reason=fallback_reason,
             evidence_summary=evidence_summary,
             proposals_returned=proposals_returned,
@@ -1221,6 +1233,7 @@ class LLMScientist:
         attempts: int = 0,
         usage: Optional[Mapping[str, Any]] = None,
         is_live: bool = False,
+        credential_slot: Optional[int] = None,
         record: Optional[ScientistRoundRecord] = None,
     ) -> ScientistRoundOutcome:
         if record is not None:
@@ -1237,6 +1250,7 @@ class LLMScientist:
             attempts=max(0, attempts),
             usage=usage,
             is_live=is_live,
+            credential_slot=credential_slot,
             fallback_reason=fallback_reason,
             evidence_summary=evidence_summary,
         )

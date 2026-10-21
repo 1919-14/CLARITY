@@ -108,9 +108,11 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    Verify health endpoint at `http://127.0.0.1:5000/api/health`.
 
    The optional LLM Scientist is **disabled by default**. Deterministic discovery
-   needs no credentials and no network. To enable it, copy `backend/.env.example`
-   to `backend/.env`, set `LLM_SCIENTIST_ENABLED=true`, and provide
-   `GROQ_API_KEY`. See [docs/llm-scientist.md](docs/llm-scientist.md).
+   needs no credentials and no network. A local, gitignored `backend/.env` already
+   contains five ordered Groq credential slots (`GROQ_API_KEY` … `GROQ_API_KEY_5`)
+   and `LLM_SCIENTIST_MODEL`. Fill at least one slot, set
+   `LLM_SCIENTIST_ENABLED=true`, and the provider rotates to the next slot when a
+   key is rate limited. See [docs/llm-scientist.md](docs/llm-scientist.md).
 
 ### Frontend (Node.js 20+)
 

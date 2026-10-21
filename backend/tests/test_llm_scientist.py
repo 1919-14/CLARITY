@@ -99,7 +99,12 @@ class FakeProvider:
         return item
 
 
-def success(payload: Any, *, usage: Optional[Dict[str, int]] = None) -> ProviderCallResult:
+def success(
+    payload: Any,
+    *,
+    usage: Optional[Dict[str, int]] = None,
+    credential_slot: Optional[int] = None,
+) -> ProviderCallResult:
     content = payload if isinstance(payload, str) else json.dumps(payload)
     return ProviderCallResult(
         status=ProviderOutcomeStatus.SUCCESS,
@@ -109,6 +114,7 @@ def success(payload: Any, *, usage: Optional[Dict[str, int]] = None) -> Provider
         usage=usage,
         duration_ms=1.0,
         is_live=False,
+        credential_slot=credential_slot,
     )
 
 
@@ -409,6 +415,15 @@ def test_empty_hypothesis_list_is_a_structured_fallback_round() -> None:
     assert outcome.record.accepted_count == 0
 
 
+def test_round_record_preserves_credential_slot() -> None:
+    scientist, _ = make_scientist(
+        [success({"hypotheses": [proposal()]}, credential_slot=2)]
+    )
+    outcome = run_round(scientist)
+    assert outcome.record.credential_slot == 2
+    assert outcome.record.to_dict()["credential_slot"] == 2
+
+
 def test_round_record_preserves_usage_only_when_reported() -> None:
     scientist, _ = make_scientist(
         [success({"hypotheses": [proposal()]}, usage={"prompt_tokens": 12, "completion_tokens": 34})]
@@ -514,6 +529,29 @@ def test_config_from_environment_defaults_to_disabled() -> None:
     assert config.enabled is False
     assert config.provider == "groq"
     assert config.credential_env_var == "GROQ_API_KEY"
+    assert config.credential_env_vars == (
+        "GROQ_API_KEY",
+        "GROQ_API_KEY_2",
+        "GROQ_API_KEY_3",
+        "GROQ_API_KEY_4",
+        "GROQ_API_KEY_5",
+    )
+
+
+def test_config_parses_plural_and_legacy_credential_slots() -> None:
+    plural = LLMScientistConfig.from_environment(
+        {"LLM_SCIENTIST_CREDENTIAL_ENV_VARS": "KEY_A, KEY_B ,KEY_C"}
+    )
+    assert plural.credential_env_vars == ("KEY_A", "KEY_B", "KEY_C")
+    assert plural.credential_env_var == "KEY_A"
+
+    legacy = LLMScientistConfig.from_environment(
+        {"LLM_SCIENTIST_CREDENTIAL_ENV_VAR": "ONLY_KEY"}
+    )
+    assert legacy.credential_env_vars == ("ONLY_KEY",)
+
+    with pytest.raises(ValueError):
+        LLMScientistConfig(credential_env_vars=())
 
 
 def test_config_from_environment_parses_explicit_values() -> None:
@@ -745,6 +783,131 @@ def test_groq_adapter_rejects_empty_content() -> None:
     provider, _, _ = _groq_provider([_completion("   ")])
     result = provider.propose(run_round_request())
     assert result.status == ProviderOutcomeStatus.MALFORMED_RESPONSE
+
+
+def _rotating_provider(scripts: Dict[str, Sequence[Any]], **overrides: Any):
+    """One fake client per credential slot, keyed by environment variable name."""
+    keys = tuple(scripts)
+    config = make_config(credential_env_vars=keys, **overrides)
+    environ = {name: f"credential-for-{name}" for name in keys}
+    clients = {
+        f"credential-for-{name}": _FakeGroqClient(outcomes)
+        for name, outcomes in scripts.items()
+    }
+    sleeps: List[float] = []
+    provider = GroqProposalProvider(
+        config,
+        client_factory=lambda credential: clients[credential],
+        sleep=sleeps.append,
+        environ=environ,
+    )
+    return provider, clients, sleeps
+
+
+def test_groq_rotates_to_next_slot_on_rate_limit() -> None:
+    provider, clients, _ = _rotating_provider(
+        {
+            "KEY_A": [RateLimitFailure()],
+            "KEY_B": [_completion('{"hypotheses": []}')],
+        }
+    )
+    result = provider.propose(run_round_request())
+
+    assert result.status == ProviderOutcomeStatus.SUCCESS
+    assert result.attempts == 2
+    assert result.credential_slot == 2
+    assert len(clients["credential-for-KEY_A"].completions.calls) == 1
+    assert len(clients["credential-for-KEY_B"].completions.calls) == 1
+
+
+def test_groq_reports_rate_limited_when_all_slots_are_exhausted() -> None:
+    provider, clients, _ = _rotating_provider(
+        {"KEY_A": [RateLimitFailure()], "KEY_B": [RateLimitFailure()]}
+    )
+    result = provider.propose(run_round_request())
+
+    assert result.status == ProviderOutcomeStatus.RATE_LIMITED
+    assert result.attempts == 2
+    assert result.credential_slot == 2
+    details = result.error.details or {}
+    assert details["credential_env_vars"] == ["KEY_A", "KEY_B"]
+    serialized = json.dumps({"details": details, "status": result.status.value})
+    assert "credential-for-" not in serialized
+
+
+def test_groq_does_not_rotate_on_authentication_failure() -> None:
+    provider, clients, _ = _rotating_provider(
+        {
+            "KEY_A": [AuthenticationFailure()],
+            "KEY_B": [_completion('{"hypotheses": []}')],
+        }
+    )
+    result = provider.propose(run_round_request())
+
+    assert result.status == ProviderOutcomeStatus.AUTHENTICATION_FAILED
+    assert result.attempts == 1
+    assert result.credential_slot == 1
+    assert len(clients["credential-for-KEY_B"].completions.calls) == 0
+
+
+def test_groq_rotation_advances_start_slot_after_success() -> None:
+    provider, clients, _ = _rotating_provider(
+        {
+            "KEY_A": [_completion('{"hypotheses": []}')],
+            "KEY_B": [_completion('{"hypotheses": []}')],
+        }
+    )
+    first = provider.propose(run_round_request())
+    second = provider.propose(run_round_request())
+
+    assert (first.credential_slot, second.credential_slot) == (1, 2)
+    assert len(clients["credential-for-KEY_A"].completions.calls) == 1
+    assert len(clients["credential-for-KEY_B"].completions.calls) == 1
+
+
+def test_groq_rotation_skips_absent_credential_slots() -> None:
+    config = make_config(credential_env_vars=("KEY_A", "KEY_B"))
+    clients = {"credential-for-KEY_B": _FakeGroqClient([_completion('{"hypotheses": []}')])}
+    provider = GroqProposalProvider(
+        config,
+        client_factory=lambda credential: clients[credential],
+        environ={"KEY_B": "credential-for-KEY_B"},
+    )
+    assert provider.credential_slots == 1
+
+    result = provider.propose(run_round_request())
+    assert result.status == ProviderOutcomeStatus.SUCCESS
+    # KEY_A is absent, so the configured second slot is reported.
+    assert result.credential_slot == 2
+
+
+def test_groq_transient_retry_stays_on_the_same_slot() -> None:
+    provider, clients, sleeps = _rotating_provider(
+        {
+            "KEY_A": [TimeoutFailure(), _completion('{"hypotheses": []}')],
+            "KEY_B": [_completion('{"hypotheses": []}')],
+        },
+        max_retries=1,
+    )
+    result = provider.propose(run_round_request())
+
+    assert result.status == ProviderOutcomeStatus.SUCCESS
+    assert result.attempts == 2
+    assert result.credential_slot == 1
+    assert len(sleeps) == 1
+    assert len(clients["credential-for-KEY_B"].completions.calls) == 0
+
+
+def test_groq_missing_credentials_lists_all_slots_without_values() -> None:
+    config = make_config(credential_env_vars=("KEY_A", "KEY_B"))
+    provider = GroqProposalProvider(config, environ={"KEY_A": "   "})
+    result = provider.propose(run_round_request())
+
+    assert result.status == ProviderOutcomeStatus.MISSING_CREDENTIALS
+    details = result.error.details or {}
+    assert details["credential_env_vars"] == ["KEY_A", "KEY_B"]
+    serialized = json.dumps(details)
+    assert "credential-for-" not in serialized
 
 
 # ==============================================================================

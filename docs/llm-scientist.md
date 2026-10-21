@@ -245,13 +245,24 @@ using the official `groq` SDK (`requirements.txt`). The SDK import is lazy.
 
 ### 8.1 Setup
 
+`backend/.env` is gitignored and is loaded by `backend/run.py`. It ships with
+five ordered credential slots and the model name:
+
 ```bash
 # backend/.env (never commit real values)
 LLM_SCIENTIST_ENABLED=true
 LLM_SCIENTIST_PROVIDER=groq
 LLM_SCIENTIST_MODEL=llama-3.3-70b-versatile
-GROQ_API_KEY=your-groq-api-key-here
+LLM_SCIENTIST_CREDENTIAL_ENV_VARS=GROQ_API_KEY,GROQ_API_KEY_2,GROQ_API_KEY_3,GROQ_API_KEY_4,GROQ_API_KEY_5
+GROQ_API_KEY=
+GROQ_API_KEY_2=
+GROQ_API_KEY_3=
+GROQ_API_KEY_4=
+GROQ_API_KEY_5=
 ```
+
+Fill at least one slot; empty slots are skipped. Keep `LLM_SCIENTIST_ENABLED=false`
+until you intend to use a provider.
 
 Environment variables:
 
@@ -260,7 +271,8 @@ Environment variables:
 | `LLM_SCIENTIST_ENABLED` | `false` |
 | `LLM_SCIENTIST_PROVIDER` | `groq` |
 | `LLM_SCIENTIST_MODEL` | `llama-3.3-70b-versatile` |
-| `LLM_SCIENTIST_CREDENTIAL_ENV_VAR` | `GROQ_API_KEY` |
+| `LLM_SCIENTIST_CREDENTIAL_ENV_VARS` | `GROQ_API_KEY,GROQ_API_KEY_2,GROQ_API_KEY_3,GROQ_API_KEY_4,GROQ_API_KEY_5` |
+| `LLM_SCIENTIST_CREDENTIAL_ENV_VAR` (legacy, single slot) | unset |
 | `LLM_SCIENTIST_MAX_PROPOSALS` | `3` |
 | `LLM_SCIENTIST_TIMEOUT_SECONDS` | `20` |
 | `LLM_SCIENTIST_MAX_RETRIES` | `1` |
@@ -280,7 +292,25 @@ from app.adapters.llm import build_llm_scientist_from_environment
 scientist = build_llm_scientist_from_environment()  # None when disabled
 ```
 
-### 8.2 Bounds, retries, and error taxonomy
+### 8.2 Credential slots and rotation
+
+- Credentials are read from the ordered environment-variable names in
+  `LLM_SCIENTIST_CREDENTIAL_ENV_VARS` (or the legacy single
+  `LLM_SCIENTIST_CREDENTIAL_ENV_VAR`). Only names live in configuration; values
+  are read once to build clients and are never stored, logged, or serialized.
+- Each call starts at the next slot in round-robin order. If a slot is rate
+  limited, the adapter moves to the next configured slot within the same bounded
+  attempt sequence (each slot gets at most `1 + max_retries` attempts).
+- Authentication, permission, timeout, provider, malformed, and oversized
+  failures return immediately instead of silently switching credentials; only a
+  rate limit rotates.
+- If every configured slot is rate limited, the call reports `rate_limited` with
+  the number of slots tried. Diagnostics record the 1-based `credential_slot`,
+  never the key.
+- Rotation is bounded: at most `slots × (1 + max_retries)` provider attempts per
+  round, and `max_rounds` bounds rounds per run.
+
+### 8.3 Bounds, retries, and error taxonomy
 
 - One explicit request timeout; the SDK's own retry loop is disabled.
 - Bounded retries (`max_retries`) for `rate_limited`, `timeout`, and transient
@@ -295,12 +325,12 @@ scientist = build_llm_scientist_from_environment()  # None when disabled
 - Token usage is reported only when the provider returned it. Cost and latency
   beyond the measured call duration are never invented.
 
-### 8.3 Troubleshooting
+### 8.4 Troubleshooting
 
 | Symptom | Meaning |
 | --- | --- |
 | `LLM_PROVIDER_NOT_CONFIGURED` | LLM mode enabled but no provider adapter was supplied. |
-| `LLM_MISSING_CREDENTIALS` | LLM mode enabled without the named environment variable. |
+| `LLM_MISSING_CREDENTIALS` | LLM mode enabled but every configured credential slot is empty. |
 | `LLM_SDK_UNAVAILABLE` | Provider package/client could not be created. |
 | `LLM_AUTHENTICATION_FAILED` | Credential rejected; not retried. |
 | `LLM_RATE_LIMITED` | Retries exhausted at `max_retries`. |
@@ -312,10 +342,12 @@ scientist = build_llm_scientist_from_environment()  # None when disabled
 ## 9. Provenance and observability
 
 Each accepted proposal's `generation_metadata` records: generator and version,
-proposal round ID and index, provider and model identifiers, configured model,
-prompt and schema versions, rationale/assumptions/competing explanations,
-suggested inputs, uncalibrated confidence flag, and whether the call was live.
-`DiscoveryRunResult.scientist_history` holds every round record.
+proposal round ID and index, acceptance timestamp, provider and model
+identifiers, configured model, prompt and schema versions,
+rationale/assumptions/competing explanations, suggested inputs, uncalibrated
+confidence flag, and whether the call was live. `DiscoveryRunResult.scientist_history`
+holds every round record, including the 1-based `credential_slot` that produced
+the outcome (never the key).
 `ExperimentExecutionRecord` continues to record the planner's decision for each
 experiment.
 
@@ -339,7 +371,7 @@ full prompts.
 
 ```bash
 cd backend
-python -m pytest tests/test_llm_scientist.py -q     # 55 offline tests
+python -m pytest tests/test_llm_scientist.py -q     # 64 offline tests
 python -m pytest -q                                 # full backend suite
 python -m compileall -q app tests
 python -m benchmarks.llm_scientist_benchmark        # offline synthetic comparison

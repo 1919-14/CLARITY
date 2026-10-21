@@ -1014,7 +1014,11 @@ answers, credentials, or previous raw prompts are sent.
 real attempts (`0` when no call was possible). `usage` is present only when the
 provider actually returned token metadata; cost/latency are never invented.
 `is_live` is `false` for every fake provider, so offline tests cannot be
-reported as live execution.
+reported as live execution. `credential_slot` is the 1-based configured key slot
+that produced the final outcome; credential values are never recorded. With
+multiple configured slots, a rate-limited slot rotates to the next slot (bounded
+by `slots × (1 + max_retries)` attempts); other failure classes return
+immediately.
 
 ### 9.4 Proposal schema and rejection codes
 Required: `model_family` (only `polynomial`), `degree` (integer inside the
@@ -1039,8 +1043,8 @@ proposals in the same round.
 (`success|no_valid_proposals|provider_failure|disabled`), timestamps, measured
 `duration_ms`, `proposals_returned`, `accepted_count`, `rejected_count`,
 `accepted_hypothesis_ids`, structured `rejected` entries, `outcome_status`,
-`error`, `attempts`, real `usage`, `is_live_provider`, `fallback_applied`,
-`fallback_reason`, and an evidence summary. Every non-success round must record
+`error`, `attempts`, real `usage`, `is_live_provider`, `credential_slot`,
+`fallback_applied`, `fallback_reason`, and an evidence summary. Every non-success round must record
 its fallback. The record is exposed in
 `DiscoveryRunResult.scientist_history` and is leakage-checked on construction
 and serialization.
