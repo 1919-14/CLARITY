@@ -8,6 +8,8 @@ within a hard budget, ingests observations, and reranks.
 **Code references**
 - [backend/app/domain/discovery_engine.py](../backend/app/domain/discovery_engine.py) — `DiscoveryEngine` (orchestration only)
 - [backend/app/domain/discovery_contracts.py](../backend/app/domain/discovery_contracts.py) — configuration, statuses, history records, planner protocol, immutable result
+- [backend/tests/test_query_controls.py](../backend/tests/test_query_controls.py) — focused validation/accounting/retry tests
+- [query controls](query-controls.md) — accounting, duplicate, retry, and concurrency policy
 - [backend/tests/test_discovery_loop.py](../backend/tests/test_discovery_loop.py) — integration tests for complete runs, budgets, stopping, failures, incremental updates, isolation, and repeatability
 - [backend/app/adapters/oracle/local_simulator.py](../backend/app/adapters/oracle/local_simulator.py) — deterministic local test oracle
 
@@ -115,6 +117,7 @@ non-failed run (see section 8); neither path calls the oracle or consumes budget
 | `experiment_seed` | `None` | Seed forwarded to stochastic experiment strategies. |
 | `dataset_id` | `None` | Evaluation dataset identity; defaults to the run ID. |
 | `max_experiment_candidates_per_iteration` | `25` | Bound on proposals tried per iteration. |
+| `max_query_retries` | `0` | Bounded retries for transient oracle transport failures; every retry consumes query budget. |
 
 Validation happens in `__post_init__`, before any oracle call. Negative
 budgets, non-positive iteration limits, out-of-range pool sizes, non-finite
@@ -160,7 +163,8 @@ held-out/training error alone therefore never terminates a run as a success.
 `stopping_criterion_plausibility_reached`,
 `stopping_criterion_metric_threshold_reached`, `budget_exhausted`,
 `max_iterations_reached`, `experiment_pool_exhausted`,
-`consecutive_oracle_failures`, `component_failure`, `unrecoverable_error`.
+`no_informative_experiment_available`, `consecutive_oracle_failures`,
+`component_failure`, `unrecoverable_error`.
 
 **Deterministic precedence.** At the top of every iteration, in order:
 
