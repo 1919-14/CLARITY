@@ -368,6 +368,7 @@ class RankingPolicyConfig:
     max_tolerated_contradictions: int = 0
     complexity_penalty_threshold: Optional[float] = None
     performance_acceptance_threshold: Optional[float] = None
+    allow_unverified_comparability: bool = False
 
     def __post_init__(self) -> None:
         if self.complexity_penalty_threshold is not None:
@@ -391,15 +392,14 @@ class RankingPolicyConfig:
     def metric_meets_acceptance(self, metric_value: float) -> bool:
         """Return True when metric_value satisfies the performance acceptance policy.
 
-        When performance_acceptance_threshold is configured (not None), metric_value
-        must meet the configured bound (<= threshold for minimize, >= threshold for maximize).
-        When performance_acceptance_threshold is None, any finite metric is accepted
-        (no universal threshold is imposed).
+        When performance_acceptance_threshold is None, returns False: no task-specific
+        acceptance criterion has been configured, so performance cannot be asserted
+        as acceptable, and plausibility status must remain UNCERTAIN.
         """
         if metric_value is None or not math.isfinite(metric_value):
             return False
         if self.performance_acceptance_threshold is None:
-            return True
+            return False
         if self.metric_direction == "minimize":
             return metric_value <= self.performance_acceptance_threshold
         return metric_value >= self.performance_acceptance_threshold

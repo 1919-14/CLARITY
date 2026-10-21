@@ -92,9 +92,9 @@ graph TD
 
 - **`UNEVALUATED`**: No evaluation has been performed.
 - **`UNEVALUABLE`**: Fitter or evaluator failed (e.g. unregistered family, rank deficiency).
-- **`UNCERTAIN`**: Fewer than `min_samples_for_plausibility` (default: 5) samples, unverified observation membership, non-finite indeterminate comparisons, or primary metric failing configured `performance_acceptance_threshold`.
+- **`UNCERTAIN`**: Fewer than `min_samples_for_plausibility` (default: 5) samples, unverified observation membership, non-finite indeterminate comparisons, or primary metric failing configured `performance_acceptance_threshold`. When `performance_acceptance_threshold` is unconfigured (`None`), the absence of an agreed acceptance criterion ensures the status remains `UNCERTAIN` rather than asserting plausibility without an empirical basis.
 - **`CONTRADICTED`**: Contradictions exceed `max_tolerated_contradictions` (default: 0).
-- **`PLAUSIBLE`**: Sufficient sample count, zero intolerable contradictions, verified observation membership, no indeterminate residuals, and validated acceptable predictive metric performance.
+- **`PLAUSIBLE`**: Sufficient sample count, zero intolerable contradictions, verified observation membership, no indeterminate residuals, and validated predictive metric performance meeting the explicit `performance_acceptance_threshold`.
 
 ---
 
@@ -107,11 +107,13 @@ $$(EvaluationTier, \text{dataset\_id}, \text{metric\_version}, \text{metric\_def
 
 Candidates are strictly ranked by predictive metric magnitude **only within their own comparability cohort**.
 
+Missing required comparability metadata (`dataset_id`, `metric_version`, or the primary metric key in `metric_definitions`) classifies candidates as `INCOMPARABLE` (Priority 2) with `within_cohort_rank = None` by default. Direct metric comparison of unverified candidates requires an explicit policy override (`allow_unverified_comparability = True`), which assigns them to unverified cohorts with audit limitations.
+
 Candidates are ordered across distinct presentation tiers to prevent invalid comparisons:
 
-1. **`VALID_HELD_OUT`** (Priority 0): Candidates with completed evaluation and finite primary metric on held-out data with verified dataset identity.
-2. **`VALID_TRAINING_ONLY`** (Priority 1): Candidates with completed evaluation on training data only (generalization unverified) with verified dataset identity.
-3. **`INCOMPARABLE`** (Priority 2): Completed evaluations with non-finite primary metrics, missing dataset identifiers, or unverified comparability.
+1. **`VALID_HELD_OUT`** (Priority 0): Candidates with completed evaluation and finite primary metric on held-out data with verified dataset identity and verified metric definitions/versions.
+2. **`VALID_TRAINING_ONLY`** (Priority 1): Candidates with completed evaluation on training data only (generalization unverified) with verified dataset identity and verified metric definitions/versions.
+3. **`INCOMPARABLE`** (Priority 2): Completed evaluations with non-finite primary metrics, missing dataset identifiers, missing metric version/definition metadata (unless `allow_unverified_comparability=True`), or unverified comparability.
 4. **`EVALUATION_FAILED`** (Priority 3): Evaluations that aborted with structured errors.
 5. **`UNEVALUATED`** (Priority 4): Candidates awaiting evaluation.
 

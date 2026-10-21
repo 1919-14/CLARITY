@@ -109,6 +109,15 @@ def make_observation(
     )
 
 
+_DEFAULT_METRIC_DEFS = {
+    "mae": "mean_absolute_error",
+    "rmse": "root_mean_squared_error",
+    "r2": "coefficient_of_determination",
+}
+
+_SENTINEL = object()
+
+
 def make_evaluation_result(
     hyp_id: str,
     eval_id: str = "eval-1",
@@ -125,6 +134,8 @@ def make_evaluation_result(
     coefficients: Optional[Dict[str, float]] = None,
     observation_ids: Optional[Sequence[str]] = None,
     held_out_observation_ids: Optional[Sequence[str]] = None,
+    metric_version: Optional[str] = "v1",
+    metric_definitions: Any = _SENTINEL,
 ) -> EvaluationResult:
     if coefficients is None:
         coefficients = {"c0": 0.0, "c1": 2.0}
@@ -151,6 +162,8 @@ def make_evaluation_result(
         if held_out_observation_ids is not None:
             dataset_ids_dict["held_out_observation_ids"] = list(held_out_observation_ids)
 
+    mdefs = _DEFAULT_METRIC_DEFS if metric_definitions is _SENTINEL else metric_definitions
+
     return EvaluationResult(
         hypothesis_id=hyp_id,
         evaluation_id=eval_id,
@@ -165,6 +178,8 @@ def make_evaluation_result(
         complexity=complexity,
         dataset_ids=dataset_ids_dict,
         error=err,
+        metric_version=metric_version,
+        metric_definitions=mdefs,
     )
 
 
@@ -334,12 +349,38 @@ class TestPlausibilityStatusTransitions:
         status = derive_plausibility_status(eval_res, summary, policy)
         assert status == PlausibilityStatus.UNCERTAIN
 
-    def test_plausible_status_when_sufficient_samples_and_no_contradictions(self):
+    def test_uncertain_status_when_no_performance_acceptance_threshold_configured(self):
+        """When no performance acceptance threshold is configured in policy,
+        status remains UNCERTAIN even with sufficient samples and no contradictions."""
         policy = RankingPolicyConfig(min_samples_for_plausibility=5, max_tolerated_contradictions=0)
-        eval_res = make_evaluation_result("hyp-1", sample_count=6)
+        eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.05)
+        summary = EvidenceSummary("hyp-1", 6, 0, 0, 6, ("o1", "o2", "o3", "o4", "o5", "o6"), (), ())
+        status = derive_plausibility_status(eval_res, summary, policy)
+        assert status == PlausibilityStatus.UNCERTAIN
+
+    def test_plausible_status_when_sufficient_samples_and_metric_meets_threshold(self):
+        """When performance_acceptance_threshold is configured and met, status becomes PLAUSIBLE."""
+        policy = RankingPolicyConfig(
+            min_samples_for_plausibility=5,
+            max_tolerated_contradictions=0,
+            performance_acceptance_threshold=0.10,
+        )
+        eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.05)
         summary = EvidenceSummary("hyp-1", 6, 0, 0, 6, ("o1", "o2", "o3", "o4", "o5", "o6"), (), ())
         status = derive_plausibility_status(eval_res, summary, policy)
         assert status == PlausibilityStatus.PLAUSIBLE
+
+    def test_uncertain_status_when_metric_fails_acceptance_threshold(self):
+        """When performance_acceptance_threshold is configured but metric fails it, status is UNCERTAIN."""
+        policy = RankingPolicyConfig(
+            min_samples_for_plausibility=5,
+            max_tolerated_contradictions=0,
+            performance_acceptance_threshold=0.10,
+        )
+        eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.50)
+        summary = EvidenceSummary("hyp-1", 6, 0, 0, 6, ("o1", "o2", "o3", "o4", "o5", "o6"), (), ())
+        status = derive_plausibility_status(eval_res, summary, policy)
+        assert status == PlausibilityStatus.UNCERTAIN
 
     def test_contradicted_status_when_contradictions_exceed_tolerance(self):
         policy = RankingPolicyConfig(min_samples_for_plausibility=5, max_tolerated_contradictions=0)
@@ -564,7 +605,8 @@ class TestMultiCandidateIsolation:
 
 class TestHypothesisRankerService:
     def test_reranking_on_new_contradictory_observation(self):
-        ranker = HypothesisRanker()
+        policy = RankingPolicyConfig(performance_acceptance_threshold=0.10)
+        ranker = HypothesisRanker(policy=policy)
         c1 = make_candidate("hyp-1", formula="y = 2*x")
         c2 = make_candidate("hyp-2", formula="y = 3*x", coefficients={"c0": 0.0, "c1": 3.0})
 
@@ -622,7 +664,8 @@ class TestScientificTransparency:
         e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, observation_ids=obs_ids)
         obs = [make_observation(f"o{i}", x=float(i), y=2.0 * i) for i in range(1, 7)]
 
-        res = rank_candidates([c1], {"hyp-1": e1}, {"hyp-1": obs})
+        policy = RankingPolicyConfig(performance_acceptance_threshold=0.10)
+        res = rank_candidates([c1], {"hyp-1": e1}, {"hyp-1": obs}, policy=policy)
         rc = res.ranked_candidates[0]
 
         d = rc.to_dict()
@@ -656,11 +699,23 @@ class TestMetricComparabilityValidator:
         assert comparable is True
         assert len(reasons) == 0
 
-    def test_pairwise_comparable_unverified_when_version_absent(self):
-        """When metric_version is absent, comparable=True but a warning is returned."""
+    def test_pairwise_incomparable_when_version_absent_by_default(self):
+        """By default (allow_unverified_comparability=False), missing metric_version
+        makes candidates non-comparable."""
         validator = MetricComparabilityValidator()
-        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1")
-        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1")
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1", metric_version=None)
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1", metric_version=None)
+
+        comparable, reasons = validator.validate_pairwise_comparability(e1, e2)
+        assert comparable is False
+        assert any("Metric version metadata is absent" in r for r in reasons)
+
+    def test_pairwise_comparable_unverified_when_version_absent_with_explicit_policy(self):
+        """When metric_version is absent and policy allows unverified comparability, comparable=True with a warning."""
+        policy = RankingPolicyConfig(allow_unverified_comparability=True)
+        validator = MetricComparabilityValidator(policy=policy)
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.02, dataset_id="ds-1", metric_version=None)
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.03, dataset_id="ds-1", metric_version=None)
 
         comparable, reasons = validator.validate_pairwise_comparability(e1, e2)
         assert comparable is True
@@ -846,9 +901,13 @@ class TestPlausibleRequiresPerformanceCriterion:
         assert status == PlausibilityStatus.UNCERTAIN
 
     def test_plausible_when_finite_training_metric_and_no_contradictions(self):
-        """When the training primary metric is finite and all other criteria pass,
+        """When the training primary metric is finite and meets the acceptance threshold,
         PLAUSIBLE is correct even without held-out metrics."""
-        policy = RankingPolicyConfig(min_samples_for_plausibility=5, max_tolerated_contradictions=0)
+        policy = RankingPolicyConfig(
+            min_samples_for_plausibility=5,
+            max_tolerated_contradictions=0,
+            performance_acceptance_threshold=0.10,
+        )
         eval_res = make_evaluation_result("hyp-1", sample_count=6, mae=0.05)
         summary = EvidenceSummary("hyp-1", 6, 0, 0, 6,
                                   tuple(f"o{i}" for i in range(6)), (), ())
@@ -1204,4 +1263,65 @@ class TestFollowUpReviewFindings:
         import pytest
         with pytest.raises(ValueError, match="conflicting payload"):
             store.add(rec_conflict)
+
+    def test_missing_metric_version_makes_candidates_incomparable_at_ranker_level(self):
+        """Review follow-up #2: When candidates share a dataset ID but have missing
+        metric_version metadata, they must be classified as INCOMPARABLE by default
+        and must NOT receive within_cohort_rank or be metric-ranked against each other."""
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.01, dataset_id="ds-1", metric_version=None)
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.50, dataset_id="ds-1", metric_version=None)
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {})
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        assert rc1.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc2.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc1.within_cohort_rank is None
+        assert rc2.within_cohort_rank is None
+        assert any("Metric version metadata absent" in lim for lim in rc1.limitations)
+        assert any("Metric version metadata absent" in lim for lim in rc2.limitations)
+
+    def test_missing_primary_metric_definition_makes_candidates_incomparable_at_ranker_level(self):
+        """Review follow-up #2: When candidates share a dataset ID but lack primary
+        metric definitions, they must be classified as INCOMPARABLE by default
+        and must NOT receive within_cohort_rank or be metric-ranked."""
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.01, dataset_id="ds-1", metric_definitions={})
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.50, dataset_id="ds-1", metric_definitions={})
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {})
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        assert rc1.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc2.evaluation_tier == EvaluationTier.INCOMPARABLE
+        assert rc1.within_cohort_rank is None
+        assert rc2.within_cohort_rank is None
+        assert any("Primary metric definition absent" in lim for lim in rc1.limitations)
+        assert any("Primary metric definition absent" in lim for lim in rc2.limitations)
+
+    def test_explicit_policy_permits_unverified_metric_metadata_ranking_at_ranker_level(self):
+        """Review follow-up #2: When policy explicitly allows unverified comparability,
+        candidates lacking metric_version can be ranked within their cohort with limitations."""
+        policy = RankingPolicyConfig(allow_unverified_comparability=True)
+        c1 = make_candidate("hyp-1")
+        c2 = make_candidate("hyp-2")
+        # hyp-1 has better MAE than hyp-2
+        e1 = make_evaluation_result("hyp-1", held_out_mae=0.01, dataset_id="ds-1", metric_version=None)
+        e2 = make_evaluation_result("hyp-2", held_out_mae=0.50, dataset_id="ds-1", metric_version=None)
+
+        res = rank_candidates([c1, c2], {"hyp-1": e1, "hyp-2": e2}, {}, policy=policy)
+        rc1 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-1"][0]
+        rc2 = [r for r in res.ranked_candidates if r.hypothesis_id == "hyp-2"][0]
+
+        assert rc1.evaluation_tier == EvaluationTier.VALID_HELD_OUT
+        assert rc2.evaluation_tier == EvaluationTier.VALID_HELD_OUT
+        assert rc1.within_cohort_rank == 1
+        assert rc2.within_cohort_rank == 2
+        assert any("Metric version metadata is absent or mixed" in lim for lim in rc1.limitations)
+        assert any("Metric version metadata is absent or mixed" in lim for lim in rc2.limitations)
 

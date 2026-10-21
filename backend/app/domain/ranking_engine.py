@@ -151,6 +151,18 @@ def _determine_tier(
     if ds is None:
         return EvaluationTier.INCOMPARABLE, None, None, None, False
 
+    # Issue #2: Missing required comparability metadata prevents direct metric ranking
+    # unless policy explicitly allows unverified comparability.
+    if not policy.allow_unverified_comparability:
+        if eval_result.metric_version is None:
+            return EvaluationTier.INCOMPARABLE, None, None, None, False
+        if (
+            eval_result.metric_definitions is None
+            or policy.primary_metric not in eval_result.metric_definitions
+            or not eval_result.metric_definitions[policy.primary_metric]
+        ):
+            return EvaluationTier.INCOMPARABLE, None, None, None, False
+
     if held_out_val is not None:
         return EvaluationTier.VALID_HELD_OUT, held_out_val, training_val, secondary_val, False
     if training_val is not None:
@@ -416,6 +428,16 @@ def _build_limitations(
             limitations.append(
                 "Dataset identifier absent: metric comparison with other candidates "
                 "is not permitted without a confirmed shared evaluation identity."
+            )
+        elif not metric_version_verified:
+            limitations.append(
+                "Metric version metadata absent: metric comparison with other candidates "
+                "is not permitted without verified metric versions."
+            )
+        elif not metric_def_verified:
+            limitations.append(
+                "Primary metric definition absent: metric comparison with other candidates "
+                "is not permitted without verified metric definitions."
             )
         else:
             limitations.append(
@@ -795,18 +817,6 @@ class MetricComparabilityValidator:
             reasons.append("One or both evaluations did not complete successfully.")
             return False, reasons
 
-        tier_a = self.classify_tier(eval_a)
-        tier_b = self.classify_tier(eval_b)
-        if tier_a != tier_b:
-            reasons.append(
-                f"Candidates belong to different presentation tiers ({tier_a.value} vs {tier_b.value})."
-            )
-            return False, reasons
-
-        if tier_a not in _RANKABLE_TIERS:
-            reasons.append(f"Tier {tier_a.value} is not a directly comparable evaluation tier.")
-            return False, reasons
-
         # Dataset comparability.
         ds_a = _dataset_id(eval_a)
         ds_b = _dataset_id(eval_b)
@@ -820,31 +830,53 @@ class MetricComparabilityValidator:
         mv_a = eval_a.metric_version
         mv_b = eval_b.metric_version
         if mv_a is None or mv_b is None:
+            if not self.policy.allow_unverified_comparability:
+                reasons.append(
+                    "Metric version metadata is absent for one or both candidates; "
+                    "direct metric comparison is not permitted without verified metric versions."
+                )
+                return False, reasons
             reasons.append(
                 "Metric version metadata is absent for one or both candidates; "
                 "direct metric comparison is unverified."
             )
-            # Return True (potentially comparable) with the warning.
         elif mv_a != mv_b:
             reasons.append(f"Metric versions differ ({mv_a!r} vs {mv_b!r}).")
             return False, reasons
 
-        # Primary metric definition (Finding #5).
+        # Primary metric definition (Finding #5 / Issue #2).
         def_a = _primary_metric_def(eval_a, self.policy)
         def_b = _primary_metric_def(eval_b, self.policy)
-        if def_a != _METRIC_DEF_ABSENT and def_b != _METRIC_DEF_ABSENT:
-            if def_a != def_b:
+        if def_a == _METRIC_DEF_ABSENT or def_b == _METRIC_DEF_ABSENT:
+            if not self.policy.allow_unverified_comparability:
                 reasons.append(
-                    f"Primary metric definitions differ for '{self.policy.primary_metric}': "
-                    f"{def_a!r} vs {def_b!r}."
+                    f"Primary metric definition ('{self.policy.primary_metric}') is absent "
+                    "for one or both candidates; direct metric comparison is not permitted "
+                    "without verified metric definitions."
                 )
                 return False, reasons
-        elif (def_a == _METRIC_DEF_ABSENT) != (def_b == _METRIC_DEF_ABSENT):
             reasons.append(
                 f"Primary metric definition ('{self.policy.primary_metric}') is absent "
-                "for one candidate but present for the other; direct comparison is unverified."
+                "for one or both candidates; direct metric comparison is unverified."
             )
-            # Return True with the warning if other checks pass.
+        elif def_a != def_b:
+            reasons.append(
+                f"Primary metric definitions differ for '{self.policy.primary_metric}': "
+                f"{def_a!r} vs {def_b!r}."
+            )
+            return False, reasons
+
+        tier_a = self.classify_tier(eval_a)
+        tier_b = self.classify_tier(eval_b)
+        if tier_a != tier_b:
+            reasons.append(
+                f"Candidates belong to different presentation tiers ({tier_a.value} vs {tier_b.value})."
+            )
+            return False, reasons
+
+        if tier_a not in _RANKABLE_TIERS:
+            reasons.append(f"Tier {tier_a.value} is not a directly comparable evaluation tier.")
+            return False, reasons
 
         return True, reasons
 
