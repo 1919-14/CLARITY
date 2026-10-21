@@ -74,6 +74,7 @@ ERROR_UNEXPECTED_DISCOVERY_ERROR = "UNEXPECTED_DISCOVERY_ERROR"
 WARNING_EXPERIMENT_POOL_UNDERSIZED = "EXPERIMENT_POOL_UNDERSIZED"
 WARNING_DUPLICATE_QUERY_SKIPPED = "DUPLICATE_QUERY_SKIPPED"
 WARNING_RANKING_STALE = "RANKING_STALE"
+WARNING_EXPERIMENT_SELECTION_UNAVAILABLE = "EXPERIMENT_SELECTION_UNAVAILABLE"
 
 DISCOVERY_ENGINE_VERSION = "1.0.0"
 
@@ -420,6 +421,9 @@ class ExperimentExecutionRecord:
       oracle_sequence_number: The observation's oracle sequence number, when
         the oracle reported one.
       strategy: Experiment generation strategy label.
+      selection_diagnostics: Optional serialized selection decision from a
+        structured planner (Issue #10), stored as a frozen, discovery-safe
+        snapshot. ``None`` when the planner exposes no structured diagnostics.
       recorded_at: UTC ISO-8601 timestamp.
     """
 
@@ -433,6 +437,7 @@ class ExperimentExecutionRecord:
     error: Optional[StructuredError] = None
     oracle_sequence_number: Optional[int] = None
     strategy: Optional[str] = None
+    selection_diagnostics: Optional[Mapping[str, Any]] = None
     recorded_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
@@ -455,6 +460,14 @@ class ExperimentExecutionRecord:
             and self.error is None
         ):
             raise ValueError(f"Outcome {self.outcome.value} requires a structured error.")
+        if self.selection_diagnostics is not None:
+            if not isinstance(self.selection_diagnostics, Mapping):
+                raise ValueError("selection_diagnostics must be a mapping or None.")
+            object.__setattr__(
+                self,
+                "selection_diagnostics",
+                freeze_payload(dict(self.selection_diagnostics)),
+            )
         object.__setattr__(self, "input_values", freeze_payload(self.input_values))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -473,6 +486,8 @@ class ExperimentExecutionRecord:
             data["oracle_sequence_number"] = self.oracle_sequence_number
         if self.strategy is not None:
             data["strategy"] = self.strategy
+        if self.selection_diagnostics is not None:
+            data["selection_diagnostics"] = thaw_payload(self.selection_diagnostics)
         if self.error is not None:
             data["error"] = self.error.to_dict()
         return data
@@ -574,6 +589,14 @@ class ExperimentPlanner(Protocol):
     A planner receives only permitted discovery data: candidate hypotheses,
     their evaluation results, committed observations, the generated batch, and
     the current ranking. It must never receive evaluator-only ground truth.
+
+    Backwards-compatible diagnostics extension: a planner may additionally
+    expose ``select_experiment_with_diagnostics`` with the same argument list,
+    returning a structured selection result instead of only a candidate. The
+    engine prefers that method when present and records the serialized decision
+    in ``ExperimentExecutionRecord.selection_diagnostics``. The required
+    ``select_experiment`` method remains the orchestrator's contract, so existing
+    planners and callers keep working unchanged.
     """
 
     def select_experiment(
@@ -592,7 +615,8 @@ class DeterministicOrderPlanner:
     """Default Issue #8 planner: first eligible candidate in batch order.
 
     Deterministic and information-free: it does not score hypotheses or peek at
-    anything hidden. Active disagreement selection is deferred to Issue #10.
+    anything hidden. Active disagreement selection (Issue #10) is available
+    through ``ExperimentSelectionPlanner``; this remains the default.
     """
 
     planner_id = "deterministic_order_planner"
@@ -742,6 +766,7 @@ __all__ = [
     "WARNING_EXPERIMENT_POOL_UNDERSIZED",
     "WARNING_DUPLICATE_QUERY_SKIPPED",
     "WARNING_RANKING_STALE",
+    "WARNING_EXPERIMENT_SELECTION_UNAVAILABLE",
     "DISCOVERY_ENGINE_VERSION",
     "DiscoveryRunError",
     "DiscoveryLifecycleStatus",

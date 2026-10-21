@@ -736,8 +736,16 @@ class ExperimentPlanner(Protocol):
     ) -> Optional[CandidateExperiment]: ...
 ```
 `DeterministicOrderPlanner` (default) returns the first eligible candidate and
-uses no scientific scoring. Active disagreement selection is deferred to
-Issues #10–#11. A planner never receives the oracle or evaluator-only data.
+uses no scientific scoring. Active disagreement selection (Issue #10) is opt-in
+through `ExperimentSelectionPlanner`; information-gain selection (#11) remains
+deferred.
+
+Backwards-compatible diagnostics extension: a planner may additionally expose
+`select_experiment_with_diagnostics` with the same argument list and return an
+`ExperimentSelectionResult`. The engine prefers it when present and stores
+`result.to_dict()` in `ExperimentExecutionRecord.selection_diagnostics`; the
+required `select_experiment` method and its return type are unchanged. A planner
+never receives the oracle or evaluator-only data.
 
 ### 7.5 Result and history (`DiscoveryRunResult`)
 Top-level serialized fields: `run_id`, `status`, `termination_reason`, `config`,
@@ -765,6 +773,7 @@ Top-level serialized fields: `run_id`, `status`, `termination_reason`, `config`,
       "observation_id": "obs-0a1b2c3d4e",
       "oracle_sequence_number": 1,
       "strategy": "grid",
+      "selection_diagnostics": null,
       "recorded_at": "2026-10-21T00:00:00.000000+00:00"
     }
   ],
@@ -840,7 +849,113 @@ python -m pytest -q                                # full backend regression
 ```
 
 ### 7.9 Out of scope for Issue #8
-Active disagreement/information-gain selection (#10, #11), held-out benchmark
-procedures, MySQL persistence (#18), Flask routes (#19), Nodus integration
-(#12), and React UI (#21, #22).
+Information-gain selection (#11), held-out benchmark procedures, MySQL
+persistence (#18), Flask routes (#19), Nodus integration (#12), and React UI
+(#21, #22). Active disagreement selection is specified in §8 and
+[experiment-selection.md](experiment-selection.md).
+
+---
+
+## 8. Active Experiment Selection (Issue #10)
+
+**Code references:**
+- [backend/app/domain/selection_contracts.py](../backend/app/domain/selection_contracts.py) — strategies, metrics, configuration, per-candidate diagnostics, selection result
+- [backend/app/domain/experiment_selection.py](../backend/app/domain/experiment_selection.py) — `ActiveExperimentSelector`, `ExperimentSelectionPlanner`, `RandomBaselinePlanner`, `compute_disagreement`
+- [docs/experiment-selection.md](experiment-selection.md) — algorithm, examples, and limitations
+- [backend/tests/test_experiment_selection.py](../backend/tests/test_experiment_selection.py) — focused tests
+
+### 8.1 Selection result (`ExperimentSelectionResult`)
+```json
+{
+  "selection_version": "1.0.0",
+  "status": "selected",
+  "strategy": "active_disagreement",
+  "reason_code": "active_disagreement_max",
+  "rationale": "Selected candidate cand-exp-x2 at {'x': 2.0} with the maximum population_variance disagreement score (1.0) across 2 eligible hypothesis(es).",
+  "config": {
+    "strategy": "active_disagreement",
+    "disagreement_metric": "population_variance",
+    "min_eligible_hypotheses": 2,
+    "exclude_queried_inputs": true,
+    "exclusion_tolerance": 1e-05,
+    "fallback_strategy": "none",
+    "random_seed": null,
+    "uncertainty_weight": 0.0,
+    "allow_candidate_specifications": true
+  },
+  "candidate_pool_size": 2,
+  "valid_candidate_count": 2,
+  "eligible_hypothesis_count": 2,
+  "eligible_hypothesis_ids": ["hyp-linear", "hyp-quadratic"],
+  "excluded_hypotheses": {},
+  "excluded_candidates": {},
+  "candidates": [
+    {"candidate_id": "cand-exp-x2", "input_values": {"x": 2.0},
+     "scoring_status": "scored", "disagreement_score": 1.0,
+     "usable_predictions": {"hyp-linear": 2.0, "hyp-quadratic": 4.0},
+     "excluded_predictions": {}, "usable_prediction_count": 2}
+  ],
+  "selected_candidate_id": "cand-exp-x2",
+  "selected_input_values": {"x": 2.0},
+  "tie_break_policy": "highest disagreement score, then lexicographically smallest canonical input key (numeric values ascending), then smallest candidate_id",
+  "tie_break_applied": false,
+  "tied_candidate_ids": ["cand-exp-x2"],
+  "prediction_source": "candidate_specification",
+  "random_seed": null,
+  "uncertainty": {"available": false, "source": null, "reason": "..."}
+}
+```
+`status` is `selected`, `fallback_selected`, or `no_selection`. `reason_code`
+distinguishes empty pool, no eligible candidates, all inputs previously queried,
+insufficient hypotheses, no usable predictions, disagreement overflow, zero
+disagreement, the active maximum, the random draw, and the explicit sequential
+fallback. `to_dict()` is JSON-compatible, deterministic for identical inputs and
+configuration, and re-runs `verify_no_ground_truth_leakage`.
+
+### 8.2 Supported disagreement metrics
+Population variance (default, divides by `n`), sample variance (divides by
+`n - 1`), and peak-to-peak maximum spread, over finite scalar predictions from
+eligible hypotheses. Variance is computed from centered deviations scaled by
+their own magnitude and rescaled with `math.frexp`/`math.ldexp`, avoiding both
+`scale * scale` overflow and precision loss for small relative spreads at large
+magnitudes. Scores are raw and pool-normalization is never applied: an all-zero
+pool returns `zero_disagreement_pool` rather than manufactured spread. A
+genuinely unrepresentable score is reported as `disagreement_overflow`, never as
+zero or infinity.
+
+### 8.3 Eligibility and prediction source
+Ranking `CONTRADICTED`/`UNEVALUABLE` hypotheses and hypotheses missing from a
+supplied ranking are excluded. Fitted specifications are used when at least
+`min_eligible_hypotheses` valid fits exist; explicit
+`allow_candidate_specifications=true` switches the whole decision to validated
+candidate specifications when too few fits exist. Fitted and unfitted
+predictions are never mixed in one score. Missing, malformed, non-finite, or
+unsupported predictions are recorded per hypothesis and never replaced with
+zero.
+
+### 8.4 Determinism, duplicates, and the random baseline
+Ties are ordered by canonical input key then candidate ID; batch order cannot
+change the outcome. A committed input excludes a candidate only when both have
+identical input variable names and every numeric value satisfies pure absolute
+tolerance (`rel_tol=0.0`); boolean/string values must match exactly, and
+different or partially overlapping schemas are not duplicates. This applies to
+both strategies, and the engine's duplicate guard remains the final safety net.
+`random_baseline` requires an integer seed, uses a local `random.Random`, and
+draws from the same valid pool without consulting disagreement. An explicit
+`sequential` fallback is the only fallback and is labelled `fallback_selected`.
+
+### 8.5 Uncertainty and isolation
+No fit/evaluation contract exposes a validated prediction-covariance,
+residual-variance, or interval estimate, so the result reports
+`uncertainty.available=false` with a reason and `uncertainty_weight` must be
+`0.0`. The selector imports no oracle/evaluator module, receives only planner
+arguments, and stores only discovery-side data. Tests assert dependency wiring,
+the planner argument list, and canary isolation.
+
+### 8.6 Tests
+```bash
+cd backend
+python -m pytest tests/test_experiment_selection.py -q
+python -m pytest -q
+```
 

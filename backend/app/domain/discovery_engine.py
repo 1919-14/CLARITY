@@ -73,6 +73,7 @@ from .discovery_contracts import (
     ERROR_UNEXPECTED_DISCOVERY_ERROR,
     WARNING_DUPLICATE_QUERY_SKIPPED,
     WARNING_EXPERIMENT_POOL_UNDERSIZED,
+    WARNING_EXPERIMENT_SELECTION_UNAVAILABLE,
     WARNING_RANKING_STALE,
     DeterministicOrderPlanner,
     DiscoveryIngestionRecord,
@@ -101,6 +102,7 @@ from .experiment_generator import (
 from .hypothesis_models import ModelFamilyRegistry, default_registry
 from .ranking_contracts import EvaluationTier, PlausibilityStatus, RankingResult
 from .ranking_engine import HypothesisRanker
+from .selection_contracts import ExperimentSelectionResult
 
 DEFAULT_METRIC_NAMES: Tuple[str, ...] = ("mae", "rmse")
 
@@ -108,7 +110,8 @@ RUN_LIMITATIONS: Tuple[str, ...] = (
     "All committed observations are used as training data; the engine does not "
     "reserve a held-out partition, so held-out metrics are reported as unavailable.",
     "The default planner selects the first eligible experiment in generator order. "
-    "Active disagreement/information-gain selection is deferred to Issues #10-#11.",
+    "Active disagreement selection (Issue #10) is opt-in through an "
+    "ExperimentPlanner; information-gain selection is deferred to Issue #11.",
     "Ranking is a presentation of measured evidence, not a claim that the hidden "
     "rule has been discovered.",
 )
@@ -645,8 +648,22 @@ class DiscoveryEngine:
             ]
             if not remaining:
                 break
-            selected = self._select_experiment(remaining)
+            selected, selection_diagnostics = self._select_experiment(remaining)
             if selected is None:
+                if (
+                    selection_diagnostics is not None
+                    and selection_diagnostics.get("status") == "no_selection"
+                ):
+                    self._warnings.append(
+                        make_structured_error(
+                            WARNING_EXPERIMENT_SELECTION_UNAVAILABLE,
+                            "The experiment planner reported no selectable candidate; "
+                            "the run terminates without an oracle call.",
+                            reason_code=selection_diagnostics.get("reason_code"),
+                            selection_strategy=selection_diagnostics.get("strategy"),
+                            rationale=selection_diagnostics.get("rationale"),
+                        )
+                    )
                 break
             if selected.candidate_id in tried:
                 break
@@ -665,6 +682,7 @@ class DiscoveryEngine:
                         "Planner selected a candidate that is not eligible in the generated batch.",
                         experiment_id=selected.candidate_id,
                     ),
+                    selection_diagnostics=selection_diagnostics,
                 )
                 continue
 
@@ -688,6 +706,7 @@ class DiscoveryEngine:
                         "Duplicate experiment input skipped.",
                         input_values=dict(selected.input_data.values),
                     ),
+                    selection_diagnostics=selection_diagnostics,
                 )
                 continue
 
@@ -708,12 +727,13 @@ class DiscoveryEngine:
                     selected,
                     ExperimentExecutionOutcome.REJECTED_PRE_INVOCATION,
                     error=validation_error,
+                    selection_diagnostics=selection_diagnostics,
                 )
                 continue
 
             if self._attempted_queries >= self._config.max_query_budget:
                 raise _BudgetExhausted()
-            return self._invoke_oracle(selected, iteration)
+            return self._invoke_oracle(selected, iteration, selection_diagnostics)
 
         return None
 
@@ -755,20 +775,52 @@ class DiscoveryEngine:
     def _select_experiment(
         self,
         remaining: Sequence[CandidateExperiment],
-    ) -> Optional[CandidateExperiment]:
+    ) -> Tuple[Optional[CandidateExperiment], Optional[Dict[str, Any]]]:
+        """Ask the planner for one experiment, preserving the Issue #8 contract.
+
+        Planners that also expose ``select_experiment_with_diagnostics`` return
+        a structured Issue #10 result; its serialized diagnostics are attached
+        to the recorded experiment attempt. Plain planners return only the
+        candidate, exactly as before.
+        """
         batch = CandidateExperimentBatch(
             candidates=list(remaining),
             requested_count=len(remaining),
             generated_count=len(remaining),
         )
+        structured = getattr(self._planner, "select_experiment_with_diagnostics", None)
+        selection_diagnostics: Optional[Dict[str, Any]] = None
         try:
-            selected = self._planner.select_experiment(
-                list(self._candidates),
-                dict(self._evaluations),
-                list(self._observations.values()),
-                batch,
-                self._ranking,
-            )
+            if callable(structured):
+                selection = structured(
+                    list(self._candidates),
+                    dict(self._evaluations),
+                    list(self._observations.values()),
+                    batch,
+                    self._ranking,
+                )
+                if not isinstance(selection, ExperimentSelectionResult):
+                    raise _ComponentFailure(
+                        make_structured_error(
+                            ERROR_INVALID_PLANNER_SELECTION,
+                            "Structured planner selection must be an "
+                            "ExperimentSelectionResult, got "
+                            f"{type(selection).__name__}.",
+                            received_type=type(selection).__name__,
+                        )
+                    )
+                selection_diagnostics = selection.to_dict()
+                selected = selection.selected_candidate
+            else:
+                selected = self._planner.select_experiment(
+                    list(self._candidates),
+                    dict(self._evaluations),
+                    list(self._observations.values()),
+                    batch,
+                    self._ranking,
+                )
+        except _ComponentFailure:
+            raise
         except Exception as exc:  # noqa: BLE001 - planner boundary
             raise _ComponentFailure(
                 make_structured_error(
@@ -778,7 +830,7 @@ class DiscoveryEngine:
                 )
             ) from None
         if selected is None:
-            return None
+            return None, selection_diagnostics
         if not isinstance(selected, CandidateExperiment):
             raise _ComponentFailure(
                 make_structured_error(
@@ -788,10 +840,13 @@ class DiscoveryEngine:
                     received_type=type(selected).__name__,
                 )
             )
-        return selected
+        return selected, selection_diagnostics
 
     def _invoke_oracle(
-        self, selected: CandidateExperiment, iteration: int
+        self,
+        selected: CandidateExperiment,
+        iteration: int,
+        selection_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> ExperimentExecutionRecord:
         self._attempted_queries += 1
         try:
@@ -806,7 +861,11 @@ class DiscoveryEngine:
             )
             self._warnings.append(error)
             return self._record_experiment(
-                iteration, selected, ExperimentExecutionOutcome.INVOKED_FAILED, error=error
+                iteration,
+                selected,
+                ExperimentExecutionOutcome.INVOKED_FAILED,
+                error=error,
+                selection_diagnostics=selection_diagnostics,
             )
 
         validation_error = self._validate_oracle_response(observation, selected.input_data)
@@ -819,6 +878,7 @@ class DiscoveryEngine:
                 selected,
                 ExperimentExecutionOutcome.INVOKED_FAILED,
                 error=validation_error,
+                selection_diagnostics=selection_diagnostics,
             )
 
         self._successful_queries += 1
@@ -829,6 +889,7 @@ class DiscoveryEngine:
             selected,
             ExperimentExecutionOutcome.INVOKED_SUCCESS,
             observation=observation,
+            selection_diagnostics=selection_diagnostics,
         )
 
     def _record_experiment(
@@ -838,6 +899,7 @@ class DiscoveryEngine:
         outcome: ExperimentExecutionOutcome,
         error: Optional[StructuredError] = None,
         observation: Optional[Observation] = None,
+        selection_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> ExperimentExecutionRecord:
         record = ExperimentExecutionRecord(
             sequence=len(self._experiment_history) + 1,
@@ -854,6 +916,7 @@ class DiscoveryEngine:
             strategy=(
                 selected.strategy.value if selected.strategy is not None else None
             ),
+            selection_diagnostics=selection_diagnostics,
         )
         self._experiment_history.append(record)
         return record

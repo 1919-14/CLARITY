@@ -198,7 +198,9 @@ Invariants:
 
 ## 6. Experiment planning boundary
 
-Issue #10/#11 own active selection. The engine depends only on:
+Issue #10 owns active disagreement selection (implemented in
+[experiment-selection.md](experiment-selection.md)); information-gain selection
+remains Issue #11. The engine depends only on:
 
 ```python
 class ExperimentPlanner(Protocol):
@@ -224,6 +226,20 @@ proposal. Per-iteration proposals are bounded by
 The planner receives only permitted discovery data — candidates, evaluations,
 observations, the batch, and the ranking — never the oracle or evaluator data.
 The default planner ignores even those inputs.
+
+**Structured selection diagnostics (Issue #10).** A planner may additionally
+expose `select_experiment_with_diagnostics(...)` with the same argument list,
+returning an `ExperimentSelectionResult` instead of only a candidate. The engine
+prefers that method when present, validates the returned candidate through the
+normal pipeline, and stores the serialized decision in
+`ExperimentExecutionRecord.selection_diagnostics` (a frozen, discovery-safe
+snapshot). `ExperimentSelectionPlanner` and `RandomBaselinePlanner` from
+`app.domain.experiment_selection` plug in this way; active selection is opt-in
+and the default planner is unchanged. If structured selection returns no
+candidate, the engine records an `EXPERIMENT_SELECTION_UNAVAILABLE` warning with
+the structured reason and ends with the existing `TERMINATED_NO_EXPERIMENTS` /
+`EXPERIMENT_POOL_EXHAUSTED` semantics — it never silently falls back to random
+or sequential selection. See [experiment-selection.md](experiment-selection.md).
 
 ## 7. Validation, commit boundary, and failure handling
 
@@ -362,6 +378,7 @@ History records:
   `input_id`, `input_values`, `outcome`
   (`validated|rejected_pre_invocation|skipped_duplicate|invoked_success|invoked_failed|failed_before_execution`),
   `observation_id`, `error`, `oracle_sequence_number`, `strategy`,
+  `selection_diagnostics` (optional serialized Issue #10 decision, frozen),
   `recorded_at`.
 - `DiscoveryIterationRecord` — `iteration`, selected experiment/observation,
   outcome, query counters before/after, top hypothesis ID and primary metric,
@@ -441,9 +458,13 @@ PY
   `held_out_metrics` is unavailable and candidates rank in the
   `VALID_TRAINING_ONLY` tier. The evaluation pipeline already supports explicit
   held-out partitions for benchmark use.
-- **Deterministic default planner.** Active disagreement/information-gain
-  selection (Issues #10–#11) is not implemented. Swap in an `ExperimentPlanner`
-  via the constructor.
+- **Deterministic default planner.** The default remains deterministic order.
+  Active disagreement selection (Issue #10) is available by passing
+  `ExperimentSelectionPlanner` via the constructor; information-gain selection
+  (#11) is still deferred. In strict mode the selector needs at least two
+  successfully fitted hypotheses, so an active run should start with enough
+  initial observations; otherwise it reports `INSUFFICIENT_HYPOTHESES`, records
+  `EXPERIMENT_SELECTION_UNAVAILABLE`, and terminates without an oracle call.
 - **Single domain shape.** The loop is numeric 1-D: one input variable from
   `NumericalDomainBounds` and the model family's scalar output. Multi-output
   and multi-variable domains are out of scope.
