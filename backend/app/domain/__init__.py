@@ -112,6 +112,27 @@ from .discovery_contracts import (
     StoppingCriteriaConfig,
 )
 from .discovery_engine import DiscoveryEngine
+from .selection_contracts import (
+    SELECTION_VERSION,
+    TIE_BREAK_POLICY,
+    UNCERTAINTY_UNAVAILABLE_REASON,
+    CandidateScoringStatus,
+    CandidateSelectionDiagnostics,
+    DisagreementMetric,
+    ExperimentSelectionConfig,
+    ExperimentSelectionResult,
+    SelectionFallback,
+    SelectionReason,
+    SelectionStatus,
+    SelectionStrategy,
+    experiment_order_key,
+)
+from .experiment_selection import (
+    ActiveExperimentSelector,
+    ExperimentSelectionPlanner,
+    RandomBaselinePlanner,
+    compute_disagreement,
+)
 
 __all__ = [
     "StructuredError",
@@ -208,4 +229,22 @@ __all__ = [
     "ExperimentPlanner",
     "DeterministicOrderPlanner",
     "DISCOVERY_ENGINE_VERSION",
+    # Issue #10: active experiment selection
+    "SELECTION_VERSION",
+    "TIE_BREAK_POLICY",
+    "UNCERTAINTY_UNAVAILABLE_REASON",
+    "SelectionStrategy",
+    "DisagreementMetric",
+    "SelectionFallback",
+    "SelectionStatus",
+    "SelectionReason",
+    "CandidateScoringStatus",
+    "experiment_order_key",
+    "ExperimentSelectionConfig",
+    "CandidateSelectionDiagnostics",
+    "ExperimentSelectionResult",
+    "compute_disagreement",
+    "ActiveExperimentSelector",
+    "ExperimentSelectionPlanner",
+    "RandomBaselinePlanner",
 ]

@@ -230,12 +230,30 @@ Each entry is marked **Confirmed**, **Provisional**, or **Open**. Provisional di
 
 **Validation:** `backend/tests/test_discovery_loop.py::test_terminal_observation_snapshots_reject_nested_mutation`; [discovery-loop.md](discovery-loop.md) section 8; [contracts.md](contracts.md) section 7.5.
 
+## D-021 — Disagreement-driven selection with an unavailable uncertainty signal
+
+**Status:** Confirmed (Issue #10)
+
+**Decision:** The first active selector scores each valid candidate by the spread of eligible hypotheses' finite scalar predictions and chooses the maximum. Population variance is the default metric (divides by `n`); sample variance (`n - 1`) and maximum spread are supported and named explicitly. Prediction values are scaled before squaring so large finite inputs cannot overflow intermediate sums; an unrepresentable final score is reported as `DISAGREEMENT_OVERFLOW`, never as zero or infinity. Scores are never normalized across the pool, and an all-zero pool returns `ZERO_DISAGREEMENT_POOL` instead of manufacturing informativeness.
+
+Eligibility uses ranking `CONTRADICTED`/`UNEVALUABLE` exclusion plus evaluation/fitted-specification availability. Fitted specifications are used whenever at least `min_eligible_hypotheses` valid fits exist. The hypotheses' own validated candidate specifications are used only through the explicit `allow_candidate_specifications` opt-in, and then for the whole decision; fitted and unfitted predictions are never mixed. Ties are broken by canonical input key then candidate ID, making the result independent of batch order. Previously queried inputs are excluded under pure absolute tolerance. A `random_baseline` strategy uses a local seeded `random.Random` over the same valid pool and never consults disagreement. Structured diagnostics are stored in `ExperimentExecutionRecord.selection_diagnostics` through an optional planner method, while `select_experiment(...) -> Optional[CandidateExperiment]` remains unchanged.
+
+Uncertainty is reported unavailable. The fit/evaluation contracts expose no validated prediction covariance, residual variance, or interval, so no polynomial variance, covariance matrix, or calibrated probability is invented, and `uncertainty_weight` must remain `0.0`.
+
+**Rationale:** Prediction disagreement is directly measurable from permitted discovery data, is deterministic, and has an interpretable formula. Population variance is the simplest documented convention and avoids the `n = 1` undefined case (a minimum of two hypotheses is enforced). Refusing to normalize an uninformative pool and refusing to invent uncertainty prevents a selection score from looking like evidence it is not. A backward-compatible planner adapter preserves every Issue #8 consumer while exposing reproducible decisions.
+
+**Trade-off:** The score is output-scale sensitive and greedy over one generated batch; it is not information gain or success probability. Strict fitted mode requires at least two successful fits, so active runs need enough initial observations or an explicit candidate-specification opt-in. Training-only evaluation in the engine (Issue #8) means the fitted source reflects training fits only. The random baseline is a benchmark control, not a claim of inferiority or superiority.
+
+**Rejected alternatives:** Normalizing scores per pool (turns zero disagreement into artificial spread); treating disagreement variance as calibrated uncertainty (unsupported by any fit contract); deriving polynomial prediction variance without covariance/residual metadata (would invent statistical assumptions); silently falling back to random or sequential selection (misreports the strategy); changing `select_experiment` to return a result object (breaks existing planners and callers); seeding from global `random` state (not reproducible or isolated).
+
+**Validation:** `backend/tests/test_experiment_selection.py` (metrics, discriminative selection, ties and order reversal, duplicates, fallback, eligibility, strict/opt-in sources, seeded baseline, planner compatibility, engine integration, frozen diagnostics, ground-truth isolation); [experiment-selection.md](experiment-selection.md); [contracts.md](contracts.md) §8; [discovery-loop.md](discovery-loop.md) §6.
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
 2. First deterministic oracle input domain/output type.
 3. ~~Candidate fitting objective.~~ Resolved for the polynomial family by D-015. Ranking formula remains open; complexity proxy is `degree + 1` (D-013).
-4. Disagreement and uncertainty score.
+4. ~~Disagreement and uncertainty score.~~ Resolved for the first implementation by D-021 (population variance default, sample variance/max spread supported, uncertainty unavailable).
 5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
 6. MySQL library/ORM and migration tool.
 7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019; run-level cancellation and durable recovery remain open for the API/persistence layer.
