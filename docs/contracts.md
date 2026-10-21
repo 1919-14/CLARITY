@@ -915,10 +915,13 @@ configuration, and re-runs `verify_no_ground_truth_leakage`.
 ### 8.2 Supported disagreement metrics
 Population variance (default, divides by `n`), sample variance (divides by
 `n - 1`), and peak-to-peak maximum spread, over finite scalar predictions from
-eligible hypotheses. Scores are raw and pool-normalization is never applied: an
-all-zero pool returns `zero_disagreement_pool` rather than manufactured spread.
-An unrepresentable score is reported as `disagreement_overflow`, never as zero
-or infinity.
+eligible hypotheses. Variance is computed from centered deviations scaled by
+their own magnitude and rescaled with `math.frexp`/`math.ldexp`, avoiding both
+`scale * scale` overflow and precision loss for small relative spreads at large
+magnitudes. Scores are raw and pool-normalization is never applied: an all-zero
+pool returns `zero_disagreement_pool` rather than manufactured spread. A
+genuinely unrepresentable score is reported as `disagreement_overflow`, never as
+zero or infinity.
 
 ### 8.3 Eligibility and prediction source
 Ranking `CONTRADICTED`/`UNEVALUABLE` hypotheses and hypotheses missing from a
@@ -932,11 +935,14 @@ zero.
 
 ### 8.4 Determinism, duplicates, and the random baseline
 Ties are ordered by canonical input key then candidate ID; batch order cannot
-change the outcome. Committed inputs are excluded with pure absolute tolerance
-(`rel_tol=0.0`) when configured, for both strategies. `random_baseline` requires
-an integer seed, uses a local `random.Random`, and draws from the same valid
-pool without consulting disagreement. An explicit `sequential` fallback is the
-only fallback and is labelled `fallback_selected`.
+change the outcome. A committed input excludes a candidate only when both have
+identical input variable names and every numeric value satisfies pure absolute
+tolerance (`rel_tol=0.0`); boolean/string values must match exactly, and
+different or partially overlapping schemas are not duplicates. This applies to
+both strategies, and the engine's duplicate guard remains the final safety net.
+`random_baseline` requires an integer seed, uses a local `random.Random`, and
+draws from the same valid pool without consulting disagreement. An explicit
+`sequential` fallback is the only fallback and is labelled `fallback_selected`.
 
 ### 8.5 Uncertainty and isolation
 No fit/evaluation contract exposes a validated prediction-covariance,

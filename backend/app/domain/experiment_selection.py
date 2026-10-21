@@ -107,9 +107,14 @@ def compute_disagreement(
     never silently replaced with zero or infinity: an unrepresentable score is
     not evidence of an informative experiment.
 
-    Predictions are scaled by their largest magnitude before squaring so that
-    finite inputs near the float limit do not overflow intermediate sums. The
-    result is still checked for finiteness.
+    Deviations are taken from the first prediction, so squaring operates on
+    the spread rather than on the absolute output magnitude. The centered
+    deviations are then divided by their own largest magnitude, summed in that
+    safe range, and rescaled with ``math.frexp``/``math.ldexp`` instead of
+    multiplying by ``scale * scale``. This avoids both catastrophic cancellation
+    for small relative spreads at large magnitudes and overflowing intermediate
+    products when the true variance is representable. A true variance outside
+    the finite float range is reported as ``None``.
     """
     if not isinstance(metric, DisagreementMetric):
         raise ValueError("metric must be a DisagreementMetric.")
@@ -123,17 +128,27 @@ def compute_disagreement(
         spread = max(values) - min(values)
         return spread if math.isfinite(spread) else None
 
-    scale = max(abs(value) for value in values)
-    if scale == 0.0:
-        return 0.0
-
-    scaled = [value / scale for value in values]
-    count = len(scaled)
-    mean = math.fsum(scaled) / count
-    squared_sum = math.fsum((value - mean) ** 2 for value in scaled)
+    count = len(values)
     divisor = count if metric == DisagreementMetric.POPULATION_VARIANCE else count - 1
-    scaled_variance = squared_sum / divisor
-    variance = scaled_variance * scale * scale
+    try:
+        reference = values[0]
+        deviations = [value - reference for value in values]
+        if not all(math.isfinite(deviation) for deviation in deviations):
+            return None
+        mean_deviation = math.fsum(deviations) / count
+        centered = [deviation - mean_deviation for deviation in deviations]
+        if not all(math.isfinite(value) for value in centered):
+            return None
+        scale = max(abs(value) for value in centered)
+        if scale == 0.0:
+            return 0.0
+        scaled_sum = math.fsum((value / scale) ** 2 for value in centered)
+        scaled_variance = scaled_sum / divisor
+        mantissa, exponent = math.frexp(scale)
+        coefficient = scaled_variance * mantissa * mantissa
+        variance = math.ldexp(coefficient, 2 * exponent)
+    except OverflowError:
+        return None
     return variance if math.isfinite(variance) else None
 
 
@@ -179,45 +194,58 @@ def _is_previously_queried(
     observations: Sequence[Observation],
     tolerance: float,
 ) -> bool:
-    """Match the engine's pure absolute-tolerance duplicate semantics.
+    """Match the engine's pure absolute-tolerance duplicate semantics safely.
 
-    The engine compares the configured domain variable. The selector is
-    domain-agnostic, so it compares every common numeric input variable with the
-    same ``rel_tol=0.0`` absolute tolerance. For the supported 1-D domain the two
-    checks are identical. Candidate input IDs are never used: duplicate identity
-    is scientific (input values), not bookkeeping.
+    A candidate is a duplicate only when it has **exactly the same input variable
+    names** as a committed observation. Every numeric value must then satisfy
+    ``math.isclose(rel_tol=0.0, abs_tol=tolerance)``; boolean and string values
+    must match exactly, and any other pairing is treated as non-duplicate.
+
+    Requiring a compatible schema means a shared ``x`` alone never excludes a
+    candidate that also carries, or lacks, other variables. The selector's
+    supported prediction contract is the scalar numerical 1-D domain; this
+    conservative rule keeps multidimensional or mixed payloads from being
+    silently misclassified. Candidate input IDs are never used: duplicate
+    identity is scientific (input values), not bookkeeping. The discovery
+    engine's duplicate-query guard remains the final safety net.
     """
     for observation in observations:
         existing = observation.input_values
         if not isinstance(existing, Mapping):
             continue
-        common = set(input_values).intersection(existing)
-        if not common:
+        if set(input_values) != set(existing):
             continue
         matches = True
-        for name in common:
-            candidate_value = input_values.get(name)
-            existing_value = existing.get(name)
-            if isinstance(candidate_value, bool) or not isinstance(
-                candidate_value, (int, float)
-            ):
-                matches = False
-                break
-            if isinstance(existing_value, bool) or not isinstance(
-                existing_value, (int, float)
-            ):
-                matches = False
-                break
-            try:
-                if not math.isclose(
-                    float(candidate_value),
-                    float(existing_value),
-                    rel_tol=0.0,
-                    abs_tol=tolerance,
-                ):
+        for name, candidate_value in input_values.items():
+            existing_value = existing[name]
+            candidate_is_number = isinstance(candidate_value, (int, float)) and not isinstance(
+                candidate_value, bool
+            )
+            existing_is_number = isinstance(existing_value, (int, float)) and not isinstance(
+                existing_value, bool
+            )
+            if candidate_is_number and existing_is_number:
+                try:
+                    if not math.isclose(
+                        float(candidate_value),
+                        float(existing_value),
+                        rel_tol=0.0,
+                        abs_tol=tolerance,
+                    ):
+                        matches = False
+                        break
+                except OverflowError:
                     matches = False
                     break
-            except OverflowError:
+            elif isinstance(candidate_value, bool) and isinstance(existing_value, bool):
+                if candidate_value != existing_value:
+                    matches = False
+                    break
+            elif isinstance(candidate_value, str) and isinstance(existing_value, str):
+                if candidate_value != existing_value:
+                    matches = False
+                    break
+            else:
                 matches = False
                 break
         if matches:

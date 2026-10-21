@@ -126,9 +126,13 @@ predictions of the `n` eligible hypotheses, `p_bar = (1/n) sum p_i`.
 
 The sample-versus-population convention is explicit in the metric name and in
 `compute_disagreement`'s docs; there is no hidden default other than population
-variance. Values are scaled by their largest magnitude before squaring, so large
-finite predictions do not overflow intermediate sums. If the final score is
-still not finite, the candidate is reported as
+variance. The implementation takes deviations from the first prediction, so the
+squared quantities are the spread rather than the absolute output magnitude.
+Centered deviations are scaled by their own largest magnitude and the final
+rescale uses `math.frexp`/`math.ldexp` decomposition instead of
+`scale * scale`. This both preserves representable small relative spreads at
+large magnitudes (where direct squaring loses precision or overflows an
+intermediate) and still reports genuinely unrepresentable variances as
 `DISAGREEMENT_OVERFLOW` with `disagreement_score=None`; it is never treated as
 zero or infinity in the ranking.
 
@@ -151,10 +155,16 @@ zero.
 
 Candidates not marked `ELIGIBLE` by the Issue #9 contract are excluded with
 `candidate_not_eligible`; a rejected candidate is never selected. When
-`exclude_queried_inputs=True`, each candidate input is compared to committed
-observation inputs with the same pure absolute tolerance used by the engine
-(`rel_tol=0.0`, `abs_tol=exclusion_tolerance`). The comparison uses input values,
-not generated input IDs, and is applied identically to both strategies.
+`exclude_queried_inputs=True`, a candidate is treated as previously queried only
+when its **input variable names exactly match** a committed observation's names.
+Every numeric value must then satisfy the pure absolute tolerance used by the
+engine (`rel_tol=0.0`, `abs_tol=exclusion_tolerance`); boolean and string values
+must match exactly. Candidates with different or partially overlapping schemas
+are never excluded merely because a shared `x` matches. This keeps the supported
+scalar 1-D contract safe for mixed payloads; multidimensional or mixed schemas
+are not silently collapsed into a duplicate. The comparison uses input values,
+not generated input IDs, is applied identically to both strategies, and the
+discovery engine's duplicate-query guard remains the final safety net.
 
 | Status | Reason code | Selected? |
 | --- | --- | --- |
@@ -309,12 +319,15 @@ python -m pytest -q                                      # full backend regressi
 ```
 
 The focused suite covers the metric formulas (population/sample/peak-to-peak),
-the agree/disagree synthetic case, negative and fractional predictions, extreme
-finite overflow, non-finite predictions (asserted **not** zero-filled), malformed
+the agree/disagree synthetic case, negative and fractional predictions,
+large-magnitude predictions whose representable variance would be lost by a
+naive `scale * scale` computation, genuinely unrepresentable variance,
+non-finite predictions (asserted **not** zero-filled), malformed
 specifications, insufficient hypotheses, deterministic ties and batch-order
-reversal, empty and rejected pools, duplicate tolerance and disabling, explicit
-fallback, rank-based eligibility, strict versus opted-in prediction sources,
-seeded random draws, shared valid pools, planner compatibility, engine
+reversal, empty and rejected pools, duplicate tolerance and disabling,
+identical/partially overlapping input schemas, non-numeric duplicate values,
+explicit fallback, rank-based eligibility, strict versus opted-in prediction
+sources, seeded random draws, shared valid pools, planner compatibility, engine
 integration, frozen diagnostics, and ground-truth isolation.
 
 The engine integration test runs a real discovery loop with
@@ -339,6 +352,10 @@ query-efficiency benchmark has been run yet.
   unavailable (§8).
 - **Raw scale-sensitive variance.** Comparison across different output scales or
   metrics is not meaningful; no pool normalization is applied.
+- **Strict duplicate schemas.** Duplicate detection requires identical input
+  variable names and compares every value; a candidate with extra or missing
+  variables is not considered previously queried by the selector. The engine's
+  own duplicate guard still applies before an oracle call.
 - **One-step greedy choice.** The selector scores the generated batch once per
   iteration; it does not look ahead over future queries.
 - **Ranking dependency.** A supplied ranking is authoritative for

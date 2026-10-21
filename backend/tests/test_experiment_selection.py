@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import random
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -140,6 +141,17 @@ def make_candidate(
         candidate_id=candidate_id or f"cand-exp-{x}",
         input_data=ExperimentInput(values={"x": float(x)}),
         status=status,
+    )
+
+
+def make_candidate_values(
+    values: Dict[str, Any],
+    *,
+    candidate_id: str = "cand-exp-multi",
+) -> CandidateExperiment:
+    return CandidateExperiment(
+        candidate_id=candidate_id,
+        input_data=ExperimentInput(values=values),
     )
 
 
@@ -310,6 +322,39 @@ def test_max_spread_metric_is_peak_to_peak_difference():
     assert result.candidates[0].disagreement_score == pytest.approx(2.0)
 
 
+def test_large_finite_predictions_keep_a_representable_variance():
+    # ``scale * scale`` overflows for this magnitude, but the true variance is
+    # finite (~9e287). The exponent-based rescaling must not lose it.
+    base = 1e160
+    neighbor = math.nextafter(base, math.inf)
+    assert math.isinf(base * base)
+
+    difference = neighbor - base
+    population = difference * difference / 4.0
+    sample = difference * difference / 2.0
+    assert math.isfinite(population) and population > 1e280
+
+    assert compute_disagreement([base, neighbor]) == pytest.approx(
+        population, rel=1e-12
+    )
+    assert compute_disagreement(
+        [base, neighbor], DisagreementMetric.SAMPLE_VARIANCE
+    ) == pytest.approx(sample, rel=1e-12)
+
+
+def test_genuinely_unrepresentable_variance_is_still_reported_as_overflow():
+    huge = math.nextafter(1e308, math.inf)
+    assert compute_disagreement([huge, -1e308]) is None
+    assert compute_disagreement([huge, -1e308], DisagreementMetric.SAMPLE_VARIANCE) is None
+    result = select(
+        candidate_source_selector(),
+        [make_hypothesis("h1", [1e308]), make_hypothesis("h2", [-1e308])],
+        {},
+        make_batch([make_candidate(0.0)]),
+    )
+    assert result.reason_code == SelectionReason.DISAGREEMENT_OVERFLOW
+
+
 def test_negative_and_fractional_predictions_use_population_variance():
     hypotheses = [make_hypothesis("h1", [-1.5]), make_hypothesis("h2", [0.5])]
     result = select(candidate_source_selector(), hypotheses, {}, make_batch([make_candidate(0.0)]))
@@ -454,6 +499,100 @@ def test_previously_queried_inputs_are_excluded_within_tolerance():
 
     assert result.selected_input_values == {"x": 2.0}
     assert result.excluded_candidates == {"cand-exp-1.0": CANDIDATE_REASON_PREVIOUSLY_QUERIED}
+
+
+def test_duplicate_detection_requires_identical_input_schema():
+    hypotheses = two_competing_hypotheses()
+    batch = make_batch([make_candidate(2.0)])
+    extra_variable_observation = Observation(
+        observation_id="obs-extra",
+        input_id="inp-extra",
+        input_values={"x": 2.0, "z": 1.0},
+        output_values={"y": 0.0},
+    )
+    result = select(
+        candidate_source_selector(),
+        hypotheses,
+        {},
+        batch,
+        [extra_variable_observation],
+    )
+    # A shared x is not enough: the candidate has a different schema.
+    assert result.status == SelectionStatus.SELECTED
+    assert result.selected_input_values == {"x": 2.0}
+    assert result.excluded_candidates == {}
+
+
+def test_partially_overlapping_input_keys_are_not_duplicates():
+    hypotheses = two_competing_hypotheses()
+    candidate = make_candidate_values({"x": 2.0, "z": 9.0})
+    result = select(
+        candidate_source_selector(),
+        hypotheses,
+        {},
+        make_batch([candidate]),
+        [make_observation(2.0)],  # only x
+    )
+    assert result.status == SelectionStatus.SELECTED
+    assert result.selected_candidate_id == "cand-exp-multi"
+    assert result.excluded_candidates == {}
+
+
+def test_multi_key_duplicate_requires_every_value_within_tolerance():
+    hypotheses = two_competing_hypotheses()
+    candidate = make_candidate_values({"x": 2.0, "z": 10.0})
+    near = Observation(
+        observation_id="obs-near",
+        input_id="inp-near",
+        input_values={"x": 2.0 + 5e-6, "z": 10.0 - 4e-6},
+        output_values={"y": 0.0},
+    )
+    far = Observation(
+        observation_id="obs-far",
+        input_id="inp-far",
+        input_values={"x": 2.0 + 5e-6, "z": 10.0 - 2e-5},
+        output_values={"y": 0.0},
+    )
+    excluded = select(
+        candidate_source_selector(), hypotheses, {}, make_batch([candidate]), [near]
+    )
+    assert excluded.reason_code == SelectionReason.ALL_CANDIDATES_PREVIOUSLY_QUERIED
+    assert excluded.excluded_candidates == {
+        "cand-exp-multi": CANDIDATE_REASON_PREVIOUSLY_QUERIED
+    }
+
+    kept = select(
+        candidate_source_selector(), hypotheses, {}, make_batch([candidate]), [far]
+    )
+    assert kept.status == SelectionStatus.SELECTED
+    assert kept.excluded_candidates == {}
+
+
+def test_non_numeric_values_require_exact_equality_for_duplicates():
+    hypotheses = two_competing_hypotheses()
+    candidate = make_candidate_values({"x": 2.0, "label": "a"})
+    same = Observation(
+        observation_id="obs-same",
+        input_id="inp-same",
+        input_values={"x": 2.0, "label": "a"},
+        output_values={"y": 0.0},
+    )
+    different = Observation(
+        observation_id="obs-different",
+        input_id="inp-different",
+        input_values={"x": 2.0, "label": "b"},
+        output_values={"y": 0.0},
+    )
+    excluded = select(
+        candidate_source_selector(), hypotheses, {}, make_batch([candidate]), [same]
+    )
+    assert excluded.reason_code == SelectionReason.ALL_CANDIDATES_PREVIOUSLY_QUERIED
+
+    kept = select(
+        candidate_source_selector(), hypotheses, {}, make_batch([candidate]), [different]
+    )
+    assert kept.status == SelectionStatus.SELECTED
+    assert kept.excluded_candidates == {}
 
 
 def test_duplicate_exclusion_is_disabled_only_by_explicit_configuration():
