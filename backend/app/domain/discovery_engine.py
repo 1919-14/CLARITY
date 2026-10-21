@@ -1123,10 +1123,13 @@ class DiscoveryEngine:
                     self._consecutive_failures += 1
                 if isinstance(exc, OracleQueryError):
                     cause = exc.error
+                    # Do not forward arbitrary oracle error details: the
+                    # adapter is an untrusted boundary and may include data
+                    # that must not enter discovery diagnostics.
                     error = make_structured_error(
                         ERROR_ORACLE_QUERY_FAILURE,
                         f"Oracle query failed ({cause.code}).",
-                        cause=cause.to_dict(),
+                        cause_code=cause.code,
                     )
                 else:
                     error = make_structured_error(
