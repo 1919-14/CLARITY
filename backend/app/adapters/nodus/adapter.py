@@ -231,6 +231,11 @@ class NodusExecutionAdapter:
             local_handlers or {}
         )
 
+    @property
+    def config(self) -> NodusConfig:
+        """The validated configuration this adapter was constructed with."""
+        return self._config
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -312,6 +317,122 @@ class NodusExecutionAdapter:
             message=f"Unhandled execution mode: {mode!r}",
         )
 
+    def execute_many(
+        self,
+        tasks: list[NodusTask],
+        max_concurrency: int = 1,
+    ) -> list[NodusResult]:
+        """Execute independent *tasks*, returning results in input order.
+
+        Remote mode configures the SDK's process-global default client once for
+        the batch and runs up to ``max_concurrency`` tasks concurrently. Each
+        task resolves the Function, spawns its own call, and keeps its own
+        provider ``FunctionCall`` handle, timeout, retry policy, and error
+        mapping, so one failure never discards or mutates another task's result.
+
+        The global client lock is held for the whole batch. That is required by
+        ``nodus-compute==1.0.27`` (one process-wide default client) and is what
+        makes concurrent execution safe: the client cannot be swapped or closed
+        while any batch task is in flight.
+
+        Mock/local modes run sequentially and never contact the platform.
+
+        Raises ``NodusConfigurationError`` for invalid arguments. Individual task
+        failures are returned as terminal ``NodusResult`` objects (never raised).
+        """
+        if isinstance(tasks, (str, bytes)) or not isinstance(tasks, list):
+            raise NodusConfigurationError(
+                NodusErrorCode.CONFIGURATION_ERROR,
+                message="execute_many requires a list of NodusTask instances.",
+            )
+        limit = _validate_concurrency(max_concurrency)
+        for task in tasks:
+            if not isinstance(task, NodusTask):
+                raise NodusConfigurationError(
+                    NodusErrorCode.CONFIGURATION_ERROR,
+                    message="execute_many requires a list of NodusTask instances.",
+                )
+        if not tasks:
+            return []
+
+        mode = self._config.execution_mode
+        if mode == ExecutionMode.REMOTE:
+            return self._remote_batch_execute(tasks, limit)
+        # Mock/local drivers are deterministic in-process work; running them
+        # concurrently would only add scheduling noise.
+        return [self.execute(task) for task in tasks]
+
+    def _remote_batch_execute(
+        self, tasks: list[NodusTask], max_concurrency: int
+    ) -> list[NodusResult]:
+        """Execute remote tasks under one client scope with bounded concurrency."""
+        nodus, nodus_errors = self._import_sdk()
+        results: list[NodusResult | None] = [None] * len(tasks)
+        with _nodus_client_context(nodus, self._client_kwargs()):
+            if max_concurrency == 1 or len(tasks) == 1:
+                for index, task in enumerate(tasks):
+                    results[index] = self._run_remote_task_sync(task, nodus, nodus_errors)
+                return [
+                    result
+                    if result is not None
+                    else _make_failed_result(
+                        tasks[index],
+                        {
+                            "code": NodusErrorCode.SDK_ERROR,
+                            "message": "No result was produced for this task.",
+                            "context": {},
+                        },
+                        mode=self._config.execution_mode,
+                    )
+                    for index, result in enumerate(results)
+                ]
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(max_concurrency, len(tasks))
+            ) as pool:
+                futures = {
+                    pool.submit(self._run_remote_task_sync, task, nodus, nodus_errors): index
+                    for index, task in enumerate(tasks)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    results[futures[future]] = future.result()
+        return [
+            result
+            if result is not None
+            else _make_failed_result(
+                tasks[index],
+                {
+                    "code": NodusErrorCode.SDK_ERROR,
+                    "message": "No result was produced for this task.",
+                    "context": {},
+                },
+                mode=self._config.execution_mode,
+            )
+            for index, result in enumerate(results)
+        ]
+
+    def _run_remote_task_sync(
+        self, task: NodusTask, nodus: Any, nodus_errors: Any
+    ) -> NodusResult:
+        """Run one task inside a batch worker thread.
+
+        The caller already owns the client scope, so this never acquires the
+        process-global lock (doing so from every thread would serialize the batch
+        and could deadlock against the batch owner).
+        """
+        try:
+            return _run_coroutine_sync(
+                self._execute_remote_in_scope(
+                    task, nodus, nodus_errors, cancel_on_timeout=True
+                )
+            )
+        except NodusAdapterError as exc:
+            return _make_failed_result(task, exc.to_safe_dict(), mode=self._config.execution_mode)
+        except Exception as exc:  # noqa: BLE001 - one task must not crash the batch
+            return _make_failed_result(
+                task, sanitize_sdk_error(exc), mode=self._config.execution_mode
+            )
+
     # ------------------------------------------------------------------
     # Remote execution
     # ------------------------------------------------------------------
@@ -338,6 +459,14 @@ class NodusExecutionAdapter:
         Lazy-imports ``nodus`` so that the module can be imported without
         the SDK installed.
         """
+        nodus, nodus_errors = self._import_sdk()
+        async with _nodus_client_context(nodus, self._client_kwargs()):
+            return await self._execute_remote_in_scope(
+                task, nodus, nodus_errors, cancel_on_timeout=False
+            )
+
+    def _import_sdk(self) -> tuple[Any, Any]:
+        """Lazy-import the SDK, surfacing a missing package as configuration error."""
         try:
             import nodus  # noqa: PLC0415 (lazy import by design)
             import nodus.errors as nodus_errors  # noqa: PLC0415
@@ -349,117 +478,141 @@ class NodusExecutionAdapter:
                     "Add nodus-compute==1.0.27 to requirements."
                 ),
             ) from exc
+        return nodus, nodus_errors
 
+    def _client_kwargs(self) -> dict[str, Any]:
         client_kwargs: dict[str, Any] = {
             "api_key": self._config.api_key,
             "project": self._config.project,
         }
         if self._config.base_url:
             client_kwargs["api_url"] = self._config.base_url
+        return client_kwargs
 
-        async with _nodus_client_context(nodus, client_kwargs):
-            submitted_at = datetime.now(timezone.utc)
+    async def _execute_remote_in_scope(
+        self,
+        task: NodusTask,
+        nodus: Any,
+        nodus_errors: Any,
+        *,
+        cancel_on_timeout: bool,
+    ) -> NodusResult:
+        """Run one remote task while the caller already owns the client scope.
 
-            # Phase 1 — resolve function and spawn (pre-submission, retryable)
-            try:
-                handle = await self._spawn_with_retries_async(task, nodus, nodus_errors)
-            except NodusAdapterError as exc:
-                completed_at = datetime.now(timezone.utc)
-                return _make_failed_result(task, exc.to_safe_dict(), mode=self._config.execution_mode)
+        The process-global default client must be configured by the caller (via
+        ``_nodus_client_context``) and must stay stable for the whole call.
+        """
+        submitted_at = datetime.now(timezone.utc)
 
-            if handle is None:
-                # All spawn retries exhausted
-                completed_at = datetime.now(timezone.utc)
-                return NodusResult(
-                    task_id=task.task_id,
-                    execution_mode=ExecutionMode.REMOTE.value,
-                    status="failed",
-                    error={
-                        "code": NodusErrorCode.RETRIES_EXHAUSTED,
-                        "message": "All pre-submission retry attempts were exhausted.",
-                        "context": {"max_retries": task.max_retries},
-                    },
-                    submitted_at=submitted_at,
-                    completed_at=completed_at,
-                    duration_seconds=(completed_at - submitted_at).total_seconds(),
-                )
-
-            # Extract provider call ID from handle before waiting on get()
-            provider_task_id: str | None = None
-            try:
-                raw_name = handle.name
-                if isinstance(raw_name, str) and raw_name:
-                    provider_task_id = raw_name
-            except Exception:  # noqa: BLE001
-                pass  # name is a best-effort attribute; never block on it
-
-            # Build tuple of timeout exceptions
-            timeout_exceptions: list[type[BaseException]] = [asyncio.TimeoutError, TimeoutError]
-            if hasattr(nodus_errors, "APITimeoutError"):
-                timeout_exceptions.append(nodus_errors.APITimeoutError)
-            timeout_types = tuple(set(timeout_exceptions))
-
-            # Phase 2 — wait for result (post-submission, NOT retried)
-            try:
-                raw_get = handle.get(timeout=self._config.timeout_seconds)
-                result_value = await _await_if_awaitable(raw_get)
-            except timeout_types:
-                completed_at = datetime.now(timezone.utc)
-                return NodusResult(
-                    task_id=task.task_id,
-                    execution_mode=ExecutionMode.REMOTE.value,
-                    status="timed_out",
-                    error={
-                        "code": NodusErrorCode.TIMEOUT,
-                        "message": "Task execution exceeded the configured timeout.",
-                        "context": {"timeout_seconds": self._config.timeout_seconds},
-                    },
-                    provider_task_id=provider_task_id,
-                    submitted_at=submitted_at,
-                    completed_at=completed_at,
-                    duration_seconds=(completed_at - submitted_at).total_seconds(),
-                )
-            except getattr(nodus_errors, "FunctionCallFailed", ()) as exc:
-                # Terminal: function ended without a result (deadline, OOM, crash, etc.)
-                completed_at = datetime.now(timezone.utc)
-                return NodusResult(
-                    task_id=task.task_id,
-                    execution_mode=ExecutionMode.REMOTE.value,
-                    status="failed",
-                    error={
-                        "code": NodusErrorCode.REMOTE_EXECUTION_FAILED,
-                        "message": "Remote function call ended without a result.",
-                        "context": {
-                            "sdk_exception_type": "FunctionCallFailed",
-                            "reason": getattr(exc, "reason", None),
-                        },
-                    },
-                    provider_task_id=provider_task_id,
-                    submitted_at=submitted_at,
-                    completed_at=completed_at,
-                    duration_seconds=(completed_at - submitted_at).total_seconds(),
-                )
-            except Exception as exc:  # noqa: BLE001 (broad catch at SDK boundary)
-                safe_error = sanitize_sdk_error(exc)
-                completed_at = datetime.now(timezone.utc)
-                return NodusResult(
-                    task_id=task.task_id,
-                    execution_mode=ExecutionMode.REMOTE.value,
-                    status="failed",
-                    error=safe_error,
-                    provider_task_id=provider_task_id,
-                    submitted_at=submitted_at,
-                    completed_at=completed_at,
-                    duration_seconds=(completed_at - submitted_at).total_seconds(),
-                )
-
+        # Phase 1 — resolve function and spawn (pre-submission, retryable)
+        try:
+            handle = await self._spawn_with_retries_async(task, nodus, nodus_errors)
+        except NodusAdapterError as exc:
             completed_at = datetime.now(timezone.utc)
-            try:
-                return self._normalize_function_result(
-                    task, result_value, provider_task_id, submitted_at, completed_at
-                )
-            except NodusAdapterError as exc:
-                return _make_failed_result(task, exc.to_safe_dict(), mode=self._config.execution_mode)
+            return _make_failed_result(task, exc.to_safe_dict(), mode=self._config.execution_mode)
+
+        if handle is None:
+            # All spawn retries exhausted
+            completed_at = datetime.now(timezone.utc)
+            return NodusResult(
+                task_id=task.task_id,
+                execution_mode=ExecutionMode.REMOTE.value,
+                status="failed",
+                error={
+                    "code": NodusErrorCode.RETRIES_EXHAUSTED,
+                    "message": "All pre-submission retry attempts were exhausted.",
+                    "context": {"max_retries": task.max_retries},
+                },
+                submitted_at=submitted_at,
+                completed_at=completed_at,
+                duration_seconds=(completed_at - submitted_at).total_seconds(),
+            )
+
+        # Extract provider call ID from handle before waiting on get()
+        provider_task_id: str | None = None
+        try:
+            raw_name = handle.name
+            if isinstance(raw_name, str) and raw_name:
+                provider_task_id = raw_name
+        except Exception:  # noqa: BLE001
+            pass  # name is a best-effort attribute; never block on it
+
+        # Build tuple of timeout exceptions
+        timeout_exceptions: list[type[BaseException]] = [asyncio.TimeoutError, TimeoutError]
+        if hasattr(nodus_errors, "APITimeoutError"):
+            timeout_exceptions.append(nodus_errors.APITimeoutError)
+        timeout_types = tuple(set(timeout_exceptions))
+
+        # Phase 2 — wait for result (post-submission, NOT retried)
+        try:
+            raw_get = handle.get(timeout=self._config.timeout_seconds)
+            result_value = await _await_if_awaitable(raw_get)
+        except timeout_types:
+            cancel_requested = False
+            if cancel_on_timeout:
+                cancel_requested = await _request_handle_cancel(handle)
+            completed_at = datetime.now(timezone.utc)
+            return NodusResult(
+                task_id=task.task_id,
+                execution_mode=ExecutionMode.REMOTE.value,
+                status="timed_out",
+                error={
+                    "code": NodusErrorCode.TIMEOUT,
+                    "message": "Task execution exceeded the configured timeout.",
+                    "context": {
+                        "timeout_seconds": self._config.timeout_seconds,
+                        # A cancel request is not confirmation that the remote
+                        # task stopped; it is recorded separately.
+                        "cancellation_requested": cancel_requested,
+                        "cancellation_confirmed": False,
+                    },
+                },
+                provider_task_id=provider_task_id,
+                submitted_at=submitted_at,
+                completed_at=completed_at,
+                duration_seconds=(completed_at - submitted_at).total_seconds(),
+            )
+        except getattr(nodus_errors, "FunctionCallFailed", ()) as exc:
+            # Terminal: function ended without a result (deadline, OOM, crash, etc.)
+            completed_at = datetime.now(timezone.utc)
+            return NodusResult(
+                task_id=task.task_id,
+                execution_mode=ExecutionMode.REMOTE.value,
+                status="failed",
+                error={
+                    "code": NodusErrorCode.REMOTE_EXECUTION_FAILED,
+                    "message": "Remote function call ended without a result.",
+                    "context": {
+                        "sdk_exception_type": "FunctionCallFailed",
+                        "reason": getattr(exc, "reason", None),
+                    },
+                },
+                provider_task_id=provider_task_id,
+                submitted_at=submitted_at,
+                completed_at=completed_at,
+                duration_seconds=(completed_at - submitted_at).total_seconds(),
+            )
+        except Exception as exc:  # noqa: BLE001 (broad catch at SDK boundary)
+            safe_error = sanitize_sdk_error(exc)
+            completed_at = datetime.now(timezone.utc)
+            return NodusResult(
+                task_id=task.task_id,
+                execution_mode=ExecutionMode.REMOTE.value,
+                status="failed",
+                error=safe_error,
+                provider_task_id=provider_task_id,
+                submitted_at=submitted_at,
+                completed_at=completed_at,
+                duration_seconds=(completed_at - submitted_at).total_seconds(),
+            )
+
+        completed_at = datetime.now(timezone.utc)
+        try:
+            return self._normalize_function_result(
+                task, result_value, provider_task_id, submitted_at, completed_at
+            )
+        except NodusAdapterError as exc:
+            return _make_failed_result(task, exc.to_safe_dict(), mode=self._config.execution_mode)
 
     def _spawn_with_retries(
         self,
@@ -674,6 +827,46 @@ class NodusExecutionAdapter:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_MAX_BATCH_CONCURRENCY = 32
+
+
+def _validate_concurrency(max_concurrency: Any) -> int:
+    """Validate a batch concurrency limit; bounds unbounded fan-out."""
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+        raise NodusConfigurationError(
+            NodusErrorCode.CONFIGURATION_ERROR,
+            message="max_concurrency must be an integer.",
+        )
+    if max_concurrency < 1 or max_concurrency > _MAX_BATCH_CONCURRENCY:
+        raise NodusConfigurationError(
+            NodusErrorCode.CONFIGURATION_ERROR,
+            message=(
+                f"max_concurrency must be between 1 and {_MAX_BATCH_CONCURRENCY}, "
+                f"got {max_concurrency}."
+            ),
+        )
+    return max_concurrency
+
+
+async def _request_handle_cancel(handle: Any) -> bool:
+    """Best-effort cancellation of a submitted call.
+
+    Returns True only when a cancel request was issued without raising. It does
+    not confirm that the remote task stopped; callers must not report it as
+    confirmed termination.
+    """
+    cancel = getattr(handle, "cancel", None)
+    if not callable(cancel):
+        return False
+    try:
+        outcome = cancel()
+        if inspect.isawaitable(outcome):
+            await outcome
+        return True
+    except Exception:  # noqa: BLE001 - cleanup must never mask the timeout
+        return False
+
 
 def _make_failed_result(
     task: NodusTask,

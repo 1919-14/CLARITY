@@ -143,6 +143,26 @@ function causes `handle.get()` to raise `nodus.errors.FunctionCallFailed`.
 
 ---
 
+## Batch Execution for Parallel Evaluation (Issue #13)
+
+`NodusExecutionAdapter.execute_many(tasks, max_concurrency=n)` executes
+independent tasks in one client scope:
+
+1. The process-global lock (`_NODUS_CLIENT_LOCK`) is acquired **once** for the
+   whole batch, so the SDK's single default client cannot be swapped or closed
+   while another task is in flight.
+2. Tasks run on a bounded thread pool (1–32). Each keeps its own
+   `FunctionCall` handle, timeout, and error mapping.
+3. Results are returned in input order; one failing task cannot discard another
+   task's result.
+4. A `get()` timeout records `cancellation_requested: true` and
+   `cancellation_confirmed: false` after a best-effort `handle.cancel()`. The
+   SDK does not confirm remote termination, so no result claims it.
+
+Mock/local modes run sequentially and never contact the platform. The parallel
+orchestration, retry policy, and result contracts are documented in
+[nodus-parallel.md](nodus-parallel.md).
+
 ## Execution Modes
 
 `NODUS_EXECUTION_MODE` must be set explicitly. There is no default — omitting
@@ -257,9 +277,14 @@ backend/app/adapters/nodus/
 ├── contracts.py      NodusTask, NodusResult, ExecutionMode, validate_json_payload
 ├── config.py         NodusConfig — loaded from env; api_key redacted from repr
 ├── errors.py         NodusErrorCode, sanitize_sdk_error, sanitize_result_error
-└── adapter.py        NodusExecutionAdapter — remote / local / mock drivers
+└── adapter.py        NodusExecutionAdapter — remote / local / mock drivers,
+                        execute_many batch path
 
-backend/app/nodus_smoke_test.py   Standalone remote smoke test
+backend/app/nodus_smoke_test.py            Standalone single-task remote smoke test
+backend/app/nodus_worker.py                Remote Function entry point
+                                           (`evaluate_candidate`, `smoke_test`)
+backend/app/nodus_parallel_smoke_test.py   Opt-in multi-task parallel smoke test
+backend/app/services/                      Parallel orchestration and task contract
 ```
 
 ### Key Invariants

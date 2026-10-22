@@ -285,13 +285,70 @@ Provider failures and empty rounds emit `SCIENTIST_FALLBACK`, record a non-succe
 
 **Validation:** `backend/tests/test_llm_scientist.py` (schema/domain/safety rejection, canonical dedupe, provider outcome taxonomy, bounded retries, secret hygiene, deterministic mode, pipeline integration, evidence feedback, fallback, suggestion routing, state immutability, isolation, reproducibility); `backend/benchmarks/llm_scientist_benchmark.py`; [llm-scientist.md](llm-scientist.md); [contracts.md](contracts.md) §9.
 
+## D-023 — Independent candidate evaluation runs in parallel through Nodus
+
+**Status:** Confirmed (Issue #13); live remote verification pending
+
+**Decision:** Candidate evaluations are orchestrated as independent tasks by
+`ParallelEvaluationRunner` (`backend/app/services/parallel_evaluation.py`) over
+the Issue #12 adapter. `NODUS_PARALLEL_EXECUTION_MODE` selects
+`local_sequential` or `nodus_parallel` explicitly and has no default.
+`nodus_parallel` requires the adapter to be in `nodus_remote` mode; any
+configuration, credential, deployment, or provider failure is reported as a
+structured failure and never falls back to local/mock execution. Both modes run
+the same serializable worker function
+(`services/evaluation_task_runtime.execute_evaluation_task_payload`), which
+reuses `EvaluationPipeline` without changing fitting or metrics.
+
+Adapter concurrency is a bounded thread pool inside one client scope.
+`NodusExecutionAdapter.execute_many` acquires the process-global client lock
+once, configures the SDK default client once, runs up to `max_concurrency`
+tasks, and restores the client once. The orchestrator owns retries (adapter
+`max_retries=0`) and retries only failures with no provider task ID and an
+explicitly retryable code. Aggregation is separate from submission and orders
+results by original request order, recording missing, duplicate, unexpected,
+and mismatched results explicitly. Failed or timed-out tasks produce no
+`EvaluationResult`; the discovery-facing pipeline maps them to
+`EvaluationResult(status=FAILED)` with no metrics.
+
+**Rationale:** Candidate evaluations are independent and dominated by fit/predict
+work, so they are the natural unit of parallelism. Reusing one payload/worker
+path in both modes makes sequential-versus-parallel comparison meaningful and
+gives the discovery loop an unchanged `evaluate_many` boundary. Refusing to fall
+back keeps the reported execution mode truthful.
+
+**Trade-off:** The pinned SDK exposes blocking wrappers and one process-global
+default client, so real concurrency uses threads and one batch-wide lock rather
+than `asyncio.gather`; a slow task occupies a thread for its duration. Retries
+before acceptance can re-run a call whose outcome was ambiguous, which is why
+post-acceptance failures (provider task ID present) are never retried. Local
+mode is sequential by design, so it is a correctness baseline, not a
+throughput baseline.
+
+**Rejected alternatives:** Silent fallback to local evaluation when remote is
+unavailable (misreports the execution mode); retrying after a handle exists
+(duplicate billable work); per-task client creation (concurrent swaps of the
+SDK's single default client); using the SDK's `.map()` fan-out (no per-call
+provider IDs for correlation); rewriting the discovery loop to be parallel-aware
+(unnecessary coupling); adding a queue/broker for one bounded batch.
+
+**Validation:** `backend/tests/test_nodus_parallel.py` (76 offline tests:
+configuration, payload/result round trips, identity, deterministic ordering,
+concurrency limits 1..4, failures/timeouts/malformed/missing/duplicate/
+unexpected results, bounded retries, cancellation, adapter batch scope,
+discovery integration, oracle non-duplication, strict JSON, secret hygiene);
+Issue #12 adapter suite (70 tests) and the full backend suite remain green.
+**Live remote smoke test and remote benchmark have not run — no Nodus credits or
+service access.** See [nodus-parallel.md](nodus-parallel.md) and
+[nodus-readiness.md](nodus-readiness.md).
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
 2. First deterministic oracle input domain/output type.
 3. ~~Candidate fitting objective.~~ Resolved for the polynomial family by D-015. Ranking formula remains open; complexity proxy is `degree + 1` (D-013).
 4. ~~Disagreement and uncertainty score.~~ Resolved for the first implementation by D-021 (population variance default, sample variance/max spread supported, uncertainty unavailable).
-5. Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.
+5. ~~Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.~~ Resolved by D-002 (SDK surface, pre-submission retry policy) and D-023 (batch concurrency, thread-based worker pool). Native per-call cost metadata and confirmed remote cancellation remain unavailable; live concurrency behaviour is pending verification.
 6. MySQL library/ORM and migration tool.
 7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019; run-level cancellation and durable recovery remain open for the API/persistence layer.
 8. Required report export formats.
