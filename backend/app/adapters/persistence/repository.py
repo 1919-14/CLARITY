@@ -40,8 +40,13 @@ class ClarityRepository:
     def get_run(self, run_id: str) -> Optional[RunModel]:
         return self.session.get(RunModel, run_id)
 
-    def list_runs(self, limit: int = 50, offset: int = 0) -> List[RunModel]:
-        stmt = select(RunModel).order_by(desc(RunModel.created_at)).limit(limit).offset(offset)
+    def list_runs(
+        self, limit: int = 50, offset: int = 0, status_filter: Optional[str] = None
+    ) -> List[RunModel]:
+        stmt = select(RunModel).order_by(desc(RunModel.created_at))
+        if status_filter:
+            stmt = stmt.where(RunModel.status == status_filter)
+        stmt = stmt.limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
 
     def update_run_status(
@@ -125,6 +130,9 @@ class ClarityRepository:
         self.session.add(observation)
         self.session.flush()
         return observation
+
+    def get_observation(self, observation_id: str) -> Optional[ObservationModel]:
+        return self.session.get(ObservationModel, observation_id)
 
     def list_observations_for_run(
         self,
