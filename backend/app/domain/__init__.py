@@ -155,8 +155,41 @@ from .llm_scientist import (
     render_system_prompt,
     render_user_prompt,
 )
+from .run_lifecycle import (
+    DuplicateExecutionError,
+    ErrorCategory,
+    InvalidStateTransitionError,
+    PERMITTED_TRANSITIONS,
+    RetryPolicy,
+    RunLifecycleError,
+    RunLifecycleManager,
+    RunLifecycleState,
+    RunNotFoundError,
+    RunPhase,
+    RunProgress,
+    TERMINAL_STATES,
+    default_lifecycle_manager,
+    normalize_state,
+)
+from .run_orchestrator import RunOrchestrator
 
 __all__ = [
+    # Issue #20: Run lifecycle management
+    "RunLifecycleState",
+    "RunPhase",
+    "TERMINAL_STATES",
+    "PERMITTED_TRANSITIONS",
+    "RunLifecycleError",
+    "InvalidStateTransitionError",
+    "DuplicateExecutionError",
+    "RunNotFoundError",
+    "ErrorCategory",
+    "RetryPolicy",
+    "RunProgress",
+    "RunLifecycleManager",
+    "RunOrchestrator",
+    "default_lifecycle_manager",
+    "normalize_state",
     "StructuredError",
     "OracleQueryError",
     "ExperimentInput",

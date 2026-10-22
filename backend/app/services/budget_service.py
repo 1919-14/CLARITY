@@ -89,7 +89,10 @@ VALID_OUTCOMES = frozenset(
 
 TERMINAL_RUN_STATUSES = frozenset({"completed", "budget_exhausted", "cancelled", "failed", "stopped_by_budget"})
 
-RUNNING_RUN_STATUSES = frozenset({"pending", "running"})
+# ``queued`` is the canonical lifecycle state for a run that has been created but
+# not started (see ``RunLifecycleState``); it is still active for admission.
+RUNNING_RUN_STATUSES = frozenset({"pending", "queued", "running"})
+PROMOTABLE_RUN_STATUSES = frozenset({"pending", "queued"})
 
 DEFAULT_STALE_RESERVATION_SECONDS = 900
 
@@ -305,7 +308,7 @@ def _start_run_clock(
     """Lazily start the run's clock when its first unit of work is admitted."""
     if run.started_at is None:
         run.started_at = now
-        if run.status == "pending":
+        if run.status in PROMOTABLE_RUN_STATUSES:
             run.status = "running"
     if run.deadline_at is None:
         started = _as_utc(run.started_at) or now

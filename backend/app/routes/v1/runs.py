@@ -4,16 +4,20 @@ Endpoints:
   POST   /api/v1/runs                      Create a new discovery run
   GET    /api/v1/runs                      List runs with pagination and status filter
   GET    /api/v1/runs/<run_id>             Retrieve a specific discovery run
+  GET    /api/v1/runs/<run_id>/status      Live lifecycle progress snapshot
   GET    /api/v1/runs/<run_id>/metrics     Usage, budget, and cost metrics
+  GET    /api/v1/runs/<run_id>/budget      Per-run budget status contract
   GET    /api/v1/runs/<run_id>/report      Scientific summary report
   GET    /api/v1/runs/<run_id>/benchmarks  Benchmark comparison results
   GET    /api/v1/runs/<run_id>/observations Observations with pagination
   GET    /api/v1/runs/<run_id>/hypotheses  Hypotheses for a run
   POST   /api/v1/runs/<run_id>/hypotheses  Propose a researcher hypothesis
-  POST   /api/v1/runs/<run_id>/cancel      Cancel an active run
+  POST   /api/v1/runs/<run_id>/start       Start execution of a queued run
+  POST   /api/v1/runs/<run_id>/cancel      Cancel an active or queued run
 
 Route handlers are intentionally thin. Persistence operations are
-delegated to ClarityRepository; no business logic lives here.
+delegated to ClarityRepository; lifecycle transitions are delegated to
+RunLifecycleManager. No business logic lives here.
 """
 
 import uuid
@@ -27,6 +31,14 @@ from ...domain.budget_contracts import (
     BudgetValidationError,
     RunBudgetConfig,
 )
+from ...domain.run_lifecycle import (
+    DuplicateExecutionError,
+    InvalidStateTransitionError,
+    RunLifecycleManager,
+    RunLifecycleState,
+    RunNotFoundError,
+    default_lifecycle_manager,
+)
 from ...services.budget_service import (
     get_budget_status,
     persist_exhaustion,
@@ -38,8 +50,6 @@ from ...services.hypothesis_service import (
 )
 from ...services.run_service import (
     RunConflictError,
-    RunNotFoundError,
-    cancel_run_service,
     create_run_service,
 )
 from .shared import (
@@ -57,9 +67,21 @@ runs_v1_bp = Blueprint("runs_v1", __name__)
 
 # Valid values enforced at this boundary
 _VALID_EXECUTION_MODES = {"local", "nodus_remote", "mock"}
-_VALID_RUN_STATUSES = {"pending", "running", "completed", "cancelled", "failed", "budget_exhausted"}
+_VALID_RUN_STATUSES = {
+    "pending", "queued", "running", "cancelling",
+    "completed", "cancelled", "failed",
+    "budget_exhausted", "stopped_by_budget",
+}
 _MAX_PAGE_SIZE = 200
 _DEFAULT_PAGE_SIZE = 50
+
+
+def _lifecycle_manager() -> RunLifecycleManager:
+    """Return the application-scoped lifecycle manager.
+
+    Allows tests to substitute a custom instance via Flask app config.
+    """
+    return current_app.config.get("LIFECYCLE_MANAGER", default_lifecycle_manager)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +213,25 @@ def create_run():
                 run_id=run_id,
                 budget=budget_config,
             )
+
+            # Register the newly persisted run with the lifecycle manager. The
+            # manager also normalizes the persisted status to QUEUED. Registration
+            # is compensated on failure so a half-initialized run cannot linger in
+            # the in-memory registry after the session rolls back.
+            mgr = _lifecycle_manager()
+            try:
+                mgr.initialize_run(
+                    run_id=run_id,
+                    name=name.strip(),
+                    max_queries=run.max_queries,
+                    max_evaluations=run.max_evaluations,
+                    domain=domain.strip(),
+                    session=session,
+                )
+            except Exception:
+                mgr.deregister_run(run_id)
+                raise
+
             serialized = serialize_run(run)
     except RunConflictError as exc:
         return error_response(str(exc), 409)
@@ -258,11 +299,33 @@ def get_run(run_id: str):
     return jsonify({"run": serialized}), 200
 
 
+@runs_v1_bp.route("/runs/<run_id>/status", methods=["GET"])
+def get_run_status(run_id: str):
+    """GET /api/v1/runs/<run_id>/status — Live lifecycle progress snapshot.
+
+    Returns real counters (queries used, evaluations completed, elapsed time).
+    Never fabricates percentage completion when total work is unknown.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            # Hydrate from DB if not in memory (e.g. after restart)
+            progress = _lifecycle_manager().get_progress(run_id, session=session)
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_status error", exc)
+        return error_response("An internal error occurred while retrieving run status.", 500)
+
+    return jsonify({"status": progress.to_dict()}), 200
+
+
 @runs_v1_bp.route("/runs/<run_id>/cancel", methods=["POST"])
 def cancel_run(run_id: str):
     """POST /api/v1/runs/<run_id>/cancel — Cancel a pending or running discovery run.
 
-    Returns 409 if the run is already in a terminal state.
+    Delegates state validation to RunLifecycleManager so that only
+    valid state transitions are allowed. Returns 409 for terminal runs.
     """
     reason = "Cancelled by researcher"
     if request.is_json:
@@ -275,21 +338,75 @@ def cancel_run(run_id: str):
     db = _get_db()
     try:
         with db.session_scope() as session:
-            run = cancel_run_service(
-                session=session,
-                run_id=run_id,
-                stop_reason=reason,
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            # Lifecycle manager enforces terminal-state guard and state machine
+            progress = _lifecycle_manager().request_cancellation(
+                run_id, reason=reason, session=session
             )
+
+            # Reload serialized view after lifecycle manager updated the model
+            run = repo.get_run(run_id)
             serialized = serialize_run(run)
-    except RunNotFoundError as exc:
-        return error_response(str(exc), 404)
-    except RunConflictError as exc:
-        return error_response(str(exc), 409)
+    except InvalidStateTransitionError:
+        return error_response(
+            f"Run '{run_id}' is already in a terminal state and cannot be cancelled.",
+            409,
+        )
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("cancel_run db error", exc)
         return error_response("An internal error occurred while cancelling the run.", 500)
 
-    return jsonify({"run": serialized, "message": "Run cancelled successfully."}), 200
+    if progress.status == RunLifecycleState.CANCELLING:
+        return jsonify({
+            "run": serialized,
+            "status": progress.to_dict(),
+            "message": "Run cancellation requested. Shutdown of in-flight work is in progress.",
+        }), 202
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "message": "Run cancelled successfully.",
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/start", methods=["POST"])
+def start_run(run_id: str):
+    """POST /api/v1/runs/<run_id>/start — Start execution of a queued discovery run.
+
+    Transitions run to RUNNING and connects to the orchestration service.
+    Returns 409 if already running or terminal.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            progress = _lifecycle_manager().start_run(run_id, session=session)
+            run = repo.get_run(run_id)
+            serialized = serialize_run(run)
+    except (DuplicateExecutionError, InvalidStateTransitionError) as exc:
+        return error_response(str(exc), 409)
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("start_run db error", exc)
+        return error_response("An internal error occurred while starting the run.", 500)
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "message": "Run execution started successfully.",
+    }), 200
 
 
 @runs_v1_bp.route("/runs/<run_id>/metrics", methods=["GET"])
