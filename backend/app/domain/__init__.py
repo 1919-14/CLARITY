@@ -171,6 +171,7 @@ from .run_lifecycle import (
     default_lifecycle_manager,
     normalize_state,
 )
+from .run_orchestrator import RunOrchestrator
 
 __all__ = [
     # Issue #20: Run lifecycle management
@@ -186,6 +187,7 @@ __all__ = [
     "RetryPolicy",
     "RunProgress",
     "RunLifecycleManager",
+    "RunOrchestrator",
     "default_lifecycle_manager",
     "normalize_state",
     "StructuredError",

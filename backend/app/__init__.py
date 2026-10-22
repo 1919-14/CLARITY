@@ -8,11 +8,14 @@ def create_app(config_name=None):
     """Application factory for the CLARITY Flask backend."""
     app = Flask(__name__)
 
-    if config_name is None:
-        config_name = os.environ.get("FLASK_ENV", "development")
-
-    config_class = config_by_name.get(config_name, Config)
-    app.config.from_object(config_class)
+    if isinstance(config_name, dict):
+        app.config.from_object(Config)
+        app.config.update(config_name)
+    else:
+        if config_name is None:
+            config_name = os.environ.get("FLASK_ENV", "development")
+        config_class = config_by_name.get(config_name, Config)
+        app.config.from_object(config_class)
 
     # Fail safely in production if a secure SECRET_KEY and DATABASE_URL are not explicitly provided
     if config_name == "production":
@@ -82,5 +85,18 @@ def create_app(config_name=None):
             ),
             500,
         )
+
+    # Recover interrupted runs left in active state across restart
+    if app.config.get("RECOVER_ON_STARTUP", True) and not app.config.get("TESTING_SKIP_RECOVERY", False):
+        try:
+            from .adapters.persistence.database import get_db_manager
+            from .domain.run_lifecycle import default_lifecycle_manager
+            mgr = app.config.get("LIFECYCLE_MANAGER", default_lifecycle_manager)
+            db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+            db = get_db_manager(db_uri)
+            with db.session_scope() as session:
+                mgr.recover_interrupted_runs(session)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.warning("Could not execute restart recovery: %s", exc)
 
     return app

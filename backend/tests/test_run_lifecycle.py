@@ -1,4 +1,4 @@
-﻿"""Unit tests for the RunLifecycleManager domain service.
+"""Unit tests for the RunLifecycleManager domain service.
 
 Covers:
   - State machine: valid and invalid transitions
@@ -199,7 +199,20 @@ class TestCancelRun:
         m = _new_manager(); _init(m, "rc2")
         m.start_run("rc2")
         p = m.request_cancellation("rc2")
-        assert p.status == RunLifecycleState.CANCELLED
+        assert p.status == RunLifecycleState.CANCELLING
+        assert m.is_cancellation_requested("rc2") is True
+        p_final = m.confirm_cancellation("rc2")
+        assert p_final.status == RunLifecycleState.CANCELLED
+
+    def test_cancel_triggers_registered_hooks(self):
+        m = _new_manager(); _init(m, "rc-hook")
+        m.start_run("rc-hook")
+        hook_called = []
+        m.register_cancellation_hook("rc-hook", lambda r_id: hook_called.append(r_id))
+        p = m.request_cancellation("rc-hook")
+        assert p.status == RunLifecycleState.CANCELLING
+        assert hook_called == ["rc-hook"]
+        assert m.is_cancellation_requested("rc-hook") is True
 
     def test_cancel_already_terminal_raises(self):
         m = _new_manager(); _init(m, "rc3")
@@ -399,6 +412,38 @@ class TestThreadSafety:
         assert len(successes) == 1
         assert len(failures) == 9
 
+    def test_competing_start_and_cancel_thread_safety(self):
+        m = _new_manager(); _init(m, "rt-compete")
+        results = []
+
+        def do_start():
+            try:
+                p = m.start_run("rt-compete")
+                results.append(("start", p.status))
+            except Exception as e:
+                results.append(("start_exc", type(e).__name__))
+
+        def do_cancel():
+            try:
+                p = m.request_cancellation("rt-compete")
+                results.append(("cancel", p.status))
+            except Exception as e:
+                results.append(("cancel_exc", type(e).__name__))
+
+        t1 = threading.Thread(target=do_start)
+        t2 = threading.Thread(target=do_cancel)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        final_state = m.get_progress("rt-compete").status
+        assert final_state in {
+            RunLifecycleState.RUNNING,
+            RunLifecycleState.CANCELLING,
+            RunLifecycleState.CANCELLED,
+        }
+
 
 class TestPhaseUpdates:
     def test_transition_can_set_phase(self):
@@ -414,3 +459,269 @@ class TestPhaseUpdates:
     def test_cancellation_sets_terminated_phase(self):
         m = _new_manager(); _init(m, "rph4")
         assert m.request_cancellation("rph4").phase == RunPhase.TERMINATED
+
+
+class TestDurablePersistenceAndReload:
+    def test_progress_counters_and_activity_survive_restart(self):
+        from app.adapters.persistence.database import DatabaseManager
+        from app.adapters.persistence.models import RunModel
+        from app.adapters.persistence.repository import ClarityRepository
+
+        db = DatabaseManager("sqlite:///:memory:")
+        db.create_all_tables()
+
+        run_id = "run-persist-01"
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = RunModel(
+                run_id=run_id,
+                name="Persist Test",
+                domain="test",
+                status="running",
+                max_queries=100,
+                max_evaluations=200,
+            )
+            repo.create_run(run)
+
+        # Manager 1 starts and records progress
+        m1 = _new_manager()
+        m1.initialize_run(run_id, name="Persist Test", max_queries=100, max_evaluations=200)
+        with db.session_scope() as session:
+            m1.start_run(run_id, session=session)
+            m1.update_progress(
+                run_id,
+                queries_used=42,
+                evaluations_completed=17,
+                phase=RunPhase.EXPERIMENT_SELECTION,
+                activity="Selecting experiments",
+                session=session,
+            )
+
+        # Simulate process restart by creating brand new manager with empty memory
+        m2 = _new_manager()
+        assert run_id not in m2._progress_registry
+
+        # When accessed with session, it reconstructs real counters and activity from DB
+        with db.session_scope() as session:
+            prog = m2.get_progress(run_id, session=session)
+            assert prog.queries_used == 42
+            assert prog.evaluations_completed == 17
+            assert prog.phase == RunPhase.EXPERIMENT_SELECTION
+            assert prog.current_activity == "Selecting experiments"
+            assert prog.queries_remaining == 58
+
+    def test_failure_diagnostics_survive_restart(self):
+        from app.adapters.persistence.database import DatabaseManager
+        from app.adapters.persistence.models import RunModel
+        from app.adapters.persistence.repository import ClarityRepository
+
+        db = DatabaseManager("sqlite:///:memory:")
+        db.create_all_tables()
+
+        run_id = "run-persist-fail"
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = RunModel(run_id=run_id, name="Fail Persist", domain="test", status="running")
+            repo.create_run(run)
+
+        m1 = _new_manager()
+        m1.initialize_run(run_id, name="Fail Persist")
+        with db.session_scope() as session:
+            m1.fail_run(
+                run_id,
+                error="Node timeout failure",
+                failure_code="NODUS_TIMEOUT",
+                diagnostics={"node_id": "nodus-01", "secret_token": "leak"},
+                session=session,
+            )
+
+        # Brand new manager after restart
+        m2 = _new_manager()
+        with db.session_scope() as session:
+            prog = m2.get_progress(run_id, session=session)
+            assert prog.status == RunLifecycleState.FAILED
+            assert prog.failure_details is not None
+            assert prog.failure_details["error_code"] == "NODUS_TIMEOUT"
+            assert "secret_token" not in prog.failure_details
+
+
+class TestStartupRecovery:
+    def test_recover_interrupted_runs_marks_active_runs_failed(self):
+        from app.adapters.persistence.database import DatabaseManager
+        from app.adapters.persistence.models import RunModel
+        from app.adapters.persistence.repository import ClarityRepository
+
+        db = DatabaseManager("sqlite:///:memory:")
+        db.create_all_tables()
+
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            repo.create_run(RunModel(run_id="run-r1", name="Running Run", domain="test", status="running"))
+            repo.create_run(RunModel(run_id="run-c1", name="Cancelling Run", domain="test", status="cancelling"))
+            repo.create_run(RunModel(run_id="run-k1", name="Completed Run", domain="test", status="completed"))
+
+        m = _new_manager()
+        with db.session_scope() as session:
+            recovered = m.recover_interrupted_runs(session)
+            assert sorted(recovered) == ["run-c1", "run-r1"]
+
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            r1 = repo.get_run("run-r1")
+            c1 = repo.get_run("run-c1")
+            k1 = repo.get_run("run-k1")
+
+            assert r1.status == "failed"
+            assert "restart" in r1.stop_reason.lower()
+            assert c1.status == "failed"
+            assert k1.status == "completed"
+
+            # Check audit events recorded
+            events = repo.list_audit_events_for_run("run-r1")
+            failed_evts = [e for e in events if e.event_type == "RUN_FAILED"]
+            assert len(failed_evts) == 1
+            assert failed_evts[0].metadata_json["from_state"] == "running"
+
+    def test_startup_recovery_invoked_on_create_app(self, tmp_path):
+        from app import create_app
+        from app.adapters.persistence.database import DatabaseManager, reset_db_manager
+        from app.adapters.persistence.models import RunModel
+        from app.adapters.persistence.repository import ClarityRepository
+
+        db_path = tmp_path / "recovery_test.db"
+        db_uri = f"sqlite:///{db_path}"
+        reset_db_manager()
+        db = DatabaseManager(db_uri)
+        db.create_all_tables()
+
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            repo.create_run(RunModel(run_id="run-startup-1", name="Orphan", domain="test", status="running"))
+
+        # Boot app with recovery enabled
+        app = create_app({
+            "SQLALCHEMY_DATABASE_URI": db_uri,
+            "TESTING": True,
+            "RECOVER_ON_STARTUP": True,
+            "TESTING_SKIP_RECOVERY": False,
+        })
+
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run("run-startup-1")
+            assert run.status == "failed"
+            assert "restart" in run.stop_reason.lower()
+        reset_db_manager()
+
+
+class TestRunOrchestrator:
+    def test_orchestrator_successful_execution(self):
+        from unittest.mock import MagicMock
+        from app.domain.run_orchestrator import RunOrchestrator
+        from app.domain.discovery_contracts import (
+            DiscoveryLifecycleStatus,
+            DiscoveryRunResult,
+            DiscoveryTerminationReason,
+            QueryAccounting,
+        )
+
+        m = _new_manager(); _init(m, "orch-1", max_queries=10)
+        mock_result = MagicMock(spec=DiscoveryRunResult)
+        mock_result.status = DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION
+        mock_result.termination_reason = DiscoveryTerminationReason.STOPPING_CRITERION_PLAUSIBILITY_REACHED
+        mock_result.query_accounting = QueryAccounting(
+            max_query_budget=10,
+            attempted_queries=3,
+            successful_queries=3,
+            failed_queries=0,
+        )
+        mock_result.evaluations = ("eval1", "eval2")
+
+        mock_engine = MagicMock()
+        mock_engine.run.return_value = mock_result
+
+        orchestrator = RunOrchestrator(lifecycle_manager=m)
+        res = orchestrator.execute_run("orch-1", mock_engine)
+
+        assert res == mock_result
+        prog = m.get_progress("orch-1")
+        assert prog.status == RunLifecycleState.COMPLETED
+        assert prog.queries_used == 3
+        assert prog.evaluations_completed == 2
+
+    def test_orchestrator_cancellation_halts_scheduling(self):
+        from unittest.mock import MagicMock
+        from app.domain.run_orchestrator import RunOrchestrator
+
+        m = _new_manager(); _init(m, "orch-cancel")
+        m.request_cancellation("orch-cancel")
+
+        mock_engine = MagicMock()
+        orchestrator = RunOrchestrator(lifecycle_manager=m)
+
+        res = orchestrator.execute_run("orch-cancel", mock_engine)
+        assert res is None
+        mock_engine.run.assert_not_called()
+
+    def test_orchestrator_pre_execution_cancellation_confirmed(self):
+        from unittest.mock import MagicMock
+        from app.domain.run_orchestrator import RunOrchestrator
+
+        m = _new_manager(); _init(m, "orch-pre-cancel")
+        m.start_run("orch-pre-cancel")
+        m.request_cancellation("orch-pre-cancel")
+        assert m.is_cancellation_requested("orch-pre-cancel") is True
+
+        mock_engine = MagicMock()
+        orchestrator = RunOrchestrator(lifecycle_manager=m)
+        res = orchestrator.execute_run("orch-pre-cancel", mock_engine)
+        assert res is None
+        mock_engine.run.assert_not_called()
+        assert m.get_progress("orch-pre-cancel").status == RunLifecycleState.CANCELLED
+
+    def test_orchestrator_failure_routes_to_lifecycle(self):
+        from unittest.mock import MagicMock
+        from app.domain.run_orchestrator import RunOrchestrator
+
+        m = _new_manager(); _init(m, "orch-fail")
+        mock_engine = MagicMock()
+        mock_engine.run.side_effect = RuntimeError("Fatal computation failure")
+
+        orchestrator = RunOrchestrator(lifecycle_manager=m)
+        with pytest.raises(RuntimeError):
+            orchestrator.execute_run("orch-fail", mock_engine)
+
+        prog = m.get_progress("orch-fail")
+        assert prog.status == RunLifecycleState.FAILED
+        assert prog.failure_details["error_code"] == "EXECUTION_FAILURE"
+        assert "Fatal computation failure" in prog.failure_details["error_message"]
+
+    def test_orchestrator_retries_transient_failure(self):
+        from unittest.mock import MagicMock
+        from app.domain.run_orchestrator import RunOrchestrator
+        from app.domain.discovery_contracts import (
+            DiscoveryLifecycleStatus,
+            DiscoveryTerminationReason,
+            QueryAccounting,
+        )
+
+        m = _new_manager(); _init(m, "orch-retry")
+        mock_engine = MagicMock()
+        mock_result = MagicMock()
+        mock_result.status = DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION
+        mock_result.termination_reason = DiscoveryTerminationReason.STOPPING_CRITERION_PLAUSIBILITY_REACHED
+        mock_result.query_accounting = QueryAccounting(
+            max_query_budget=10, attempted_queries=1, successful_queries=1, failed_queries=0
+        )
+        mock_result.evaluations = ()
+
+        # Fails once with TimeoutError (classified as RETRYABLE), succeeds on 2nd attempt
+        mock_engine.run.side_effect = [TimeoutError("Transient timeout"), mock_result]
+
+        policy = RetryPolicy(max_attempts=2, initial_delay_seconds=0.01)
+        orchestrator = RunOrchestrator(lifecycle_manager=m, retry_policy=policy)
+        res = orchestrator.execute_run("orch-retry", mock_engine)
+
+        assert res == mock_result
+        assert mock_engine.run.call_count == 2
+        assert m.get_progress("orch-retry").status == RunLifecycleState.COMPLETED

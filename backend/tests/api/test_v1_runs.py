@@ -133,6 +133,23 @@ class TestCreateRun:
         assert "status_code" in data
         assert data["status_code"] == 400
 
+    def test_create_run_atomic_rollback_on_registration_failure(self, client, app):
+        """When lifecycle manager initialization fails, DB row is rolled back and no orphan persists."""
+        from unittest.mock import patch
+        from app.domain.run_lifecycle import DuplicateExecutionError
+
+        mgr = app.config["LIFECYCLE_MANAGER"]
+        run_id = "run-fail-init-test"
+
+        with patch.object(mgr, "initialize_run", side_effect=DuplicateExecutionError("Simulated registration error")):
+            res = client.post("/api/v1/runs", json={"name": "Atomic Fail", "run_id": run_id})
+            assert res.status_code == 500
+
+        # Verify no orphan row exists in DB
+        get_res = client.get(f"/api/v1/runs/{run_id}")
+        assert get_res.status_code == 404
+        assert run_id not in mgr._progress_registry
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/runs — listing
@@ -304,6 +321,49 @@ class TestCancelRun:
     def test_cancel_unknown_run_returns_404(self, client):
         """Cancelling a non-existent run returns 404."""
         res = client.post("/api/v1/runs/run-ghost/cancel")
+        assert res.status_code == 404
+
+    def test_cancel_running_run_returns_202_cancelling(self, client):
+        """Cancelling an active running run transitions to 'cancelling' and returns 202 Accepted."""
+        run = _make_run(client, "Active Running")
+        # Start run first
+        start_res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert start_res.status_code == 200
+        assert start_res.get_json()["run"]["status"] == "running"
+
+        # Request cancellation
+        cancel_res = client.post(f"/api/v1/runs/{run['run_id']}/cancel")
+        assert cancel_res.status_code == 202
+        data = cancel_res.get_json()
+        assert data["run"]["status"] == "cancelling"
+        assert data["status"]["status"] == "cancelling"
+        assert "in progress" in data["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/runs/<run_id>/start
+# ---------------------------------------------------------------------------
+
+class TestStartRun:
+    def test_start_queued_run_returns_200(self, client):
+        """Starting a queued run returns 200 with status running."""
+        run = _make_run(client, "Start Test")
+        res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["run"]["status"] == "running"
+        assert data["status"]["status"] == "running"
+
+    def test_start_already_running_returns_409(self, client):
+        """Starting an already active run returns 409 Conflict."""
+        run = _make_run(client, "Already Running")
+        client.post(f"/api/v1/runs/{run['run_id']}/start")
+        res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert res.status_code == 409
+
+    def test_start_unknown_run_returns_404(self, client):
+        """Starting an unknown run returns 404."""
+        res = client.post("/api/v1/runs/run-ghost/start")
         assert res.status_code == 404
 
 

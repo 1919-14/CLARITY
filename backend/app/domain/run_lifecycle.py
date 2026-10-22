@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import threading
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
+import uuid
 
 # NOTE: app.adapters imports are intentionally deferred to method bodies.
 # Importing them at module level would violate the pure-domain isolation
@@ -167,7 +168,7 @@ class ErrorCategory(str, Enum):
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Configurable bounded retry policy."""
+    """Configurable bounded retry policy with backoff and retry execution."""
 
     max_attempts: int = 3
     initial_delay_seconds: float = 0.5
@@ -200,6 +201,26 @@ class RetryPolicy:
             return 0.0
         delay = self.initial_delay_seconds * (self.backoff_multiplier ** (attempt - 1))
         return min(delay, self.max_delay_seconds)
+
+    def execute_with_retry(self, action: Callable[[], Any], on_retry: Optional[Callable[[int, Exception, float], None]] = None) -> Any:
+        """Execute a callable with bounded exponential backoff retries for retryable exceptions."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return action()
+            except Exception as exc:
+                last_exc = exc
+                category = self.classify_error(exc)
+                if category != ErrorCategory.RETRYABLE or attempt >= self.max_attempts:
+                    raise
+                import time
+                delay = self.calculate_delay(attempt)
+                if on_retry:
+                    on_retry(attempt, exc, delay)
+                if delay > 0:
+                    time.sleep(delay)
+        if last_exc:
+            raise last_exc
 
 
 # ==============================================================================
@@ -270,21 +291,60 @@ class RunProgress:
 class RunLifecycleManager:
     """Coordinates lifecycle transitions, persistence, progress tracking, and failure handling.
 
-    Thread-safe per run ID using dedicated locks.
+    Thread-safe per run ID using reentrant locks.
     """
 
     def __init__(self, repository_factory=None, retry_policy: Optional[RetryPolicy] = None):
         self._repo_factory = repository_factory
         self._retry_policy = retry_policy or RetryPolicy()
         self._progress_registry: Dict[str, RunProgress] = {}
-        self._run_locks: Dict[str, threading.Lock] = {}
-        self._global_lock = threading.Lock()
+        self._run_locks: Dict[str, threading.RLock] = {}
+        self._global_lock = threading.RLock()
+        self._cancellation_events: Dict[str, threading.Event] = {}
+        self._cancellation_hooks: Dict[str, List[Callable[[], Any]]] = {}
 
-    def _get_lock(self, run_id: str) -> threading.Lock:
+    def _get_lock(self, run_id: str) -> threading.RLock:
         with self._global_lock:
             if run_id not in self._run_locks:
-                self._run_locks[run_id] = threading.Lock()
+                self._run_locks[run_id] = threading.RLock()
             return self._run_locks[run_id]
+
+    def deregister_run(self, run_id: str) -> None:
+        """Remove a run from in-memory registry and cleanup locks (used on creation rollback)."""
+        with self._global_lock:
+            self._progress_registry.pop(run_id, None)
+            self._run_locks.pop(run_id, None)
+            self._cancellation_events.pop(run_id, None)
+            self._cancellation_hooks.pop(run_id, None)
+
+    def is_cancellation_requested(self, run_id: str) -> bool:
+        """Check if cancellation has been requested for a run."""
+        with self._get_lock(run_id):
+            evt = self._cancellation_events.get(run_id)
+            if evt and evt.is_set():
+                return True
+            prog = self._progress_registry.get(run_id)
+            if prog and prog.status == RunLifecycleState.CANCELLING:
+                return True
+            return False
+
+    def register_cancellation_hook(self, run_id: str, hook: Callable[..., Any]) -> None:
+        """Register a callback to be invoked when cancellation is requested."""
+        with self._get_lock(run_id):
+            if run_id not in self._cancellation_hooks:
+                self._cancellation_hooks[run_id] = []
+            self._cancellation_hooks[run_id].append(hook)
+            if self.is_cancellation_requested(run_id):
+                try:
+                    hook(run_id)
+                except TypeError:
+                    try:
+                        hook()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
 
     # --------------------------------------------------------------------------
     # Lifecycle Transitions
@@ -412,18 +472,23 @@ class RunLifecycleManager:
                     if progress.completed_at and not run_model.completed_at:
                         run_model.completed_at = progress.completed_at
 
-                    # Record audit event for significant lifecycle transitions
+                    # Record audit event with unique ID to avoid collisions
+                    event_id = f"evt-lc-{uuid.uuid4().hex[:12]}"
+                    metadata = {
+                        "from_state": current_state.value,
+                        "to_state": target_state.value,
+                        "stop_reason": progress.stop_reason,
+                    }
+                    if progress.failure_details:
+                        metadata["failure_details"] = progress.failure_details
+
                     repo.record_audit_event(
                         AuditEventModel(
-                            event_id=f"evt-lc-{run_id[-6:]}-{target_state.value}",
+                            event_id=event_id,
                             run_id=run_id,
                             event_type=f"RUN_{target_state.value.upper()}",
                             actor="lifecycle_manager",
-                            metadata_json={
-                                "from_state": current_state.value,
-                                "to_state": target_state.value,
-                                "stop_reason": progress.stop_reason,
-                            },
+                            metadata_json=metadata,
                         )
                     )
                     session.flush()
@@ -435,20 +500,27 @@ class RunLifecycleManager:
     # --------------------------------------------------------------------------
 
     def start_run(self, run_id: str, session=None) -> RunProgress:
-        """Start execution of a queued run."""
-        progress = self.get_progress(run_id, session=session)
-        if progress.status == RunLifecycleState.RUNNING:
-            raise DuplicateExecutionError(f"Run '{run_id}' is already actively running.")
-        if progress.status in TERMINAL_STATES:
-            raise DuplicateExecutionError(f"Run '{run_id}' is already in terminal state '{progress.status.value}'.")
+        """Start execution of a queued run under one atomic lock acquisition."""
+        with self._get_lock(run_id):
+            progress = self._get_or_load_progress(run_id, session=session)
+            if progress.status == RunLifecycleState.RUNNING:
+                raise DuplicateExecutionError(f"Run '{run_id}' is already actively running.")
+            if progress.status in TERMINAL_STATES:
+                raise DuplicateExecutionError(f"Run '{run_id}' is already in terminal state '{progress.status.value}'.")
+            if progress.status == RunLifecycleState.CANCELLING:
+                raise InvalidStateTransitionError(
+                    from_state=progress.status.value,
+                    to_state=RunLifecycleState.RUNNING.value,
+                    reason="Run is currently being cancelled and cannot be started.",
+                )
 
-        return self.transition_state(
-            run_id,
-            target_state=RunLifecycleState.RUNNING,
-            phase=RunPhase.INITIALIZING,
-            activity="Starting discovery loop",
-            session=session,
-        )
+            return self.transition_state(
+                run_id,
+                target_state=RunLifecycleState.RUNNING,
+                phase=RunPhase.INITIALIZING,
+                activity="Starting discovery loop",
+                session=session,
+            )
 
     def update_progress(
         self,
@@ -459,7 +531,7 @@ class RunLifecycleManager:
         activity: Optional[str] = None,
         session=None,
     ) -> RunProgress:
-        """Update activity and work counters without fabricating percentages."""
+        """Update activity and work counters without fabricating percentages, persisting durably to DB."""
         with self._get_lock(run_id):
             progress = self._get_or_load_progress(run_id, session=session)
             if progress.status in TERMINAL_STATES:
@@ -475,10 +547,68 @@ class RunLifecycleManager:
             if activity:
                 progress.current_activity = activity
             progress.last_updated_at = _utc_now()
+
+            if session:
+                from ..adapters.persistence.repository import ClarityRepository
+                from ..adapters.persistence.models import AuditEventModel, UsageRecordModel
+                repo = ClarityRepository(session)
+
+                # Durably persist progress to usage_records table
+                latest_usage = repo.get_latest_usage_for_run(run_id)
+                queries_count = progress.queries_used
+                evals_count = progress.evaluations_completed
+                if latest_usage:
+                    latest_usage.queries_executed = queries_count
+                    latest_usage.evaluations_completed = evals_count
+                    latest_usage.recorded_at = progress.last_updated_at
+                else:
+                    repo.record_usage(
+                        UsageRecordModel(
+                            usage_id=f"use-prog-{uuid.uuid4().hex[:10]}",
+                            run_id=run_id,
+                            queries_executed=queries_count,
+                            evaluations_scheduled=evals_count,
+                            evaluations_completed=evals_count,
+                            estimated_cost_usd=0.0,
+                            live_accruing_cost_usd=0.0,
+                            settled_cost_usd=None,
+                            is_budget_exhausted=False,
+                            recorded_at=progress.last_updated_at,
+                        )
+                    )
+
+                # Persist progress event to audit_events
+                repo.record_audit_event(
+                    AuditEventModel(
+                        event_id=f"evt-prog-{uuid.uuid4().hex[:12]}",
+                        run_id=run_id,
+                        event_type="RUN_PROGRESS",
+                        actor="lifecycle_manager",
+                        metadata_json={
+                            "phase": progress.phase.value,
+                            "queries_used": progress.queries_used,
+                            "evaluations_completed": progress.evaluations_completed,
+                            "activity": progress.current_activity,
+                        },
+                    )
+                )
+                session.flush()
+
             return progress
 
-    def request_cancellation(self, run_id: str, reason: str = "Cancellation requested by researcher", session=None) -> RunProgress:
-        """Request and process cancellation for a run."""
+    def request_cancellation(
+        self,
+        run_id: str,
+        reason: str = "Cancellation requested by researcher",
+        session=None,
+    ) -> RunProgress:
+        """Request cancellation for a run.
+
+        If RUNNING, transitions to CANCELLING, signals cancellation token, and executes hooks.
+        It remains in CANCELLING until the orchestrator/runner confirms shutdown.
+        If QUEUED/PENDING, transitions directly to CANCELLED.
+        If already terminal, raises InvalidStateTransitionError.
+        """
         with self._get_lock(run_id):
             progress = self._get_or_load_progress(run_id, session=session)
             current_state = normalize_state(progress.status)
@@ -487,27 +617,75 @@ class RunLifecycleManager:
                 raise InvalidStateTransitionError(
                     from_state=current_state.value,
                     to_state=RunLifecycleState.CANCELLED.value,
-                    reason=f"Run '{run_id}' is already terminal.",
+                    reason=f"Run '{run_id}' is already terminal ('{current_state.value}').",
                 )
 
-        # Transition to CANCELLING if running, then CANCELLED
-        if current_state == RunLifecycleState.RUNNING:
-            self.transition_state(
+            # Signal cancellation event
+            if run_id not in self._cancellation_events:
+                self._cancellation_events[run_id] = threading.Event()
+            self._cancellation_events[run_id].set()
+
+            # Execute any registered cancellation hooks (e.g. cancelling Nodus compute tasks)
+            hooks = self._cancellation_hooks.get(run_id, [])
+            for hook in hooks:
+                try:
+                    hook(run_id)
+                except TypeError:
+                    try:
+                        hook()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            if current_state == RunLifecycleState.RUNNING:
+                # Transition to CANCELLING and hold until orchestrator confirms shutdown
+                return self.transition_state(
+                    run_id,
+                    target_state=RunLifecycleState.CANCELLING,
+                    phase=RunPhase.TERMINATED,
+                    stop_reason=reason,
+                    activity="Cancellation in progress: signaling discovery loop and stopping tasks",
+                    session=session,
+                )
+
+            # If QUEUED or CANCELLING, finalize to CANCELLED
+            return self.transition_state(
                 run_id,
-                target_state=RunLifecycleState.CANCELLING,
+                target_state=RunLifecycleState.CANCELLED,
+                phase=RunPhase.TERMINATED,
                 stop_reason=reason,
-                activity="Stopping in-flight tasks and cleaning up",
+                activity="Run cancelled",
                 session=session,
             )
 
-        return self.transition_state(
-            run_id,
-            target_state=RunLifecycleState.CANCELLED,
-            phase=RunPhase.TERMINATED,
-            stop_reason=reason,
-            activity="Run cancelled",
-            session=session,
-        )
+    def confirm_cancellation(
+        self,
+        run_id: str,
+        reason: str = "Cancellation confirmed after task cleanup",
+        session=None,
+    ) -> RunProgress:
+        """Confirm shutdown of a cancelling run, transitioning state from CANCELLING to CANCELLED."""
+        with self._get_lock(run_id):
+            progress = self._get_or_load_progress(run_id, session=session)
+            if progress.status != RunLifecycleState.CANCELLING:
+                # If already cancelled or terminal, return as is
+                if progress.status in TERMINAL_STATES:
+                    return progress
+                raise InvalidStateTransitionError(
+                    from_state=progress.status.value,
+                    to_state=RunLifecycleState.CANCELLED.value,
+                    reason=f"Cannot confirm cancellation of run in state '{progress.status.value}'.",
+                )
+
+            return self.transition_state(
+                run_id,
+                target_state=RunLifecycleState.CANCELLED,
+                phase=RunPhase.TERMINATED,
+                stop_reason=reason or progress.stop_reason,
+                activity="Run cancelled: execution confirmed stopped",
+                session=session,
+            )
 
     def stop_by_budget(self, run_id: str, reason: str = "Configured resource limit reached", session=None) -> RunProgress:
         """Stop a run due to budget exhaustion."""
@@ -536,6 +714,7 @@ class RunLifecycleManager:
         run_id: str,
         error: Exception | str,
         failure_code: str = "EXECUTION_FAILURE",
+        diagnostics: Optional[Dict[str, Any]] = None,
         session=None,
     ) -> RunProgress:
         """Fail a run and record structured, sanitized diagnostic context."""
@@ -545,6 +724,8 @@ class RunLifecycleManager:
             "error_message": reason,
             "timestamp": _utc_now().isoformat(),
         }
+        if diagnostics and isinstance(diagnostics, dict):
+            diag.update(self._sanitize_diagnostics(diagnostics))
         return self.transition_state(
             run_id,
             target_state=RunLifecycleState.FAILED,
@@ -563,23 +744,32 @@ class RunLifecycleManager:
         """Detect and explicitly mark runs that were left in active state across restart.
 
         Does not silently convert interrupted runs to completed or delete scientific results.
-        Marks them as FAILED with an explicit diagnostic explanation.
+        Marks them as FAILED with an explicit diagnostic explanation and records audit events.
         """
         from sqlalchemy import select
-        from ..adapters.persistence.models import RunModel
+        from ..adapters.persistence.models import AuditEventModel, RunModel
 
         active_statuses = [RunLifecycleState.RUNNING.value, RunLifecycleState.CANCELLING.value]
         stmt = select(RunModel).where(RunModel.status.in_(active_statuses))
         interrupted_runs = list(session.scalars(stmt).all())
 
         recovered_ids = []
+        now = _utc_now()
         for run in interrupted_runs:
             run_id = run.run_id
+            prior_state = run.status
             reason = "Interrupted by system restart; marked for researcher review"
             run.status = RunLifecycleState.FAILED.value
             run.stop_reason = reason
-            run.completed_at = _utc_now()
+            run.completed_at = now
             recovered_ids.append(run_id)
+
+            fail_diag = {
+                "error_code": "SYSTEM_RESTART_INTERRUPTED",
+                "error_message": reason,
+                "prior_state": prior_state,
+                "interrupted_at": now.isoformat(),
+            }
 
             # Update in-memory snapshot if present
             if run_id in self._progress_registry:
@@ -587,8 +777,26 @@ class RunLifecycleManager:
                 prog.status = RunLifecycleState.FAILED
                 prog.phase = RunPhase.TERMINATED
                 prog.stop_reason = reason
-                prog.completed_at = run.completed_at
+                prog.completed_at = now
                 prog.current_activity = reason
+                prog.failure_details = fail_diag
+                prog.last_updated_at = now
+
+            # Record audit event
+            session.add(
+                AuditEventModel(
+                    event_id=f"evt-recov-{uuid.uuid4().hex[:12]}",
+                    run_id=run_id,
+                    event_type="RUN_FAILED",
+                    actor="system_recovery",
+                    metadata_json={
+                        "from_state": prior_state,
+                        "to_state": RunLifecycleState.FAILED.value,
+                        "stop_reason": reason,
+                        "failure_details": fail_diag,
+                    },
+                )
+            )
 
         if interrupted_runs:
             session.flush()
@@ -605,7 +813,7 @@ class RunLifecycleManager:
             return self._get_or_load_progress(run_id, session=session)
 
     def _get_or_load_progress(self, run_id: str, session=None) -> RunProgress:
-        """Internal helper to fetch progress from memory or DB."""
+        """Internal helper to fetch progress from memory or reconstruct from DB."""
         if run_id in self._progress_registry:
             return self._progress_registry[run_id]
 
@@ -614,15 +822,40 @@ class RunLifecycleManager:
             repo = ClarityRepository(session)
             run = repo.get_run(run_id)
             if run:
+                latest_usage = repo.get_latest_usage_for_run(run_id)
+                queries_used = latest_usage.queries_executed if latest_usage else 0
+                evaluations_completed = latest_usage.evaluations_completed if latest_usage else 0
+
+                audit_events = repo.list_audit_events_for_run(run_id)
+                failure_details = None
+                phase = RunPhase.TERMINATED if run.status in [s.value for s in TERMINAL_STATES] else RunPhase.INITIALIZING
+                current_activity = None
+
+                for evt in reversed(audit_events):
+                    if evt.event_type == "RUN_FAILED" and evt.metadata_json:
+                        failure_details = evt.metadata_json.get("failure_details")
+                    if evt.event_type == "RUN_PROGRESS" and evt.metadata_json:
+                        if not current_activity:
+                            current_activity = evt.metadata_json.get("activity")
+                        if phase == RunPhase.INITIALIZING and "phase" in evt.metadata_json:
+                            try:
+                                phase = RunPhase(evt.metadata_json["phase"])
+                            except ValueError:
+                                pass
+
                 prog = RunProgress(
                     run_id=run.run_id,
                     status=normalize_state(run.status),
-                    phase=RunPhase.TERMINATED if run.status in [s.value for s in TERMINAL_STATES] else RunPhase.INITIALIZING,
+                    phase=phase,
+                    queries_used=queries_used,
                     max_queries=run.max_queries,
+                    evaluations_completed=evaluations_completed,
                     max_evaluations=run.max_evaluations,
                     started_at=run.started_at,
                     completed_at=run.completed_at,
+                    current_activity=current_activity or (run.stop_reason if run.status in [s.value for s in TERMINAL_STATES] else None),
                     stop_reason=run.stop_reason,
+                    failure_details=failure_details,
                 )
                 self._progress_registry[run_id] = prog
                 return prog

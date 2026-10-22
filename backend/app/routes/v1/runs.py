@@ -33,6 +33,7 @@ from ...adapters.persistence.models import (
 )
 from ...adapters.persistence.repository import ClarityRepository
 from ...domain.run_lifecycle import (
+    DuplicateExecutionError,
     InvalidStateTransitionError,
     RunLifecycleManager,
     RunLifecycleState,
@@ -184,14 +185,19 @@ def create_run():
             )
             repo.create_run(run)
 
-            # Register run with lifecycle manager (in-memory; no extra DB write)
-            _lifecycle_manager().initialize_run(
-                run_id=run_id,
-                name=name.strip(),
-                max_queries=max_queries,
-                max_evaluations=max_evaluations,
-                domain=domain.strip(),
-            )
+            # Register run with lifecycle manager atomically with compensating cleanup
+            mgr = _lifecycle_manager()
+            try:
+                mgr.initialize_run(
+                    run_id=run_id,
+                    name=name.strip(),
+                    max_queries=max_queries,
+                    max_evaluations=max_evaluations,
+                    domain=domain.strip(),
+                )
+            except Exception:
+                mgr.deregister_run(run_id)
+                raise
 
             usage = UsageRecordModel(
                 usage_id=f"use-{uuid.uuid4().hex[:12]}",
@@ -325,7 +331,7 @@ def cancel_run(run_id: str):
                 return error_response(f"Run '{run_id}' not found.", 404)
 
             # Lifecycle manager enforces terminal-state guard and state machine
-            _lifecycle_manager().request_cancellation(
+            progress = _lifecycle_manager().request_cancellation(
                 run_id, reason=reason, session=session
             )
 
@@ -343,7 +349,51 @@ def cancel_run(run_id: str):
         current_app.logger.error("cancel_run db error: %s", exc)
         return error_response("An internal error occurred while cancelling the run.", 500)
 
-    return jsonify({"run": serialized, "message": "Run cancelled successfully."}), 200
+    if progress.status == RunLifecycleState.CANCELLING:
+        return jsonify({
+            "run": serialized,
+            "status": progress.to_dict(),
+            "message": "Run cancellation requested. Shutdown of in-flight work is in progress.",
+        }), 202
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "message": "Run cancelled successfully.",
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/start", methods=["POST"])
+def start_run(run_id: str):
+    """POST /api/v1/runs/<run_id>/start — Start execution of a queued discovery run.
+
+    Transitions run to RUNNING and connects to the orchestration service.
+    Returns 409 if already running or terminal.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            progress = _lifecycle_manager().start_run(run_id, session=session)
+            run = repo.get_run(run_id)
+            serialized = serialize_run(run)
+    except (DuplicateExecutionError, InvalidStateTransitionError) as exc:
+        return error_response(str(exc), 409)
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
+    except Exception as exc:  # noqa: BLE001
+        current_app.logger.error("start_run db error: %s", exc)
+        return error_response("An internal error occurred while starting the run.", 500)
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "message": "Run execution started successfully.",
+    }), 200
 
 
 @runs_v1_bp.route("/runs/<run_id>/metrics", methods=["GET"])
