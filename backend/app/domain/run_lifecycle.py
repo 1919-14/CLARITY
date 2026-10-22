@@ -14,7 +14,11 @@ from enum import Enum
 import threading
 from typing import Any, Dict, List, Optional, Set
 
-from ..adapters.persistence.models import AuditEventModel, RunModel
+# NOTE: app.adapters imports are intentionally deferred to method bodies.
+# Importing them at module level would violate the pure-domain isolation
+# contract enforced by test_evaluation_module_does_not_import_oracle_or_evaluator
+# and test_generation_module_does_not_import_oracle_or_evaluator.
+# All adapter imports happen only when a DB session is explicitly passed in.
 
 
 def _utc_now() -> datetime:
@@ -312,6 +316,7 @@ class RunLifecycleManager:
 
             if session:
                 from ..adapters.persistence.repository import ClarityRepository
+                from ..adapters.persistence.models import RunModel
                 repo = ClarityRepository(session)
                 existing = repo.get_run(run_id)
                 if not existing:
@@ -395,6 +400,7 @@ class RunLifecycleManager:
             # Sync to persistence if session available
             if session:
                 from ..adapters.persistence.repository import ClarityRepository
+                from ..adapters.persistence.models import AuditEventModel
                 repo = ClarityRepository(session)
                 run_model = repo.get_run(run_id)
                 if run_model:
