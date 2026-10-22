@@ -266,6 +266,29 @@ class TestCancelRun:
         res = client.post("/api/v1/runs/run-ghost/cancel")
         assert res.status_code == 404
 
+    def test_cancel_records_actual_prior_status_in_audit_event(self, client, app):
+        """Audit event records the true previous status (not 'cancelled') in metadata_json."""
+        from app.adapters.persistence.database import get_db_manager
+        from app.adapters.persistence.repository import ClarityRepository
+
+        run = _make_run(client, "Audit Status Check")
+        # Initial run status is "pending"
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/cancel",
+            json={"reason": "User stop"},
+        )
+        assert res.status_code == 200
+
+        db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+        db = get_db_manager(db_uri)
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            events = repo.list_audit_events_for_run(run["run_id"])
+            cancel_events = [e for e in events if e.event_type == "RUN_CANCELLED"]
+            assert len(cancel_events) == 1
+            assert cancel_events[0].metadata_json["previous_status"] == "pending"
+            assert cancel_events[0].metadata_json["stop_reason"] == "User stop"
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/runs/<run_id>/metrics
@@ -457,6 +480,68 @@ class TestRunObservations:
         data = res.get_json()
         assert data["count"] == 2
         assert data["total"] == 5
+
+    def test_observation_pagination_is_database_bounded(self, client, app):
+        """Prove that observation pagination pushes limit and offset into the database query and does not load full table into memory."""
+        from unittest.mock import patch
+        from sqlalchemy import event
+        from app.adapters.persistence.database import get_db_manager
+        from app.adapters.persistence.repository import ClarityRepository
+
+        run = _make_run(client, "DB Bounded Obs")
+        run_id = run["run_id"]
+        for i in range(10):
+            self._seed_observation(app, run_id, i + 1)
+
+        db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+        db = get_db_manager(db_uri)
+
+        executed_statements = []
+
+        def capture_sql(conn, cursor, statement, parameters, context, executemany):
+            executed_statements.append((statement, parameters))
+
+        event.listen(db.engine, "before_cursor_execute", capture_sql)
+        orig_list = ClarityRepository.list_observations_for_run
+        orig_count = ClarityRepository.count_observations_for_run
+
+        list_calls = []
+        count_calls = []
+
+        def spy_list(self_repo, r_id, only_training=False, limit=None, offset=None):
+            list_calls.append({"run_id": r_id, "only_training": only_training, "limit": limit, "offset": offset})
+            return orig_list(self_repo, r_id, only_training=only_training, limit=limit, offset=offset)
+
+        def spy_count(self_repo, r_id, only_training=False):
+            count_calls.append({"run_id": r_id, "only_training": only_training})
+            return orig_count(self_repo, r_id, only_training=only_training)
+
+        with patch.object(ClarityRepository, "list_observations_for_run", spy_list), \
+             patch.object(ClarityRepository, "count_observations_for_run", spy_count):
+            try:
+                res = client.get(f"/api/v1/runs/{run_id}/observations?limit=3&offset=4")
+            finally:
+                event.remove(db.engine, "before_cursor_execute", capture_sql)
+
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["count"] == 3
+        assert data["total"] == 10
+        assert data["limit"] == 3
+        assert data["offset"] == 4
+
+        # Verify repository was invoked with bounded limit & offset (not unbounded loading)
+        assert len(list_calls) == 1
+        assert list_calls[0] == {"run_id": run_id, "only_training": False, "limit": 3, "offset": 4}
+        assert len(count_calls) == 1
+        assert count_calls[0] == {"run_id": run_id, "only_training": False}
+
+        # Verify SQL statements sent to SQLite contained LIMIT and OFFSET
+        obs_sqls = [stmt for stmt, params in executed_statements if "observations" in stmt.lower() and "select" in stmt.lower()]
+        assert any("count(" in stmt.lower() for stmt in obs_sqls), f"Missing count query in: {obs_sqls}"
+        paged_sqls = [stmt for stmt in obs_sqls if "limit" in stmt.lower() and "offset" in stmt.lower()]
+        assert len(paged_sqls) >= 1, f"Expected bounded SQL with LIMIT and OFFSET, found: {obs_sqls}"
+
 
     def test_no_oracle_internals_in_observations(self, client, app):
         """Observation response never contains oracle formula or hidden ground truth."""

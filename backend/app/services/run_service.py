@@ -114,6 +114,7 @@ def cancel_run_service(
             f"Run '{run_id}' is already in a terminal state ('{run.status}') and cannot be cancelled."
         )
 
+    previous_status = run.status
     run.status = "cancelled"
     run.stop_reason = stop_reason
     run.completed_at = datetime.now(timezone.utc)
@@ -126,7 +127,7 @@ def cancel_run_service(
         metadata_json={
             "run_id": run_id,
             "stop_reason": stop_reason,
-            "previous_status": run.status,
+            "previous_status": previous_status,
         },
     )
     repo.record_audit_event(audit)

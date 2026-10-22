@@ -7,6 +7,7 @@ re-evaluation execution via the domain EvaluationPipeline or task dispatcher.
 from datetime import datetime, timezone
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..adapters.persistence.models import (
@@ -142,10 +143,107 @@ def update_hypothesis_flags_service(
     return hyp
 
 
+def _execute_pipeline_for_revision(
+    session: Session,
+    repo: ClarityRepository,
+    hyp: HypothesisModel,
+    latest_rev: HypothesisRevisionModel,
+    eval_model: EvaluationResultModel,
+    audit_event_type: str = "HYPOTHESIS_REEVALUATED",
+) -> EvaluationResultModel:
+    """Execute domain EvaluationPipeline on a hypothesis revision and update eval_model."""
+    obs_models = repo.list_observations_for_run(hyp.run_id)
+    training_ids = [o.observation_id for o in obs_models if not o.is_held_out]
+    held_out_ids = [o.observation_id for o in obs_models if o.is_held_out]
+
+    obs_domain: Dict[str, Observation] = {}
+    for o in obs_models:
+        status_enum = (
+            ObservationStatus.SUCCESS
+            if o.status == "success"
+            else ObservationStatus.INVALID_INPUT
+        )
+        obs_domain[o.observation_id] = Observation(
+            observation_id=o.observation_id,
+            input_id=o.input_id,
+            input_values=o.input_values or {},
+            output_values=o.output_values,
+            status=status_enum,
+            sequence_number=o.sequence_number,
+            is_held_out=o.is_held_out,
+        )
+
+    params = dict(latest_rev.parameters or {})
+    model_family = hyp.model_family
+    if model_family in ("linear", "1d_linear") or ("a" in params and "b" in params and "coefficients" not in params):
+        model_family = POLYNOMIAL_FAMILY_ID
+        params = {
+            "family": POLYNOMIAL_FAMILY_ID,
+            "degree": 1,
+            "coefficient_order": "ascending",
+            "coefficients": {
+                "c0": float(params.get("b", 0.0)),
+                "c1": float(params.get("a", 1.0)),
+            },
+            "input_variable": "x",
+            "output_variable": "y",
+        }
+    elif "family" not in params and model_family == POLYNOMIAL_FAMILY_ID:
+        params["family"] = POLYNOMIAL_FAMILY_ID
+
+    candidate_repr = HypothesisRepresentation(
+        model_family=model_family,
+        formula=latest_rev.formula,
+        parameters=params,
+        complexity=latest_rev.complexity,
+        hypothesis_id=hyp.hypothesis_id,
+        revision=latest_rev.revision_number,
+    )
+
+    request = EvaluationRequest(
+        hypothesis=candidate_repr,
+        observation_ids=training_ids,
+        held_out_observation_ids=held_out_ids,
+        metric_names=["mae", "rmse"],
+    )
+
+    pipeline = EvaluationPipeline()
+    result: EvaluationResult = pipeline.evaluate(request, obs_domain, dataset_id=hyp.run_id)
+
+    eval_status = "completed" if result.status == EvaluationStatus.COMPLETED else "failed"
+    error_msg = result.error.message if result.error else None
+
+    eval_model.status = eval_status
+    eval_model.sample_count = result.sample_count
+    eval_model.dataset_version = len(training_ids)
+    eval_model.metrics = result.metrics or {}
+    eval_model.held_out_metrics = result.held_out_metrics
+    eval_model.error_message = error_msg
+    eval_model.evaluated_at = datetime.now(timezone.utc)
+
+    repo.record_audit_event(
+        AuditEventModel(
+            event_id=f"evt-{uuid.uuid4().hex[:12]}",
+            run_id=hyp.run_id,
+            event_type=audit_event_type,
+            actor="worker" if audit_event_type == "HYPOTHESIS_REEVALUATION_CONSUMED" else "researcher",
+            metadata_json={
+                "hypothesis_id": hyp.hypothesis_id,
+                "revision_id": latest_rev.revision_id,
+                "evaluation_id": eval_model.evaluation_id,
+                "status": eval_status,
+                "sample_count": result.sample_count,
+            },
+        )
+    )
+    session.flush()
+    return eval_model
+
+
 def reevaluate_hypothesis_service(
     session: Session,
     hypothesis_id: str,
-    dispatcher: Optional[Callable[[str, str], Any]] = None,
+    dispatcher: Optional[Callable[..., Any]] = None,
 ) -> Tuple[EvaluationResultModel, bool]:
     """Execute or dispatch re-evaluation for a hypothesis's latest revision.
 
@@ -199,99 +297,93 @@ def reevaluate_hypothesis_service(
             )
         )
         session.flush()
-        dispatcher(hyp.run_id, hypothesis_id)
+
+        def _dispatch_after_commit(*args, **kwargs):
+            try:
+                dispatcher(hyp.run_id, hypothesis_id, eval_id)
+            except TypeError:
+                dispatcher(hyp.run_id, hypothesis_id)
+
+        try:
+            from sqlalchemy import event
+            event.listen(session, "after_commit", _dispatch_after_commit, once=True)
+        except Exception:
+            _dispatch_after_commit()
+
         return pending_eval, True
 
     # Synchronous evaluation through domain EvaluationPipeline
-    obs_models = repo.list_observations_for_run(hyp.run_id)
-    training_ids = [o.observation_id for o in obs_models if not o.is_held_out]
-    held_out_ids = [o.observation_id for o in obs_models if o.is_held_out]
-
-    obs_domain: Dict[str, Observation] = {}
-    for o in obs_models:
-        status_enum = (
-            ObservationStatus.SUCCESS
-            if o.status == "success"
-            else ObservationStatus.INVALID_INPUT
-        )
-        obs_domain[o.observation_id] = Observation(
-            observation_id=o.observation_id,
-            input_id=o.input_id,
-            input_values=o.input_values or {},
-            output_values=o.output_values,
-            status=status_enum,
-            sequence_number=o.sequence_number,
-            is_held_out=o.is_held_out,
-        )
-
-    params = dict(latest_rev.parameters or {})
-    model_family = hyp.model_family
-    if model_family in ("linear", "1d_linear") or ("a" in params and "b" in params and "coefficients" not in params):
-        model_family = POLYNOMIAL_FAMILY_ID
-        params = {
-            "family": POLYNOMIAL_FAMILY_ID,
-            "degree": 1,
-            "coefficient_order": "ascending",
-            "coefficients": {
-                "c0": float(params.get("b", 0.0)),
-                "c1": float(params.get("a", 1.0)),
-            },
-            "input_variable": "x",
-            "output_variable": "y",
-        }
-    elif "family" not in params and model_family == POLYNOMIAL_FAMILY_ID:
-        params["family"] = POLYNOMIAL_FAMILY_ID
-
-    candidate_repr = HypothesisRepresentation(
-        model_family=model_family,
-        formula=latest_rev.formula,
-        parameters=params,
-        complexity=latest_rev.complexity,
-        hypothesis_id=hypothesis_id,
-        revision=latest_rev.revision_number,
-    )
-
-    request = EvaluationRequest(
-        hypothesis=candidate_repr,
-        observation_ids=training_ids,
-        held_out_observation_ids=held_out_ids,
-        metric_names=["mae", "rmse"],
-    )
-
-    pipeline = EvaluationPipeline()
-    result: EvaluationResult = pipeline.evaluate(request, obs_domain, dataset_id=hyp.run_id)
-
-    eval_status = "completed" if result.status == EvaluationStatus.COMPLETED else "failed"
-    error_msg = result.error.message if result.error else None
-
-    completed_eval = EvaluationResultModel(
+    eval_model = EvaluationResultModel(
         evaluation_id=eval_id,
         revision_id=latest_rev.revision_id,
         run_id=hyp.run_id,
-        status=eval_status,
-        sample_count=result.sample_count,
-        dataset_version=len(training_ids),
-        metrics=result.metrics or {},
-        held_out_metrics=result.held_out_metrics,
-        error_message=error_msg,
-        evaluated_at=datetime.now(timezone.utc),
+        status="pending",
+        sample_count=0,
+        dataset_version=0,
+        metrics={},
+        held_out_metrics=None,
+        error_message=None,
     )
-    repo.record_evaluation(completed_eval)
-
-    repo.record_audit_event(
-        AuditEventModel(
-            event_id=f"evt-{uuid.uuid4().hex[:12]}",
-            run_id=hyp.run_id,
-            event_type="HYPOTHESIS_REEVALUATED",
-            actor="researcher",
-            metadata_json={
-                "hypothesis_id": hypothesis_id,
-                "revision_id": latest_rev.revision_id,
-                "evaluation_id": eval_id,
-                "status": eval_status,
-                "sample_count": result.sample_count,
-            },
-        )
-    )
+    repo.record_evaluation(eval_model)
     session.flush()
+
+    completed_eval = _execute_pipeline_for_revision(
+        session=session,
+        repo=repo,
+        hyp=hyp,
+        latest_rev=latest_rev,
+        eval_model=eval_model,
+        audit_event_type="HYPOTHESIS_REEVALUATED",
+    )
     return completed_eval, False
+
+
+def consume_pending_evaluation(
+    session: Session,
+    evaluation_id: Optional[str] = None,
+) -> Optional[EvaluationResultModel]:
+    """Worker task consumer that claims and processes a pending evaluation.
+
+    Pulls a pending EvaluationResultModel, fits and evaluates the hypothesis
+    revision against run observations using CLARITY's domain EvaluationPipeline,
+    updates the record to 'completed' or 'failed', updates metrics, and records
+    a HYPOTHESIS_REEVALUATION_CONSUMED audit event.
+
+    Returns the completed/failed EvaluationResultModel, or None if no pending work exists.
+    """
+    repo = ClarityRepository(session)
+    stmt = (
+        select(EvaluationResultModel)
+        .where(EvaluationResultModel.status == "pending")
+        .order_by(EvaluationResultModel.evaluation_id.asc())
+    )
+    if evaluation_id:
+        stmt = stmt.where(EvaluationResultModel.evaluation_id == evaluation_id)
+
+    eval_model = session.scalars(stmt).first()
+    if not eval_model:
+        return None
+
+    rev = session.get(HypothesisRevisionModel, eval_model.revision_id)
+    if not rev:
+        eval_model.status = "failed"
+        eval_model.error_message = f"Revision '{eval_model.revision_id}' not found."
+        session.flush()
+        return eval_model
+
+    hyp = session.get(HypothesisModel, rev.hypothesis_id)
+    if not hyp:
+        eval_model.status = "failed"
+        eval_model.error_message = f"Hypothesis '{rev.hypothesis_id}' not found."
+        session.flush()
+        return eval_model
+
+    return _execute_pipeline_for_revision(
+        session=session,
+        repo=repo,
+        hyp=hyp,
+        latest_rev=rev,
+        eval_model=eval_model,
+        audit_event_type="HYPOTHESIS_REEVALUATION_CONSUMED",
+    )
+

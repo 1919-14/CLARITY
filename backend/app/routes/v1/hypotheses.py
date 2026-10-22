@@ -114,7 +114,14 @@ def reevaluate_hypothesis(hypothesis_id: str):
 
     Routes re-evaluation through CLARITY's domain EvaluationPipeline against
     run observations, or dispatches to a configured background consumer if available.
+    If EVALUATION_DEFERRED is configured, returns 501 Not Implemented with a truthful status.
     """
+    if current_app.config.get("EVALUATION_DEFERRED"):
+        return error_response(
+            "Re-evaluation is deferred in this deployment: asynchronous evaluation worker is not enabled.",
+            501,
+        )
+
     db = _get_db()
     dispatcher = current_app.config.get("EVALUATION_DISPATCHER")
     try:

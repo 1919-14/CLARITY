@@ -584,7 +584,17 @@ def list_observations_endpoint(run_id: str):
         if not run:
             return error_response(f"Run '{run_id}' not found.", 404)
 
-        observations = repo.list_observations_for_run(run_id, only_training=only_training)
+        limit_arg = request.args.get("limit")
+        offset_arg = request.args.get("offset")
+        try:
+            limit = int(limit_arg) if limit_arg is not None else None
+            offset = int(offset_arg) if offset_arg is not None else None
+        except (ValueError, TypeError):
+            return error_response("Query parameters 'limit' and 'offset' must be integers.", 400)
+
+        observations = repo.list_observations_for_run(
+            run_id, only_training=only_training, limit=limit, offset=offset
+        )
         serialized_observations = [serialize_observation(o) for o in observations]
 
     return jsonify({

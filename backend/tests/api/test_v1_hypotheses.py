@@ -222,8 +222,8 @@ class TestReevaluateHypothesis:
         """When an asynchronous queue/dispatcher is configured, work is enqueued returning 202."""
         dispatched_jobs = []
 
-        def mock_dispatcher(run_id, hypothesis_id):
-            dispatched_jobs.append((run_id, hypothesis_id))
+        def mock_dispatcher(run_id, hypothesis_id, evaluation_id=None):
+            dispatched_jobs.append((run_id, hypothesis_id, evaluation_id))
 
         app.config["EVALUATION_DISPATCHER"] = mock_dispatcher
         try:
@@ -235,9 +235,71 @@ class TestReevaluateHypothesis:
             assert data["evaluation"]["status"] == "pending"
             assert "enqueued" in data["message"].lower()
             assert len(dispatched_jobs) == 1
-            assert dispatched_jobs[0] == (run["run_id"], hyp["hypothesis_id"])
+            assert dispatched_jobs[0][0] == run["run_id"]
+            assert dispatched_jobs[0][1] == hyp["hypothesis_id"]
         finally:
             app.config.pop("EVALUATION_DISPATCHER", None)
+
+    def test_pending_reevaluation_is_consumed_by_worker(self, client, app):
+        """Prove that a pending re-evaluation enqueued via dispatcher is consumed by the worker pipeline."""
+        from app.adapters.persistence.database import get_db_manager
+        from app.services.hypothesis_service import consume_pending_evaluation
+
+        dispatched_queue = []
+
+        def mock_dispatcher(run_id, hypothesis_id, evaluation_id=None):
+            dispatched_queue.append((run_id, hypothesis_id, evaluation_id))
+
+        app.config["EVALUATION_DISPATCHER"] = mock_dispatcher
+        try:
+            run = _create_run(client)
+            hyp = _create_hypothesis(client, run["run_id"])
+            # Seed observations so pipeline can fit and evaluate
+            self._seed_observation(app, run["run_id"], x=1.0, y=1.0, seq=1)
+            self._seed_observation(app, run["run_id"], x=2.0, y=2.0, seq=2)
+
+            # 1. Enqueue re-evaluation -> returns 202 with pending status
+            res = client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
+            assert res.status_code == 202
+            eval_id = res.get_json()["evaluation"]["evaluation_id"]
+            assert res.get_json()["evaluation"]["status"] == "pending"
+            assert len(dispatched_queue) == 1
+
+            # 2. Evaluations history confirms it is pending before worker runs
+            hist_before = client.get(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/evaluations").get_json()
+            assert hist_before["evaluations"][0]["status"] == "pending"
+
+            # 3. Worker consumer picks up and processes the pending evaluation
+            db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+            db = get_db_manager(db_uri)
+            with db.session_scope() as session:
+                consumed = consume_pending_evaluation(session, evaluation_id=eval_id)
+                assert consumed is not None
+                assert consumed.evaluation_id == eval_id
+                assert consumed.status == "completed"
+
+            # 4. Evaluations history proves it transitioned to completed with real metrics
+            hist_after = client.get(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/evaluations").get_json()
+            assert hist_after["count"] == 1
+            latest_eval = hist_after["evaluations"][0]
+            assert latest_eval["status"] == "completed"
+            assert latest_eval["sample_count"] == 2
+            assert "mae" in latest_eval["metrics"]
+            assert "rmse" in latest_eval["metrics"]
+        finally:
+            app.config.pop("EVALUATION_DISPATCHER", None)
+
+    def test_reevaluate_deferred_mode_returns_truthful_501(self, client, app):
+        """When EVALUATION_DEFERRED is enabled, endpoint truthfully returns 501 Not Implemented."""
+        app.config["EVALUATION_DEFERRED"] = True
+        try:
+            run = _create_run(client)
+            hyp = _create_hypothesis(client, run["run_id"])
+            res = client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
+            assert res.status_code == 501
+            assert "deferred" in res.get_json()["message"].lower()
+        finally:
+            app.config.pop("EVALUATION_DEFERRED", None)
 
     def test_reevaluate_returns_evaluation_id(self, client):
         """Re-evaluate response includes a valid evaluation_id."""
