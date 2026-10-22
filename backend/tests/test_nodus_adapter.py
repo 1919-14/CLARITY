@@ -486,10 +486,25 @@ def _build_nodus_mock_module(fn_return_value: dict | None = None) -> types.Modul
         def __exit__(self, *args):
             pass
 
+    api_mod = types.ModuleType("nodus.api")
+    _global_default = None
+
+    def _default_client():
+        return _global_default
+
+    def _set_default_client(c):
+        nonlocal _global_default
+        _global_default = c
+
+    api_mod.default_client = _default_client
+    api_mod.set_default_client = _set_default_client
+    nodus_mod.api = api_mod
+
     nodus_mod.Client = _ClientStub
     nodus_mod.Function = _FunctionStub
 
     sys.modules["nodus"] = nodus_mod
+    sys.modules["nodus.api"] = api_mod
     sys.modules["nodus.errors"] = errors_mod
 
     return nodus_mod
@@ -505,7 +520,7 @@ class TestRemoteDriver:
         self._nodus = _build_nodus_mock_module()
 
     def teardown_method(self):
-        for key in ["nodus", "nodus.errors"]:
+        for key in ["nodus", "nodus.errors", "nodus.api"]:
             sys.modules.pop(key, None)
 
     def test_remote_success_returns_succeeded_result(self):
@@ -893,7 +908,7 @@ class TestRuntimeEventLoopSafety:
         _build_nodus_mock_module(fn_return_value={"result": "safe_runtime"})
 
     def teardown_method(self):
-        for key in ["nodus", "nodus.errors"]:
+        for key in ["nodus", "nodus.errors", "nodus.api"]:
             sys.modules.pop(key, None)
 
     def test_execute_from_running_event_loop(self):
@@ -1020,4 +1035,240 @@ class TestRuntimeEventLoopSafety:
         assert default_client() is None
         assert len(closed) == 1
         assert closed[0] is client
+
+    def test_client_lifecycle_async_context_manager(self):
+        """async with _nodus_client_context sets default client, unsets on exit, and closes."""
+        import asyncio
+        from app.adapters.nodus.adapter import _nodus_client_context
+
+        closed = []
+        defaults = []
+
+        class MockClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+            def close(self):
+                closed.append(self)
+
+        mock_nodus = types.ModuleType("mock_nodus")
+        mock_nodus.Client = MockClient
+        mock_api = types.ModuleType("mock_nodus.api")
+
+        current_default = None
+
+        def set_default_client(client):
+            nonlocal current_default
+            current_default = client
+            defaults.append(client)
+
+        def default_client():
+            return current_default
+
+        mock_api.set_default_client = set_default_client
+        mock_api.default_client = default_client
+        mock_nodus.api = mock_api
+
+        async def run_async_test():
+            client_kwargs = {"api_key": "secret-async", "project": "proj-async"}
+            async with _nodus_client_context(mock_nodus, client_kwargs) as client:
+                assert isinstance(client, MockClient)
+                assert default_client() is client
+            return client
+
+        client_instance = asyncio.run(run_async_test())
+
+        assert default_client() is None
+        assert len(closed) == 1
+        assert closed[0] is client_instance
+
+    def test_concurrent_executions_serialize_default_client_swap_async(self):
+        """Concurrent remote executions via execute_async with distinct client configs
+        must serialize default-client swaps so that during each execution, the process-global
+        default client strictly matches that task's client and is never closed prematurely.
+        """
+        import asyncio
+
+        closed_clients = set()
+        violations = []
+
+        class MockSDKClient:
+            def __init__(self, api_key: str, **kwargs):
+                self.api_key = api_key
+                self.kwargs = kwargs
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                closed_clients.add(self.api_key)
+
+        mock_nodus = types.ModuleType("nodus")
+        mock_nodus.Client = MockSDKClient
+        mock_api = types.ModuleType("nodus.api")
+        current_default = None
+
+        def set_default_client(c):
+            nonlocal current_default
+            current_default = c
+
+        def default_client():
+            return current_default
+
+        mock_api.set_default_client = set_default_client
+        mock_api.default_client = default_client
+        mock_nodus.api = mock_api
+
+        class MockFunctionCall:
+            def __init__(self, expected_key: str):
+                self.expected_key = expected_key
+                self.name = f"call-{expected_key}"
+
+            async def get(self, timeout=None):
+                cur = default_client()
+                if cur is None or getattr(cur, "api_key", None) != self.expected_key:
+                    violations.append(
+                        f"During get: expected {self.expected_key}, found {getattr(cur, 'api_key', None)}"
+                    )
+                if cur is not None and cur.closed:
+                    violations.append(f"Client {self.expected_key} was prematurely closed during get()")
+                await asyncio.sleep(0.03)  # Yield to event loop to expose any race
+                return {"result": f"ok-{self.expected_key}"}
+
+        class MockFunction:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+
+            async def spawn(self, **kwargs):
+                cur = default_client()
+                expected_key = kwargs.get("payload", {}).get("key")
+                if cur is None or getattr(cur, "api_key", None) != expected_key:
+                    violations.append(
+                        f"During spawn: expected {expected_key}, found {getattr(cur, 'api_key', None)}"
+                    )
+                if cur is not None and cur.closed:
+                    violations.append(f"Client {expected_key} was prematurely closed during spawn()")
+                return MockFunctionCall(expected_key)
+
+        mock_nodus.Function = MockFunction
+        mock_errors = types.ModuleType("nodus.errors")
+        class NodusError(Exception): pass
+        mock_errors.NodusError = NodusError
+        mock_nodus.errors = mock_errors
+
+        sys.modules["nodus"] = mock_nodus
+        sys.modules["nodus.api"] = mock_api
+        sys.modules["nodus.errors"] = mock_errors
+
+        adapters = [
+            NodusExecutionAdapter(_make_config("nodus_remote", api_key=f"key-{i}"))
+            for i in range(1, 4)
+        ]
+        tasks = [
+            _make_task(payload={"key": f"key-{i}"})
+            for i in range(1, 4)
+        ]
+
+        async def run_concurrent():
+            return await asyncio.gather(
+                adapters[0].execute_async(tasks[0]),
+                adapters[1].execute_async(tasks[1]),
+                adapters[2].execute_async(tasks[2]),
+            )
+
+        results = asyncio.run(run_concurrent())
+
+        assert not violations, f"Concurrency race detected on default client: {violations}"
+        assert all(r.status == "succeeded" for r in results)
+        assert results[0].result_data == {"result": "ok-key-1"}
+        assert results[1].result_data == {"result": "ok-key-2"}
+        assert results[2].result_data == {"result": "ok-key-3"}
+        assert closed_clients == {"key-1", "key-2", "key-3"}
+        assert default_client() is None
+
+    def test_concurrent_executions_in_separate_threads(self):
+        """Concurrent remote executions via execute() in separate threads with distinct
+        clients must not race on the process-global default client or close active transports.
+        """
+        import asyncio
+        import concurrent.futures
+
+        closed_clients = set()
+        violations = []
+
+        class MockThreadClient:
+            def __init__(self, api_key: str, **kwargs):
+                self.api_key = api_key
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                closed_clients.add(self.api_key)
+
+        mock_nodus = types.ModuleType("nodus")
+        mock_nodus.Client = MockThreadClient
+        mock_api = types.ModuleType("nodus.api")
+        current_default = None
+
+        def set_default_client(c):
+            nonlocal current_default
+            current_default = c
+
+        def default_client():
+            return current_default
+
+        mock_api.set_default_client = set_default_client
+        mock_api.default_client = default_client
+        mock_nodus.api = mock_api
+
+        class MockFunctionCall:
+            def __init__(self, key: str):
+                self.key = key
+                self.name = f"thread-call-{key}"
+
+            async def get(self, timeout=None):
+                cur = default_client()
+                if cur is None or getattr(cur, "api_key", None) != self.key:
+                    violations.append(f"Thread get: expected {self.key}, found {getattr(cur, 'api_key', None)}")
+                if cur is not None and cur.closed:
+                    violations.append(f"Client {self.key} prematurely closed in thread get")
+                await asyncio.sleep(0.02)
+                return {"result": f"thread-ok-{self.key}"}
+
+        class MockFunction:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+
+            async def spawn(self, **kwargs):
+                expected = kwargs.get("payload", {}).get("key")
+                cur = default_client()
+                if cur is None or getattr(cur, "api_key", None) != expected:
+                    violations.append(f"Thread spawn: expected {expected}, found {getattr(cur, 'api_key', None)}")
+                return MockFunctionCall(expected)
+
+        mock_nodus.Function = MockFunction
+        mock_errors = types.ModuleType("nodus.errors")
+        class NodusError(Exception): pass
+        mock_errors.NodusError = NodusError
+        mock_nodus.errors = mock_errors
+
+        sys.modules["nodus"] = mock_nodus
+        sys.modules["nodus.api"] = mock_api
+        sys.modules["nodus.errors"] = mock_errors
+
+        def run_thread(idx: int):
+            config = _make_config("nodus_remote", api_key=f"thread-key-{idx}")
+            adapter = NodusExecutionAdapter(config)
+            task = _make_task(payload={"key": f"thread-key-{idx}"})
+            return adapter.execute(task)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(run_thread, i) for i in range(1, 5)]
+            results = [f.result() for f in futures]
+
+        assert not violations, f"Thread concurrency race detected: {violations}"
+        failures = [r.to_dict() for r in results if r.status != "succeeded"]
+        assert not failures, f"Some thread executions failed: {failures}"
+        assert closed_clients == {"thread-key-1", "thread-key-2", "thread-key-3", "thread-key-4"}
+        assert default_client() is None
 

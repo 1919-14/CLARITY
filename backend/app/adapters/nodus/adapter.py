@@ -27,6 +27,10 @@ SDK usage (verified against nodus-compute==1.0.27)
   Takes positional string arguments; does not accept an App object.
 * ``nodus.Client(api_key=..., api_url=..., project=...)`` — set as the default
   client before calling any SDK methods via ``nodus.api.set_default_client``.
+  Because ``nodus.api._client._default`` is process-global, ``_nodus_client_context``
+  acquires a process-global mutex (``_NODUS_CLIENT_LOCK``) across the entire
+  lookup/spawn/get lifecycle to prevent concurrent tasks or threads from
+  clobbering or prematurely closing another execution's client transport.
 * ``fn.spawn(**kwargs) -> FunctionCall`` — submits the remote call; kwargs are
   passed directly to the deployed function.
 * ``handle.get(timeout=...) -> Any`` — waits for the result and returns the
@@ -54,6 +58,7 @@ import concurrent.futures
 import contextlib
 import inspect
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -116,46 +121,79 @@ def _run_coroutine_sync(awaitable: Any) -> Any:
         return asyncio.run(_await_target(awaitable))
 
 
-@contextlib.contextmanager
-def _nodus_client_context(nodus: Any, client_kwargs: dict[str, Any]):
-    """Context manager configuring the process/thread default client for Nodus SDK.
+# Process-global mutex to serialize default client configuration and usage.
+# Pinned nodus SDK (1.0.27) uses a single process-global _default Client in nodus.api._client.
+# Holding this lock across the entire lookup/spawn/get lifecycle guarantees that concurrent
+# executions cannot clobber or close each other's active client transport.
+_NODUS_CLIENT_LOCK = threading.Lock()
 
-    1. Instantiates ``nodus.Client(**client_kwargs)``.
-    2. Sets it as default via ``nodus.api.set_default_client`` if the SDK supports it.
-    3. Yields the client instance.
-    4. On exit, restores the previous default client and closes the client instance.
+
+class _nodus_client_context:
+    """Context manager configuring the process-wide default client for Nodus SDK.
+
+    Supports both synchronous (``with``) and asynchronous (``async with``) usage.
+    Acquires the process-global execution lock (``_NODUS_CLIENT_LOCK``) to serialize
+    the default-client swap and the entire lookup/spawn/get lifecycle across concurrent
+    tasks and threads, preventing race conditions on the process-wide default client.
     """
-    client = None
-    if hasattr(nodus, "Client"):
-        try:
-            client = nodus.Client(**client_kwargs)
-        except Exception:
-            client = None
 
-    prev_client = None
-    if hasattr(nodus, "api") and hasattr(nodus.api, "default_client"):
-        try:
-            prev_client = nodus.api.default_client()
-        except Exception:
-            prev_client = None
+    def __init__(self, nodus: Any, client_kwargs: dict[str, Any]) -> None:
+        self.nodus = nodus
+        self.client_kwargs = client_kwargs
+        self.client: Any = None
+        self.prev_client: Any = None
 
-    if client is not None and hasattr(nodus, "api") and hasattr(nodus.api, "set_default_client"):
-        try:
-            nodus.api.set_default_client(client)
-        except Exception:
-            pass
+    def __enter__(self) -> Any:
+        _NODUS_CLIENT_LOCK.acquire(blocking=True)
+        return self._setup()
 
-    try:
-        yield client
-    finally:
-        if hasattr(nodus, "api") and hasattr(nodus.api, "set_default_client"):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        try:
+            self._teardown()
+        finally:
+            _NODUS_CLIENT_LOCK.release()
+
+    async def __aenter__(self) -> Any:
+        while not _NODUS_CLIENT_LOCK.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        return self._setup()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        try:
+            self._teardown()
+        finally:
+            _NODUS_CLIENT_LOCK.release()
+
+    def _setup(self) -> Any:
+        if hasattr(self.nodus, "Client"):
             try:
-                nodus.api.set_default_client(prev_client)
+                self.client = self.nodus.Client(**self.client_kwargs)
+            except Exception:
+                self.client = None
+
+        if hasattr(self.nodus, "api") and hasattr(self.nodus.api, "default_client"):
+            try:
+                self.prev_client = self.nodus.api.default_client()
+            except Exception:
+                self.prev_client = None
+
+        if self.client is not None and hasattr(self.nodus, "api") and hasattr(self.nodus.api, "set_default_client"):
+            try:
+                self.nodus.api.set_default_client(self.client)
             except Exception:
                 pass
-        if client is not None and hasattr(client, "close"):
+
+        return self.client
+
+    def _teardown(self) -> None:
+        if hasattr(self.nodus, "api") and hasattr(self.nodus.api, "set_default_client"):
             try:
-                client.close()
+                self.nodus.api.set_default_client(self.prev_client)
+            except Exception:
+                pass
+        if self.client is not None and hasattr(self.client, "close"):
+            try:
+                self.client.close()
             except Exception:
                 pass
 
@@ -319,7 +357,7 @@ class NodusExecutionAdapter:
         if self._config.base_url:
             client_kwargs["api_url"] = self._config.base_url
 
-        with _nodus_client_context(nodus, client_kwargs):
+        async with _nodus_client_context(nodus, client_kwargs):
             submitted_at = datetime.now(timezone.utc)
 
             # Phase 1 — resolve function and spawn (pre-submission, retryable)

@@ -41,11 +41,17 @@ variable. It is never logged, serialized, or included in repr output.
 
 The adapter manages the client lifecycle using a scoped context manager
 (`_nodus_client_context`):
-1. Instantiates `nodus.Client` with configured credentials and project.
-2. Sets it as the SDK default via `nodus.api.set_default_client(client)` so
+1. Acquires a process-global mutex (`_NODUS_CLIENT_LOCK`) for the entire lookup,
+   spawn, and get lifecycle. Because the pinned SDK (`nodus-compute==1.0.27`) maintains
+   a single process-wide default client (`nodus.api._client._default`), holding this
+   lock prevents concurrent executions across threads or async tasks from clobbering
+   each other's default client or prematurely closing an active client transport.
+2. Instantiates `nodus.Client` with configured credentials and project.
+3. Sets it as the SDK default via `nodus.api.set_default_client(client)` so
    that both `fn.spawn(...)` and `handle.get(...)` share the authenticated client.
-3. Automatically restores any previous default client and closes the client
-   transport via `client.close()` upon task completion or failure.
+4. Automatically restores any previous default client, closes the client
+   transport via `client.close()`, and releases the execution lock upon task
+   completion or failure.
 
 ---
 

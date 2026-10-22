@@ -35,10 +35,11 @@ status envelope). The remote function's return dict becomes `result_data` verbat
 Retries are pre-submission-only — post-submission retry would create duplicate
 billable calls.
 
-**Validation:** Adapter tested with 67 unit tests (including running event loops,
-threadless contexts, native async execution, client lifecycle, and mocked SDK
-boundary). Genuine remote smoke test (`python -m app.nodus_smoke_test`) is ready;
-pending a deployed Function with matching `NODUS_APP_NAME`/`NODUS_FUNCTION_NAME`
+**Validation:** Adapter tested with 70 unit tests (including running event loops,
+threadless contexts, native async execution, process-global client serialization
+and concurrency regression tests across async tasks and threads, client lifecycle,
+and mocked SDK boundary). Genuine remote smoke test (`python -m app.nodus_smoke_test`)
+is ready; pending a deployed Function with matching `NODUS_APP_NAME`/`NODUS_FUNCTION_NAME`
 and `NODUS_API_KEY`. See `docs/nodus-compute.md` for deployment and smoke-test
 instructions.
 
