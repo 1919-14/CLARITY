@@ -873,3 +873,151 @@ class TestExecutionMode:
 
     def test_from_str_case_insensitive(self):
         assert ExecutionMode.from_str("MOCK") == ExecutionMode.MOCK
+
+
+# ===========================================================================
+# 10. Event Loop & Runtime Context Safety (Reviewer Issue #12 Follow-up)
+# ===========================================================================
+
+class TestRuntimeEventLoopSafety:
+    """Verifies that the adapter safely executes async SDK calls across runtime
+    contexts without raising event loop errors:
+    1. From inside an actively running event loop (e.g. FastAPI / asyncio task).
+    2. From a thread with no event loop set (e.g. background worker thread).
+    3. Via the native async interface: await adapter.execute_async(task).
+    4. Client lifecycle context manager behavior (sets default, restores, closes).
+    5. Timeout exceptions: asyncio.TimeoutError and standard TimeoutError.
+    """
+
+    def setup_method(self):
+        _build_nodus_mock_module(fn_return_value={"result": "safe_runtime"})
+
+    def teardown_method(self):
+        for key in ["nodus", "nodus.errors"]:
+            sys.modules.pop(key, None)
+
+    def test_execute_from_running_event_loop(self):
+        """adapter.execute() must succeed when called from inside a running event loop."""
+        import asyncio
+
+        config = _make_config("nodus_remote", api_key="test-key")
+        adapter = NodusExecutionAdapter(config)
+        task = _make_task()
+
+        async def async_caller():
+            # Inside an actively running event loop
+            return adapter.execute(task)
+
+        result = asyncio.run(async_caller())
+        assert result.status == "succeeded"
+        assert result.result_data == {"result": "safe_runtime"}
+
+    def test_execute_from_thread_without_event_loop(self):
+        """adapter.execute() must succeed when called in a thread with no event loop."""
+        import asyncio
+        import threading
+
+        config = _make_config("nodus_remote", api_key="test-key")
+        adapter = NodusExecutionAdapter(config)
+        task = _make_task()
+
+        result_box = []
+        error_box = []
+
+        def worker():
+            try:
+                # Explicitly unset event loop in this thread
+                asyncio.set_event_loop(None)
+                res = adapter.execute(task)
+                result_box.append(res)
+            except Exception as e:
+                error_box.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert not error_box, f"Worker raised exception: {error_box[0]}"
+        assert len(result_box) == 1
+        assert result_box[0].status == "succeeded"
+        assert result_box[0].result_data == {"result": "safe_runtime"}
+
+    def test_execute_async_interface(self):
+        """await adapter.execute_async() executes natively in an async context."""
+        import asyncio
+
+        config = _make_config("nodus_remote", api_key="test-key")
+        adapter = NodusExecutionAdapter(config)
+        task = _make_task()
+
+        async def run_test():
+            return await adapter.execute_async(task)
+
+        result = asyncio.run(run_test())
+        assert result.status == "succeeded"
+        assert result.result_data == {"result": "safe_runtime"}
+
+    def test_timeout_error_varieties_handled(self):
+        """Both standard TimeoutError and asyncio.TimeoutError map to timed_out."""
+        config = _make_config("nodus_remote", api_key="test-key")
+
+        class _TimeoutHandle:
+            name = "prov-to"
+            async def get(self, timeout=None):
+                raise TimeoutError("operation timed out")
+
+        class _TimeoutFn:
+            @classmethod
+            def from_name(cls, app, name, project=None):
+                return cls()
+            async def spawn(self, **kwargs):
+                return _TimeoutHandle()
+
+        sys.modules["nodus"].Function = _TimeoutFn
+        adapter = NodusExecutionAdapter(config)
+        result = adapter.execute(_make_task())
+
+        assert result.status == "timed_out"
+        assert result.error["code"] == NodusErrorCode.TIMEOUT
+
+    def test_client_lifecycle_context_manager(self):
+        """_nodus_client_context sets default client, unsets on exit, and closes."""
+        from app.adapters.nodus.adapter import _nodus_client_context
+
+        closed = []
+        defaults = []
+
+        class MockClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+            def close(self):
+                closed.append(self)
+
+        mock_nodus = types.ModuleType("mock_nodus")
+        mock_nodus.Client = MockClient
+        mock_api = types.ModuleType("mock_nodus.api")
+
+        current_default = None
+
+        def set_default_client(client):
+            nonlocal current_default
+            current_default = client
+            defaults.append(client)
+
+        def default_client():
+            return current_default
+
+        mock_api.set_default_client = set_default_client
+        mock_api.default_client = default_client
+        mock_nodus.api = mock_api
+
+        client_kwargs = {"api_key": "secret", "project": "proj"}
+        with _nodus_client_context(mock_nodus, client_kwargs) as client:
+            assert isinstance(client, MockClient)
+            assert default_client() is client
+
+        # After context exit: default restored and client closed
+        assert default_client() is None
+        assert len(closed) == 1
+        assert closed[0] is client
+

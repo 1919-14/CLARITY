@@ -28,7 +28,7 @@ Ordinary application startup does not require the SDK to be installed.
 
 ---
 
-## Authentication
+## Authentication & Client Lifecycle
 
 The Nodus SDK authenticates using an API key passed to `nodus.Client`:
 
@@ -38,6 +38,42 @@ client = nodus.Client(api_key="...", project="my-project")
 
 In CLARITY the key is read exclusively from the `NODUS_API_KEY` environment
 variable. It is never logged, serialized, or included in repr output.
+
+The adapter manages the client lifecycle using a scoped context manager
+(`_nodus_client_context`):
+1. Instantiates `nodus.Client` with configured credentials and project.
+2. Sets it as the SDK default via `nodus.api.set_default_client(client)` so
+   that both `fn.spawn(...)` and `handle.get(...)` share the authenticated client.
+3. Automatically restores any previous default client and closes the client
+   transport via `client.close()` upon task completion or failure.
+
+---
+
+## Event Loop & Execution Architecture
+
+Nodus SDK calls (`fn.spawn` and `handle.get`) are asynchronous coroutines.
+The adapter supports both synchronous and asynchronous caller patterns:
+
+### 1. Synchronous Interface: `adapter.execute(task)`
+Safe to call from any context:
+- **Inside a running event loop** (e.g. FastAPI routes, Jupyter, async tests):
+  automatically offloaded to a dedicated single-worker thread running `asyncio.run()`,
+  preventing `RuntimeError: This event loop is already running`.
+- **In threads without an event loop** (e.g. background worker threads):
+  automatically executed via a freshly scoped `asyncio.run()`, preventing
+  `RuntimeError: There is no current event loop in thread`.
+- **In standard synchronous code**: executes cleanly via `asyncio.run()`.
+
+### 2. Asynchronous Interface: `await adapter.execute_async(task)`
+A native coroutine alternative for callers already operating within an async context:
+```python
+result = await adapter.execute_async(task)
+```
+
+### 3. Timeout Handling
+Execution timeouts are bounded by `NODUS_TIMEOUT_SECONDS`. The adapter catches
+all timeout variants — standard Python `TimeoutError`, `asyncio.TimeoutError`, and
+`nodus.errors.APITimeoutError` — returning a terminal `NodusResult(status="timed_out")`.
 
 ---
 
