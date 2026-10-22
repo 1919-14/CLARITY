@@ -35,7 +35,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .candidate_generator import CandidateGenerationError, CandidateGenerator
 from .contracts import (
@@ -136,6 +136,10 @@ class _BudgetExhausted(Exception):
     """Internal signal that no oracle invocation is permitted."""
 
 
+class _CancelledException(Exception):
+    """Internal signal that execution was cancelled."""
+
+
 class DiscoveryEngine:
     """Coordinates one bounded discovery run over existing components."""
 
@@ -154,6 +158,7 @@ class DiscoveryEngine:
         registry: Optional[ModelFamilyRegistry] = None,
         scientist: Optional[LLMScientist] = None,
         run_id: Optional[str] = None,
+        cancellation_token: Optional[Callable[[], bool]] = None,
     ):
         if not callable(getattr(oracle, "validate_input", None)) or not callable(
             getattr(oracle, "query", None)
@@ -265,6 +270,10 @@ class DiscoveryEngine:
         self._started_at = utc_now_iso()
         self._finished_at = self._started_at
 
+        # Cancellation.
+        self._cancellation_token: Optional[Callable[[], bool]] = cancellation_token
+        self._cancellation_requested: bool = False
+
     # ------------------------------------------------------------------
     # Read-only inspection
     # ------------------------------------------------------------------
@@ -303,10 +312,41 @@ class DiscoveryEngine:
         return self._accounting()
 
     # ------------------------------------------------------------------
+    # Cancellation controls
+    # ------------------------------------------------------------------
+
+    def set_cancellation_token(self, token: Optional[Callable[[], bool]]) -> None:
+        """Register a cancellation token callback that returns True if cancelled."""
+        self._cancellation_token = token
+
+    def request_cancellation(self) -> None:
+        """Signal the discovery engine to stop scheduling new work and shut down."""
+        self._cancellation_requested = True
+
+    def cancel(self) -> None:
+        """Alias for request_cancellation."""
+        self.request_cancellation()
+
+    def is_cancelled(self) -> bool:
+        """Check whether cancellation was signaled via explicit request or token."""
+        if self._cancellation_requested:
+            return True
+        if self._cancellation_token is not None:
+            try:
+                return bool(self._cancellation_token())
+            except Exception:
+                return False
+        return False
+
+    # ------------------------------------------------------------------
     # Public lifecycle
     # ------------------------------------------------------------------
 
-    def run(self, initial_observations: Sequence[Observation] = ()) -> DiscoveryRunResult:
+    def run(
+        self,
+        initial_observations: Sequence[Observation] = (),
+        cancellation_token: Optional[Callable[[], bool]] = None,
+    ) -> DiscoveryRunResult:
         """Execute one bounded discovery run and return its result snapshot.
 
         ``initial_observations`` must be permitted observations already
@@ -316,6 +356,9 @@ class DiscoveryEngine:
         invalid initial observations or candidate generation failure) is
         reported inside the returned result as FAILED, before any oracle call.
         """
+        if cancellation_token is not None:
+            self._cancellation_token = cancellation_token
+
         with self._lifecycle_lock:
             if self._started:
                 raise DiscoveryRunError(
@@ -328,6 +371,12 @@ class DiscoveryEngine:
             self._started = True
             self._started_at = utc_now_iso()
 
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
+            )
+
         try:
             self._initialize_candidates()
             self._ingest_initial_observations(initial_observations)
@@ -336,6 +385,12 @@ class DiscoveryEngine:
             return self._finalize(
                 DiscoveryLifecycleStatus.FAILED,
                 DiscoveryTerminationReason.UNRECOVERABLE_ERROR,
+            )
+
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
             )
 
         self._status = DiscoveryLifecycleStatus.RUNNING
@@ -370,6 +425,12 @@ class DiscoveryEngine:
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
                 )
+
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
+            )
 
         return self._run_iterations()
 
@@ -562,6 +623,11 @@ class DiscoveryEngine:
 
     def _run_iterations(self) -> DiscoveryRunResult:
         while True:
+            if self.is_cancelled():
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
+                )
             criterion = self._satisfied_stopping_criterion()
             if criterion is not None:
                 return self._finalize(
@@ -583,6 +649,11 @@ class DiscoveryEngine:
 
             try:
                 execution = self._execute_one_experiment(iteration)
+            except _CancelledException:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
+                )
             except _BudgetExhausted:
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
@@ -595,6 +666,11 @@ class DiscoveryEngine:
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
                 )
             except Exception as exc:  # noqa: BLE001 - never leak a raw crash
+                if self.is_cancelled():
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                        DiscoveryTerminationReason.CANCELLED,
+                    )
                 self._errors.append(
                     make_structured_error(
                         ERROR_UNEXPECTED_DISCOVERY_ERROR,
@@ -606,6 +682,12 @@ class DiscoveryEngine:
                 return self._finalize(
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.UNRECOVERABLE_ERROR,
+                )
+
+            if self.is_cancelled():
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
                 )
 
             if execution is None:
@@ -704,6 +786,9 @@ class DiscoveryEngine:
         remains. Raises ``_ComponentFailure`` for contract violations and
         ``_BudgetExhausted`` if the budget disappeared mid-iteration.
         """
+        if self.is_cancelled():
+            raise _CancelledException()
+
         batch = self._generate_experiment_batch()
         if batch is None:
             return None
@@ -723,6 +808,8 @@ class DiscoveryEngine:
             self._config.max_experiment_candidates_per_iteration,
         )
         for _ in range(limit):
+            if self.is_cancelled():
+                raise _CancelledException()
             remaining = [
                 candidate
                 for candidate in batch.candidates
@@ -823,6 +910,8 @@ class DiscoveryEngine:
                 )
                 continue
 
+            if self.is_cancelled():
+                raise _CancelledException()
             if self._attempted_queries >= self._config.max_query_budget:
                 raise _BudgetExhausted()
             return self._invoke_oracle(selected, iteration, selection_diagnostics)
@@ -849,7 +938,7 @@ class DiscoveryEngine:
         experiment generator; they cannot call the oracle directly.
         """
         scientist = self._scientist
-        if scientist is None:
+        if scientist is None or self.is_cancelled():
             return False
         if not bool(getattr(scientist, "can_propose", True)):
             return False
@@ -1131,7 +1220,11 @@ class DiscoveryEngine:
         """
         last_error: Optional[StructuredError] = None
         for attempt_index in range(self._config.max_query_retries + 1):
+            if self.is_cancelled():
+                raise _CancelledException()
             with self._query_lock:
+                if self.is_cancelled():
+                    raise _CancelledException()
                 if self._attempted_queries >= self._config.max_query_budget:
                     if last_error is None:
                         raise _BudgetExhausted()
