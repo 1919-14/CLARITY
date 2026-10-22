@@ -172,16 +172,72 @@ class TestUpdateHypothesis:
 # ---------------------------------------------------------------------------
 
 class TestReevaluateHypothesis:
-    def test_reevaluate_enqueues_pending_evaluation(self, client):
-        """Re-evaluate returns 202 with a pending evaluation record."""
+    def _seed_observation(self, app, run_id, x=1.0, y=2.0, seq=1):
+        import uuid
+        from app.adapters.persistence.database import get_db_manager
+        from app.adapters.persistence.models import ObservationModel
+        from app.adapters.persistence.repository import ClarityRepository
+        db = get_db_manager(app.config.get("SQLALCHEMY_DATABASE_URI"))
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            repo.add_observation(ObservationModel(
+                observation_id=f"obs-{uuid.uuid4().hex[:8]}",
+                run_id=run_id,
+                input_id=f"inp-{seq}",
+                input_values={"x": x},
+                output_values={"y": y},
+                status="success",
+                sequence_number=seq,
+                is_held_out=False,
+            ))
+
+    def test_reevaluate_executes_pipeline_with_observations(self, client, app):
+        """Re-evaluate executes through EvaluationPipeline when observations exist, returning 200."""
+        run = _create_run(client)
+        hyp = _create_hypothesis(client, run["run_id"])
+        # Seed 2 observations so linear polynomial fitting succeeds
+        self._seed_observation(app, run["run_id"], x=1.0, y=1.0, seq=1)
+        self._seed_observation(app, run["run_id"], x=2.0, y=2.0, seq=2)
+
+        res = client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert "evaluation" in data
+        assert data["evaluation"]["status"] == "completed"
+        assert "mae" in data["evaluation"]["metrics"]
+        assert "rmse" in data["evaluation"]["metrics"]
+        assert data["evaluation"]["sample_count"] == 2
+
+    def test_reevaluate_handles_empty_observations(self, client):
+        """Re-evaluate on run with no observations marks evaluation as failed (not phantom pending)."""
         run = _create_run(client)
         hyp = _create_hypothesis(client, run["run_id"])
         res = client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
-        assert res.status_code == 202
+        assert res.status_code == 200
         data = res.get_json()
-        assert "evaluation" in data
-        assert data["evaluation"]["status"] == "pending"
-        assert "message" in data
+        assert data["evaluation"]["status"] == "failed"
+        assert data["evaluation"]["error_message"] is not None
+
+    def test_reevaluate_dispatches_when_consumer_configured(self, client, app):
+        """When an asynchronous queue/dispatcher is configured, work is enqueued returning 202."""
+        dispatched_jobs = []
+
+        def mock_dispatcher(run_id, hypothesis_id):
+            dispatched_jobs.append((run_id, hypothesis_id))
+
+        app.config["EVALUATION_DISPATCHER"] = mock_dispatcher
+        try:
+            run = _create_run(client)
+            hyp = _create_hypothesis(client, run["run_id"])
+            res = client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
+            assert res.status_code == 202
+            data = res.get_json()
+            assert data["evaluation"]["status"] == "pending"
+            assert "enqueued" in data["message"].lower()
+            assert len(dispatched_jobs) == 1
+            assert dispatched_jobs[0] == (run["run_id"], hyp["hypothesis_id"])
+        finally:
+            app.config.pop("EVALUATION_DISPATCHER", None)
 
     def test_reevaluate_returns_evaluation_id(self, client):
         """Re-evaluate response includes a valid evaluation_id."""
@@ -223,14 +279,14 @@ class TestHypothesisEvaluations:
         assert data["hypothesis_id"] == hyp["hypothesis_id"]
 
     def test_evaluations_appear_after_reevaluate(self, client):
-        """Pending evaluation from /reevaluate appears in the evaluation history."""
+        """Evaluation from /reevaluate appears in the evaluation history."""
         run = _create_run(client)
         hyp = _create_hypothesis(client, run["run_id"])
         client.post(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/reevaluate")
         res = client.get(f"/api/v1/hypotheses/{hyp['hypothesis_id']}/evaluations")
         data = res.get_json()
         assert data["count"] == 1
-        assert data["evaluations"][0]["status"] == "pending"
+        assert "status" in data["evaluations"][0]
 
     def test_evaluations_unknown_hypothesis_returns_404(self, client):
         """Unknown hypothesis_id returns 404."""

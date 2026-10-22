@@ -612,8 +612,8 @@ paths:
     post:
       summary: Request hypothesis re-evaluation
       description: >-
-        Enqueues a pending evaluation for the latest hypothesis revision and emits an audit event.
-        The actual evaluation is executed asynchronously by the discovery engine.
+        Routes re-evaluation through the domain EvaluationPipeline against current run observations,
+        or enqueues to an asynchronous worker queue when a dispatcher is configured.
       operationId: reevaluateHypothesisV1
       parameters:
         - name: hypothesis_id
@@ -623,8 +623,21 @@ paths:
           schema:
             type: string
       responses:
+        '200':
+          description: Re-evaluation successfully executed via domain EvaluationPipeline
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [evaluation, message]
+                properties:
+                  evaluation:
+                    $ref: '#/components/schemas/EvaluationResult'
+                  message:
+                    type: string
+                    example: Re-evaluation completed via evaluation pipeline.
         '202':
-          description: Re-evaluation successfully enqueued
+          description: Re-evaluation successfully enqueued to background consumer
           content:
             application/json:
               schema:

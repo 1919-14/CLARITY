@@ -131,7 +131,7 @@ def get_db_manager(database_uri: str = None) -> DatabaseManager:
             "A production database (e.g., MySQL) URL must be configured."
         )
 
-    if _db_manager is None or (database_uri is not None and _db_manager.database_uri != resolved_uri):
+    if _db_manager is None or _db_manager.database_uri != resolved_uri:
         _db_manager = DatabaseManager(resolved_uri)
     return _db_manager
 

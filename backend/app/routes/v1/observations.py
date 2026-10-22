@@ -11,7 +11,7 @@ from flask import Blueprint, current_app, jsonify
 
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
-from .shared import error_response, serialize_observation
+from .shared import error_response, log_safe_error, serialize_observation
 
 observations_v1_bp = Blueprint("observations_v1", __name__)
 
@@ -37,7 +37,7 @@ def get_observation(observation_id: str):
                 return error_response(f"Observation '{observation_id}' not found.", 404)
             serialized = serialize_observation(obs)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_observation db error: %s", exc)
+        log_safe_error("get_observation db error", exc)
         return error_response("An internal error occurred while retrieving the observation.", 500)
 
     return jsonify({"observation": serialized}), 200

@@ -22,16 +22,20 @@ from typing import Optional
 from flask import Blueprint, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
-from ...adapters.persistence.models import (
-    AuditEventModel,
-    HypothesisModel,
-    HypothesisRevisionModel,
-    RunModel,
-    UsageRecordModel,
-)
 from ...adapters.persistence.repository import ClarityRepository
+from ...services.hypothesis_service import (
+    HypothesisNotFoundError,
+    propose_hypothesis_service,
+)
+from ...services.run_service import (
+    RunConflictError,
+    RunNotFoundError,
+    cancel_run_service,
+    create_run_service,
+)
 from .shared import (
     error_response,
+    log_safe_error,
     serialize_benchmark,
     serialize_hypothesis,
     serialize_observation,
@@ -145,49 +149,23 @@ def create_run():
     db = _get_db()
     try:
         with db.session_scope() as session:
-            repo = ClarityRepository(session)
-            if repo.get_run(run_id):
-                return error_response(f"A run with ID '{run_id}' already exists.", 409)
-
-            run = RunModel(
-                run_id=run_id,
+            run = create_run_service(
+                session=session,
                 name=name.strip(),
                 domain=domain.strip(),
-                status="pending",
                 execution_mode=execution_mode,
                 sampling_strategy=sampling_strategy.strip(),
                 max_queries=max_queries,
                 max_evaluations=max_evaluations,
                 max_runtime_seconds=max_runtime_seconds,
                 spend_ceiling_usd=spend_ceiling_usd,
-            )
-            repo.create_run(run)
-
-            usage = UsageRecordModel(
-                usage_id=f"use-{uuid.uuid4().hex[:12]}",
                 run_id=run_id,
-                queries_executed=0,
-                evaluations_scheduled=0,
-                evaluations_completed=0,
-                estimated_cost_usd=0.0,
-                live_accruing_cost_usd=0.0,
-                settled_cost_usd=None,
-                is_budget_exhausted=False,
-            )
-            repo.record_usage(usage)
-
-            repo.record_audit_event(
-                AuditEventModel(
-                    event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                    run_id=run_id,
-                    event_type="RUN_CREATED",
-                    actor="researcher",
-                    metadata_json={"name": run.name, "domain": run.domain},
-                )
             )
             serialized = serialize_run(run)
+    except RunConflictError as exc:
+        return error_response(str(exc), 409)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("create_run db error: %s", exc)
+        log_safe_error("create_run db error", exc)
         return error_response("An internal error occurred while creating the run.", 500)
 
     return jsonify({"run": serialized}), 201
@@ -220,7 +198,7 @@ def list_runs():
             runs = repo.list_runs(limit=limit, offset=offset, status_filter=status_filter)
             serialized = [serialize_run(r) for r in runs]
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("list_runs db error: %s", exc)
+        log_safe_error("list_runs db error", exc)
         return error_response("An internal error occurred while listing runs.", 500)
 
     return jsonify({
@@ -244,7 +222,7 @@ def get_run(run_id: str):
                 return error_response(f"Run '{run_id}' not found.", 404)
             serialized = serialize_run(run)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_run db error: %s", exc)
+        log_safe_error("get_run db error", exc)
         return error_response("An internal error occurred while retrieving the run.", 500)
 
     return jsonify({"run": serialized}), 200
@@ -267,33 +245,18 @@ def cancel_run(run_id: str):
     db = _get_db()
     try:
         with db.session_scope() as session:
-            repo = ClarityRepository(session)
-            run = repo.get_run(run_id)
-            if not run:
-                return error_response(f"Run '{run_id}' not found.", 404)
-
-            terminal_states = {"completed", "cancelled", "failed", "budget_exhausted"}
-            if run.status in terminal_states:
-                return error_response(
-                    f"Run '{run_id}' is already in terminal state '{run.status}' and cannot be cancelled.",
-                    409,
-                )
-
-            run.status = "cancelled"
-            run.stop_reason = reason
-
-            repo.record_audit_event(
-                AuditEventModel(
-                    event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                    run_id=run_id,
-                    event_type="RUN_CANCELLED",
-                    actor="researcher",
-                    metadata_json={"stop_reason": run.stop_reason},
-                )
+            run = cancel_run_service(
+                session=session,
+                run_id=run_id,
+                stop_reason=reason,
             )
             serialized = serialize_run(run)
+    except RunNotFoundError as exc:
+        return error_response(str(exc), 404)
+    except RunConflictError as exc:
+        return error_response(str(exc), 409)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("cancel_run db error: %s", exc)
+        log_safe_error("cancel_run db error", exc)
         return error_response("An internal error occurred while cancelling the run.", 500)
 
     return jsonify({"run": serialized, "message": "Run cancelled successfully."}), 200
@@ -328,7 +291,7 @@ def get_run_metrics(run_id: str):
                 "usage": serialize_usage(latest_usage),
             }
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_run_metrics db error: %s", exc)
+        log_safe_error("get_run_metrics db error", exc)
         return error_response("An internal error occurred while retrieving metrics.", 500)
 
     return jsonify(payload), 200
@@ -360,7 +323,7 @@ def get_run_report(run_id: str):
 
             serialized = serialize_report(report)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_run_report db error: %s", exc)
+        log_safe_error("get_run_report db error", exc)
         return error_response("An internal error occurred while retrieving the report.", 500)
 
     return jsonify({"report": serialized}), 200
@@ -380,7 +343,7 @@ def get_run_benchmarks(run_id: str):
             benchmarks = repo.get_benchmark_results_for_run(run_id)
             serialized = [serialize_benchmark(b) for b in benchmarks]
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_run_benchmarks db error: %s", exc)
+        log_safe_error("get_run_benchmarks db error", exc)
         return error_response("An internal error occurred while retrieving benchmarks.", 500)
 
     return jsonify({
@@ -414,17 +377,22 @@ def list_run_observations(run_id: str):
             if not run:
                 return error_response(f"Run '{run_id}' not found.", 404)
 
-            all_obs = repo.list_observations_for_run(run_id, only_training=only_training)
-            page = all_obs[offset: offset + limit]
+            total = repo.count_observations_for_run(run_id, only_training=only_training)
+            page = repo.list_observations_for_run(
+                run_id,
+                only_training=only_training,
+                limit=limit,
+                offset=offset,
+            )
             serialized = [serialize_observation(o) for o in page]
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("list_run_observations db error: %s", exc)
+        log_safe_error("list_run_observations db error", exc)
         return error_response("An internal error occurred while retrieving observations.", 500)
 
     return jsonify({
         "observations": serialized,
         "count": len(serialized),
-        "total": len(all_obs),
+        "total": total,
         "limit": limit,
         "offset": offset,
         "only_training": only_training,
@@ -452,7 +420,7 @@ def list_run_hypotheses(run_id: str):
             hypotheses = repo.list_hypotheses_for_run(run_id, include_excluded=include_excluded)
             serialized = [serialize_hypothesis(h, repo) for h in hypotheses]
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("list_run_hypotheses db error: %s", exc)
+        log_safe_error("list_run_hypotheses db error", exc)
         return error_response("An internal error occurred while retrieving hypotheses.", 500)
 
     return jsonify({
@@ -503,47 +471,24 @@ def create_run_hypothesis(run_id: str):
     try:
         with db.session_scope() as session:
             repo = ClarityRepository(session)
-            run = repo.get_run(run_id)
-            if not run:
-                return error_response(f"Run '{run_id}' not found.", 404)
-
-            if repo.get_hypothesis(hypothesis_id):
+            if hypothesis_id and repo.get_hypothesis(hypothesis_id):
                 return error_response(f"Hypothesis '{hypothesis_id}' already exists.", 409)
 
-            hyp = HypothesisModel(
-                hypothesis_id=hypothesis_id,
+            hyp = propose_hypothesis_service(
+                session=session,
                 run_id=run_id,
                 model_family=model_family.strip(),
-                current_revision=1,
-                is_pinned=False,
-                is_excluded=False,
-            )
-            rev = HypothesisRevisionModel(
-                revision_id=f"rev-{uuid.uuid4().hex[:12]}",
-                revision_number=1,
                 formula=formula.strip(),
                 parameters=parameters,
                 complexity=complexity,
                 creation_source="researcher",
-            )
-            repo.create_hypothesis_with_initial_revision(hyp, rev)
-
-            repo.record_audit_event(
-                AuditEventModel(
-                    event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                    run_id=run_id,
-                    event_type="HYPOTHESIS_PROPOSED",
-                    actor="researcher",
-                    metadata_json={
-                        "hypothesis_id": hyp.hypothesis_id,
-                        "formula": rev.formula,
-                        "model_family": hyp.model_family,
-                    },
-                )
+                hypothesis_id=hypothesis_id,
             )
             serialized = serialize_hypothesis(hyp, repo)
+    except HypothesisNotFoundError as exc:
+        return error_response(str(exc), 404)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("create_run_hypothesis db error: %s", exc)
+        log_safe_error("create_run_hypothesis db error", exc)
         return error_response("An internal error occurred while creating the hypothesis.", 500)
 
     return jsonify({"hypothesis": serialized}), 201
