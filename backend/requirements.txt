@@ -8,3 +8,6 @@ PyMySQL==1.1.1
 # Optional LLM Scientist provider SDK (Issue #41). Imported lazily; deterministic
 # discovery works without LLM configuration.
 groq==0.5.0
+# Nodus Compute remote execution SDK (Issue #12). Imported lazily inside the
+# NodusExecutionAdapter; ordinary application imports do not require it.
+nodus-compute==1.0.27
