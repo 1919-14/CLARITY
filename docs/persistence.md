@@ -34,7 +34,8 @@ erDiagram
 1. **`runs`:**
    * Primary Key: `run_id` (String(64))
    * Attributes: `name`, `domain`, `status`, `execution_mode`, `sampling_strategy`, `stop_reason`
-   * Limits: `max_queries`, `max_evaluations`, `max_runtime_seconds`, `spend_ceiling_usd`
+   * Limits: `max_queries`, `max_evaluations`, `max_runtime_seconds`, `spend_ceiling_usd`, `max_concurrent_remote_tasks`, `max_generated_hypotheses`
+   * Budget: `budget_config_json` (canonical validated snapshot), `deadline_at`
    * Timestamps: `created_at`, `started_at`, `completed_at`
    * Indexes: `idx_runs_status`, `idx_runs_created_at`
 
@@ -91,6 +92,22 @@ erDiagram
     * Primary Key: `report_id` (String(64))
     * Foreign Key: `run_id`
     * Attributes: `status`, `ranked_candidates` (JSON), `stop_reason`, `limitations`, `artifact_uri`
+
+12. **`run_budget_usage`:** (Issue #14)
+    * Primary Key: `run_id` (one row per run, `ON DELETE CASCADE`)
+    * Counters: `queries_reserved`, `queries_completed`, `queries_failed`, `queries_released`, `evaluations_reserved`, `evaluations_completed`, `evaluations_failed`, `evaluations_released`, `hypotheses_generated`, `hypotheses_released`, `active_remote_tasks`
+    * Costs: `estimated_cost_usd`, `accruing_cost_usd`, `settled_cost_usd` (all nullable), `cost_data_state`
+    * Exhaustion: `is_exhausted`, `stop_reason`, `exhausted_at`
+    * Invariant: admission is a single conditional `UPDATE` against these counters (`counter < limit`), so concurrent workers cannot overshoot.
+
+13. **`budget_reservations`:** (Issue #14)
+    * Primary Key: `reservation_id` (String(64))
+    * Foreign Key: `run_id` (`ON DELETE CASCADE`)
+    * Unique Constraint: (`run_id`, `resource`, `operation_id`) — idempotency key
+    * Attributes: `resource` (`oracle_query`, `candidate_evaluation`, `remote_task`, `hypothesis`), `state` (`reserved`, `committed`, `released`, `ambiguous`), `quantity`, `details_json` (JSON), `expires_at`
+    * Index: `idx_budget_reservation_run_state` (`run_id`, `resource`, `state`)
+
+See [budget-manager.md](budget-manager.md) for accounting and recovery semantics.
 
 ---
 
