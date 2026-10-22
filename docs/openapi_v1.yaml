@@ -1,0 +1,1342 @@
+openapi: 3.0.3
+info:
+  title: CLARITY REST API v1
+  description: >-
+    Versioned REST API for CLARITY (Closed-Loop Active Research & Inference
+    System). Connects the React frontend and external clients to CLARITY's
+    discovery engine and MySQL persistence layer. Employs explicit allowlist
+    serialization to ensure domain algorithms, evaluator ground truth, and
+    internal database credentials are never leaked.
+  version: 1.0.0
+servers:
+  - url: /api/v1
+    description: Current API v1 base path
+
+paths:
+  /health:
+    get:
+      summary: Service health & dependency check
+      description: >-
+        Probes backend runtime status and database connectivity using a
+        safe query. Returns 503 if database connectivity fails. Never exposes
+        credentials or internal tracebacks.
+      operationId: getHealthV1
+      responses:
+        '200':
+          description: Backend service and all dependencies are healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service degraded (e.g. database unreachable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /runs:
+    get:
+      summary: List discovery runs
+      description: Retrieves a paginated list of discovery runs with optional status filtering.
+      operationId: listRunsV1
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of runs to return (1-200)
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: offset
+          in: query
+          description: Number of runs to skip (>= 0)
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: status
+          in: query
+          description: Optional run status filter
+          required: false
+          schema:
+            type: string
+            enum: [pending, running, completed, cancelled, failed, budget_exhausted]
+      responses:
+        '200':
+          description: List of runs matching criteria
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs, count, limit, offset, status_filter]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Run'
+                  count:
+                    type: integer
+                    example: 10
+                  limit:
+                    type: integer
+                    example: 50
+                  offset:
+                    type: integer
+                    example: 0
+                  status_filter:
+                    type: string
+                    nullable: true
+                    example: running
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Create a new discovery run
+      description: Validates configuration, creates a discovery run record, initializes usage tracking, and logs an audit event.
+      operationId: createRunV1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunCreateRequest'
+      responses:
+        '201':
+          description: Run successfully created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    $ref: '#/components/schemas/Run'
+        '400':
+          description: Validation error in request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Run with specified run_id already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}:
+    get:
+      summary: Retrieve a discovery run
+      description: Returns configuration and lifecycle metadata for a specific run.
+      operationId: getRunV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Run details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    $ref: '#/components/schemas/Run'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/cancel:
+    post:
+      summary: Cancel an active run
+      description: Transitions an active or pending run to cancelled status and emits an audit event. Fails if run is already in a terminal state.
+      operationId: cancelRunV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunCancelRequest'
+      responses:
+        '200':
+          description: Run successfully cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run, message]
+                properties:
+                  run:
+                    $ref: '#/components/schemas/Run'
+                  message:
+                    type: string
+                    example: Run cancelled successfully.
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Run is already in a terminal state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/metrics:
+    get:
+      summary: Get execution & cost metrics
+      description: Retrieves query counts, candidate evaluation progress, and distinct cost categories (estimated, live-accruing, and settled).
+      operationId: getRunMetricsV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Run metrics and budget usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunMetricsResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/report:
+    get:
+      summary: Get scientific summary report
+      description: Returns the final scientific report for a completed run, or status pending if not yet generated.
+      operationId: getRunReportV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Scientific report or pending notification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id:
+                    type: string
+                  report:
+                    $ref: '#/components/schemas/Report'
+                  status:
+                    type: string
+                    example: pending
+                  message:
+                    type: string
+                    example: Report has not yet been generated for this run.
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/benchmarks:
+    get:
+      summary: Get benchmark results
+      description: Retrieves ground-truth benchmark comparison metrics (Hit@K, MRR, held-out MAE/RMSE) for a run.
+      operationId: getRunBenchmarksV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Benchmark comparison results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [benchmarks, count]
+                properties:
+                  benchmarks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BenchmarkResult'
+                  count:
+                    type: integer
+                    example: 1
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/observations:
+    get:
+      summary: List observations for a run
+      description: Returns observation queries and outputs with pagination. Ground truth formulas are never exposed.
+      operationId: listRunObservationsV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Maximum items to return (1-200)
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: offset
+          in: query
+          description: Items to skip (>= 0)
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: only_training
+          in: query
+          description: When true, filters out held-out evaluation observations
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated observations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [observations, count, total, limit, offset, only_training]
+                properties:
+                  observations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Observation'
+                  count:
+                    type: integer
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  only_training:
+                    type: boolean
+        '400':
+          description: Invalid pagination parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /runs/{run_id}/hypotheses:
+    get:
+      summary: List hypotheses for a run
+      description: Retrieves candidate hypotheses for a run, including their revision history and latest evaluation.
+      operationId: listRunHypothesesV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+        - name: include_excluded
+          in: query
+          description: Whether to include hypotheses marked as excluded
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: List of hypotheses
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypotheses, count]
+                properties:
+                  hypotheses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Hypothesis'
+                  count:
+                    type: integer
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Propose a researcher hypothesis
+      description: Submits a new candidate hypothesis with an initial revision and logs an audit event.
+      operationId: createRunHypothesisV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HypothesisCreateRequest'
+      responses:
+        '201':
+          description: Hypothesis successfully created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis]
+                properties:
+                  hypothesis:
+                    $ref: '#/components/schemas/Hypothesis'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Hypothesis ID already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /hypotheses/{hypothesis_id}:
+    get:
+      summary: Retrieve a single hypothesis
+      description: Returns hypothesis details, full revision history, and latest evaluation result.
+      operationId: getHypothesisV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          description: Unique hypothesis identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Hypothesis details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis]
+                properties:
+                  hypothesis:
+                    $ref: '#/components/schemas/Hypothesis'
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    patch:
+      summary: Update hypothesis flags
+      description: Updates researcher preference flags (is_pinned, is_excluded) non-destructively and logs audit events.
+      operationId: updateHypothesisV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          description: Unique hypothesis identifier
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HypothesisUpdateRequest'
+      responses:
+        '200':
+          description: Updated hypothesis
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis]
+                properties:
+                  hypothesis:
+                    $ref: '#/components/schemas/Hypothesis'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /hypotheses/{hypothesis_id}/reevaluate:
+    post:
+      summary: Request hypothesis re-evaluation
+      description: >-
+        Routes re-evaluation through the domain EvaluationPipeline against current run observations,
+        or enqueues to an asynchronous worker queue when a dispatcher is configured.
+      operationId: reevaluateHypothesisV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          description: Unique hypothesis identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Re-evaluation successfully executed via domain EvaluationPipeline
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [evaluation, message]
+                properties:
+                  evaluation:
+                    $ref: '#/components/schemas/EvaluationResult'
+                  message:
+                    type: string
+                    example: Re-evaluation completed via evaluation pipeline.
+        '202':
+          description: Re-evaluation successfully enqueued to background consumer
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [evaluation, message]
+                properties:
+                  evaluation:
+                    $ref: '#/components/schemas/EvaluationResult'
+                  message:
+                    type: string
+                    example: Re-evaluation enqueued. Poll the evaluation history for results.
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Hypothesis has no revisions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /hypotheses/{hypothesis_id}/evaluations:
+    get:
+      summary: List hypothesis evaluation history
+      description: Returns all evaluation results for the latest revision, sorted most recent first.
+      operationId: listHypothesisEvaluationsV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          description: Unique hypothesis identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of evaluation results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis_id, revision_id, evaluations, count]
+                properties:
+                  hypothesis_id:
+                    type: string
+                  revision_id:
+                    type: string
+                  evaluations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EvaluationResult'
+                  count:
+                    type: integer
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /observations/{observation_id}:
+    get:
+      summary: Retrieve a single observation
+      description: Returns input/output values and execution status for an observation. Ground truth formulas are never exposed.
+      operationId: getObservationV1
+      parameters:
+        - name: observation_id
+          in: path
+          required: true
+          description: Unique observation identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Observation details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [observation]
+                properties:
+                  observation:
+                    $ref: '#/components/schemas/Observation'
+        '404':
+          description: Observation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error, message, status_code]
+      properties:
+        error:
+          type: string
+          example: Bad Request
+        message:
+          type: string
+          example: Field 'name' is required and must be a non-empty string.
+        status_code:
+          type: integer
+          example: 400
+        details:
+          nullable: true
+          description: Optional structured context for validation errors
+
+    HealthResponse:
+      type: object
+      required: [status, service, version, environment, timestamp, dependencies]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+          example: healthy
+        service:
+          type: string
+          example: clarity-backend
+        version:
+          type: string
+          example: v1
+        environment:
+          type: string
+          example: development
+        timestamp:
+          type: string
+          format: date-time
+        dependencies:
+          type: object
+          required: [database]
+          properties:
+            database:
+              type: string
+              enum: [ok, unavailable]
+              example: ok
+
+    Run:
+      type: object
+      required:
+        - run_id
+        - name
+        - domain
+        - status
+        - execution_mode
+        - sampling_strategy
+        - stop_reason
+        - max_queries
+        - max_evaluations
+        - max_runtime_seconds
+        - spend_ceiling_usd
+        - created_at
+        - started_at
+        - completed_at
+      properties:
+        run_id:
+          type: string
+          example: run-a1b2c3d4e5f6
+        name:
+          type: string
+          example: Polynomial Active Discovery
+        domain:
+          type: string
+          example: 1d_polynomial
+        status:
+          type: string
+          enum: [pending, running, completed, cancelled, failed, budget_exhausted]
+          example: pending
+        execution_mode:
+          type: string
+          enum: [local, nodus_remote, mock]
+          example: local
+        sampling_strategy:
+          type: string
+          example: active_disagreement
+        stop_reason:
+          type: string
+          nullable: true
+          example: null
+        max_queries:
+          type: integer
+          nullable: true
+          example: 20
+        max_evaluations:
+          type: integer
+          nullable: true
+          example: 60
+        max_runtime_seconds:
+          type: integer
+          nullable: true
+          example: 180
+        spend_ceiling_usd:
+          type: number
+          format: float
+          nullable: true
+          example: 10.0
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    RunCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Human-readable name for the run
+          example: Polynomial Active Discovery
+        domain:
+          type: string
+          description: Problem domain name
+          default: default
+          example: 1d_polynomial
+        execution_mode:
+          type: string
+          enum: [local, nodus_remote, mock]
+          default: local
+          example: local
+        sampling_strategy:
+          type: string
+          default: active_disagreement
+          example: active_disagreement
+        max_queries:
+          type: integer
+          minimum: 1
+          description: Maximum allowed oracle queries
+          example: 20
+        max_evaluations:
+          type: integer
+          minimum: 1
+          description: Maximum candidate evaluations
+          example: 60
+        max_runtime_seconds:
+          type: integer
+          minimum: 1
+          description: Timeout limit in seconds
+          example: 180
+        spend_ceiling_usd:
+          type: number
+          format: float
+          minimum: 0.0
+          description: Hard spending ceiling in USD
+          example: 10.0
+        run_id:
+          type: string
+          description: Optional caller-specified unique run identifier
+          example: run-custom-001
+
+    RunCancelRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Reason for cancellation
+          example: Stopped by researcher after inspection
+
+    HypothesisRevision:
+      type: object
+      required: [revision_id, revision_number, formula, parameters, complexity, creation_source, created_at]
+      properties:
+        revision_id:
+          type: string
+          example: rev-01
+        revision_number:
+          type: integer
+          example: 1
+        formula:
+          type: string
+          example: y = 0.5x^2 - 1.0
+        parameters:
+          type: object
+          example:
+            c2: 0.5
+            c0: -1.0
+        complexity:
+          type: integer
+          example: 2
+        creation_source:
+          type: string
+          example: researcher
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    EvaluationResult:
+      type: object
+      required: [evaluation_id, status, sample_count, dataset_version, metrics, held_out_metrics, error_message, evaluated_at]
+      properties:
+        evaluation_id:
+          type: string
+          example: eva-01
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+          example: completed
+        sample_count:
+          type: integer
+          example: 10
+        dataset_version:
+          type: integer
+          example: 10
+        metrics:
+          type: object
+          example:
+            mae: 0.045
+            rmse: 0.052
+        held_out_metrics:
+          type: object
+          nullable: true
+          example:
+            mae: 0.081
+            rmse: 0.093
+        error_message:
+          type: string
+          nullable: true
+        evaluated_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Hypothesis:
+      type: object
+      required:
+        - hypothesis_id
+        - run_id
+        - model_family
+        - current_revision
+        - is_pinned
+        - is_excluded
+        - created_at
+        - updated_at
+        - latest_revision
+        - latest_evaluation
+      properties:
+        hypothesis_id:
+          type: string
+          example: hyp-01
+        run_id:
+          type: string
+          example: run-01
+        model_family:
+          type: string
+          example: 1d_polynomial
+        current_revision:
+          type: integer
+          example: 1
+        is_pinned:
+          type: boolean
+          example: false
+        is_excluded:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        latest_revision:
+          $ref: '#/components/schemas/HypothesisRevision'
+          nullable: true
+        latest_evaluation:
+          $ref: '#/components/schemas/EvaluationResult'
+          nullable: true
+        revisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/HypothesisRevision'
+
+    HypothesisCreateRequest:
+      type: object
+      required: [model_family, formula]
+      properties:
+        model_family:
+          type: string
+          description: Target model family
+          example: 1d_polynomial
+        formula:
+          type: string
+          description: Mathematical or symbolic expression
+          example: y = 2.0 * x + 1.0
+        parameters:
+          type: object
+          description: Dictionary of coefficients/parameters
+          default: {}
+          example:
+            slope: 2.0
+            intercept: 1.0
+        complexity:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Complexity proxy metric
+          example: 1
+        hypothesis_id:
+          type: string
+          description: Optional caller-specified hypothesis identifier
+
+    HypothesisUpdateRequest:
+      type: object
+      description: At least one of is_pinned or is_excluded must be provided.
+      properties:
+        is_pinned:
+          type: boolean
+          description: Pin display preference (does not change scientific ranking)
+          example: true
+        is_excluded:
+          type: boolean
+          description: Exclude candidate from active search (preserves historical evaluation)
+          example: false
+
+    Observation:
+      type: object
+      required:
+        - observation_id
+        - run_id
+        - input_id
+        - input_values
+        - output_values
+        - status
+        - sequence_number
+        - is_held_out
+        - error_code
+        - error_message
+        - noise_metadata
+        - created_at
+      properties:
+        observation_id:
+          type: string
+          example: obs-01
+        run_id:
+          type: string
+          example: run-01
+        input_id:
+          type: string
+          example: inp-01
+        input_values:
+          type: object
+          example:
+            x: 2.5
+        output_values:
+          type: object
+          nullable: true
+          example:
+            y: 5.25
+        status:
+          type: string
+          enum: [success, error]
+          example: success
+        sequence_number:
+          type: integer
+          example: 1
+        is_held_out:
+          type: boolean
+          example: false
+        error_code:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        noise_metadata:
+          type: object
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    UsageRecord:
+      type: object
+      required:
+        - queries_executed
+        - evaluations_scheduled
+        - evaluations_completed
+        - estimated_cost_usd
+        - live_accruing_cost_usd
+        - settled_cost_usd
+        - is_budget_exhausted
+        - exhaustion_reason
+        - recorded_at
+      properties:
+        queries_executed:
+          type: integer
+          nullable: true
+          example: 12
+        evaluations_scheduled:
+          type: integer
+          nullable: true
+          example: 30
+        evaluations_completed:
+          type: integer
+          nullable: true
+          example: 28
+        estimated_cost_usd:
+          type: number
+          format: float
+          nullable: true
+          example: 0.084
+        live_accruing_cost_usd:
+          type: number
+          format: float
+          nullable: true
+          example: 0.079
+        settled_cost_usd:
+          type: number
+          format: float
+          nullable: true
+          example: null
+        is_budget_exhausted:
+          type: boolean
+          example: false
+        exhaustion_reason:
+          type: string
+          nullable: true
+        recorded_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    RunMetricsResponse:
+      type: object
+      required: [run_id, status, stop_reason, limits, usage]
+      properties:
+        run_id:
+          type: string
+          example: run-01
+        status:
+          type: string
+          example: running
+        stop_reason:
+          type: string
+          nullable: true
+        limits:
+          type: object
+          properties:
+            max_queries:
+              type: integer
+              nullable: true
+            max_evaluations:
+              type: integer
+              nullable: true
+            max_runtime_seconds:
+              type: integer
+              nullable: true
+            spend_ceiling_usd:
+              type: number
+              format: float
+              nullable: true
+        usage:
+          $ref: '#/components/schemas/UsageRecord'
+
+    Report:
+      type: object
+      required:
+        - report_id
+        - run_id
+        - status
+        - ranked_candidates
+        - stop_reason
+        - limitations
+        - artifact_uri
+        - generated_at
+      properties:
+        report_id:
+          type: string
+          example: rep-01
+        run_id:
+          type: string
+          example: run-01
+        status:
+          type: string
+          example: generated
+        ranked_candidates:
+          type: array
+          items:
+            type: object
+          example:
+            - hypothesis_id: hyp-01
+              rank: 1
+              mae: 0.012
+        stop_reason:
+          type: string
+          nullable: true
+          example: target_accuracy_reached
+        limitations:
+          type: string
+          nullable: true
+          example: Evaluated within [-10, 10] domain.
+        artifact_uri:
+          type: string
+          nullable: true
+          example: reports/run-01-summary.json
+        generated_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    BenchmarkResult:
+      type: object
+      required:
+        - benchmark_id
+        - run_id
+        - benchmark_name
+        - target_label
+        - hit_at_1
+        - hit_at_3
+        - hit_at_5
+        - reciprocal_rank
+        - best_candidate_id
+        - queries_to_target
+        - held_out_mae
+        - held_out_rmse
+        - baseline_type
+        - efficiency_gain
+        - executed_at
+      properties:
+        benchmark_id:
+          type: string
+          example: bench-01
+        run_id:
+          type: string
+          example: run-01
+        benchmark_name:
+          type: string
+          example: polynomial_cubic_benchmark
+        target_label:
+          type: string
+          example: target_cubic
+        hit_at_1:
+          type: boolean
+          example: true
+        hit_at_3:
+          type: boolean
+          example: true
+        hit_at_5:
+          type: boolean
+          example: true
+        reciprocal_rank:
+          type: number
+          format: float
+          example: 1.0
+        best_candidate_id:
+          type: string
+          example: hyp-target
+        queries_to_target:
+          type: integer
+          nullable: true
+          example: 4
+        held_out_mae:
+          type: number
+          format: float
+          nullable: true
+          example: 0.012
+        held_out_rmse:
+          type: number
+          format: float
+          nullable: true
+          example: 0.018
+        baseline_type:
+          type: string
+          example: random_sampling
+        efficiency_gain:
+          type: string
+          example: 3.2x
+        executed_at:
+          type: string
+          format: date-time
+          nullable: true
