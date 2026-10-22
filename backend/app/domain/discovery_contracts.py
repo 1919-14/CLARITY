@@ -46,6 +46,7 @@ from .experiment_generator import (
 )
 from .fitting import FittingConfig
 from .candidate_generator import HypothesisGenerationConfig
+from .llm_scientist_contracts import ScientistRoundRecord
 from .ranking_contracts import RankingPolicyConfig, RankingResult
 
 # ==============================================================================
@@ -75,6 +76,9 @@ WARNING_EXPERIMENT_POOL_UNDERSIZED = "EXPERIMENT_POOL_UNDERSIZED"
 WARNING_DUPLICATE_QUERY_SKIPPED = "DUPLICATE_QUERY_SKIPPED"
 WARNING_RANKING_STALE = "RANKING_STALE"
 WARNING_EXPERIMENT_SELECTION_UNAVAILABLE = "EXPERIMENT_SELECTION_UNAVAILABLE"
+WARNING_SCIENTIST_FALLBACK = "SCIENTIST_FALLBACK"
+WARNING_SCIENTIST_ROUND_FAILED = "SCIENTIST_ROUND_FAILED"
+WARNING_SCIENTIST_PROPOSAL_SKIPPED = "SCIENTIST_PROPOSAL_SKIPPED"
 
 DISCOVERY_ENGINE_VERSION = "1.0.0"
 
@@ -116,6 +120,7 @@ class DiscoveryTerminationReason(str, Enum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     EXPERIMENT_POOL_EXHAUSTED = "experiment_pool_exhausted"
+    NO_INFORMATIVE_EXPERIMENT_AVAILABLE = "no_informative_experiment_available"
     CONSECUTIVE_ORACLE_FAILURES = "consecutive_oracle_failures"
     COMPONENT_FAILURE = "component_failure"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
@@ -218,6 +223,9 @@ class DiscoveryRunConfig:
       max_experiment_candidates_per_iteration: Maximum candidates from one
         generated batch that may be tried (validation/deduplication rejects
         them) before the run terminates as "no valid experiment".
+      max_query_retries: Maximum retries for explicitly retryable transient
+        oracle exceptions. Each retry is a new invocation and consumes budget;
+        the default is zero (no automatic retries).
     """
 
     max_query_budget: int = 10
@@ -235,6 +243,7 @@ class DiscoveryRunConfig:
     experiment_seed: Optional[int] = None
     dataset_id: Optional[str] = None
     max_experiment_candidates_per_iteration: int = 25
+    max_query_retries: int = 0
 
     def __post_init__(self) -> None:
         self._validate()
@@ -303,6 +312,12 @@ class DiscoveryRunConfig:
             raise ValueError(
                 "max_experiment_candidates_per_iteration must be an integer >= 1."
             )
+        if (
+            isinstance(self.max_query_retries, bool)
+            or not isinstance(self.max_query_retries, int)
+            or not 0 <= self.max_query_retries <= 5
+        ):
+            raise ValueError("max_query_retries must be an integer between 0 and 5.")
 
     def to_dict(self) -> Dict[str, Any]:
         """Return the sanitized, reproducible configuration snapshot."""
@@ -344,6 +359,7 @@ class DiscoveryRunConfig:
             "max_experiment_candidates_per_iteration": (
                 self.max_experiment_candidates_per_iteration
             ),
+            "max_query_retries": self.max_query_retries,
         }
 
 
@@ -365,15 +381,30 @@ class QueryAccounting:
     attempted_queries: int
     successful_queries: int
     failed_queries: int
+    rejected_queries: int = 0
+    duplicate_queries: int = 0
+    retry_count: int = 0
+    in_flight_queries: int = 0
 
     def __post_init__(self) -> None:
         if self.attempted_queries > self.max_query_budget:
             raise ValueError("attempted_queries must not exceed max_query_budget.")
-        if self.successful_queries + self.failed_queries != self.attempted_queries:
+        if (
+            self.successful_queries + self.failed_queries + self.in_flight_queries
+            != self.attempted_queries
+        ):
             raise ValueError(
-                "successful_queries + failed_queries must equal attempted_queries."
+                "successful_queries + failed_queries + in_flight_queries must equal attempted_queries."
             )
-        if min(self.attempted_queries, self.successful_queries, self.failed_queries) < 0:
+        if min(
+            self.attempted_queries,
+            self.successful_queries,
+            self.failed_queries,
+            self.rejected_queries,
+            self.duplicate_queries,
+            self.retry_count,
+            self.in_flight_queries,
+        ) < 0:
             raise ValueError("query counters must be non-negative.")
 
     @property
@@ -386,7 +417,11 @@ class QueryAccounting:
             "attempted_queries": self.attempted_queries,
             "successful_queries": self.successful_queries,
             "failed_queries": self.failed_queries,
+            "rejected_queries": self.rejected_queries,
+            "duplicate_queries": self.duplicate_queries,
+            "retry_count": self.retry_count,
             "remaining_queries": self.remaining_queries,
+            "in_flight_queries": self.in_flight_queries,
         }
 
 
@@ -654,7 +689,8 @@ class DiscoveryRunResult:
         only for a snapshot taken while the run is still active.
       config: Sanitized reproducibility configuration.
       iterations_completed: Completed outer iterations.
-      query_accounting: Attempted/successful/failed/remaining query counters.
+      query_accounting: Attempted/successful/failed/rejected/duplicate/retry
+        diagnostics and remaining query budget.
       hypotheses: Candidate hypotheses, stable IDs preserved.
       evaluations: Latest EvaluationResult per hypothesis, candidate order.
       ranking: Latest valid ranking snapshot, or None when ranking never ran.
@@ -666,6 +702,9 @@ class DiscoveryRunResult:
       warnings: Structured non-fatal warnings.
       ranking_is_fresh: False when a new observation was committed but the
         evaluation/ranking refresh failed; the ranking snapshot is then stale.
+      scientist_history: One auditable record per optional LLM Scientist proposal
+        round (Issue #41), including provider failures and fallbacks. Empty for
+        deterministic-only runs.
       limitations: Human-readable limitations of this run.
       started_at / finished_at: UTC ISO-8601 timestamps.
     """
@@ -686,6 +725,7 @@ class DiscoveryRunResult:
     errors: Tuple[StructuredError, ...] = ()
     warnings: Tuple[StructuredError, ...] = ()
     ranking_is_fresh: bool = False
+    scientist_history: Tuple[ScientistRoundRecord, ...] = ()
     limitations: Tuple[str, ...] = ()
     started_at: str = field(default_factory=utc_now_iso)
     finished_at: str = field(default_factory=utc_now_iso)
@@ -729,6 +769,7 @@ class DiscoveryRunResult:
             "ingestion_history": [record.to_dict() for record in self.ingestion_history],
             "errors": [error.to_dict() for error in self.errors],
             "warnings": [warning.to_dict() for warning in self.warnings],
+            "scientist_history": [record.to_dict() for record in self.scientist_history],
             "limitations": list(self.limitations),
         }
         verify_no_ground_truth_leakage(data)
@@ -767,6 +808,9 @@ __all__ = [
     "WARNING_DUPLICATE_QUERY_SKIPPED",
     "WARNING_RANKING_STALE",
     "WARNING_EXPERIMENT_SELECTION_UNAVAILABLE",
+    "WARNING_SCIENTIST_FALLBACK",
+    "WARNING_SCIENTIST_ROUND_FAILED",
+    "WARNING_SCIENTIST_PROPOSAL_SKIPPED",
     "DISCOVERY_ENGINE_VERSION",
     "DiscoveryRunError",
     "DiscoveryLifecycleStatus",

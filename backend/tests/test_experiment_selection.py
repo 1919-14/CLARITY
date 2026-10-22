@@ -991,7 +991,10 @@ def test_engine_terminates_safely_when_selection_has_no_candidate():
     result = engine.run()
 
     assert result.status == DiscoveryLifecycleStatus.TERMINATED_NO_EXPERIMENTS
-    assert result.termination_reason == DiscoveryTerminationReason.EXPERIMENT_POOL_EXHAUSTED
+    assert (
+        result.termination_reason
+        == DiscoveryTerminationReason.NO_INFORMATIVE_EXPERIMENT_AVAILABLE
+    )
     assert oracle.submitted == []
     assert result.query_accounting.attempted_queries == 0
     warnings = [warning.code for warning in result.warnings]
