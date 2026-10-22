@@ -300,8 +300,18 @@ def local_runner(**config: Any) -> ParallelEvaluationRunner:
 
 
 def remote_runner(adapter: Any = None, **config: Any) -> ParallelEvaluationRunner:
+    """Remote runner for adapter-level tests.
+
+    These tests exercise adapter and orchestration semantics rather than the
+    persisted budget, so they opt out of the remote budget requirement
+    explicitly. Application composition never uses this flag.
+    """
     adapter = adapter if adapter is not None else FakeBatchAdapter()
-    return ParallelEvaluationRunner(adapter, make_parallel_config("nodus_parallel", **config))
+    return ParallelEvaluationRunner(
+        adapter,
+        make_parallel_config("nodus_parallel", **config),
+        allow_unbudgeted_remote=True,
+    )
 
 
 # ===========================================================================

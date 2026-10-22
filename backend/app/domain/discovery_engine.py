@@ -336,6 +336,16 @@ class DiscoveryEngine:
     def query_accounting(self) -> QueryAccounting:
         return self._accounting()
 
+    @property
+    def budget(self) -> Optional[RunBudgetPort]:
+        """The persisted budget port this engine was composed with, if any.
+
+        Exposed so a composition boundary can verify that the authoritative
+        budget it resolved is the one actually attached to the engine instead
+        of trusting the factory to have passed it through.
+        """
+        return self._budget
+
     # ------------------------------------------------------------------
     # Cancellation controls
     # ------------------------------------------------------------------

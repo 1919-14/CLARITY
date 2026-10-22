@@ -377,7 +377,8 @@ or a 100% remaining bar.
 | Remote scheduling | Per-run slot acquisition around each adapter batch; effective concurrency is the minimum of global and per-run limits |
 | Hypothesis generation | `propose_hypothesis_service` reserves one slot before persisting a new hypothesis; the engine reserves generator/scientist candidates it adopts |
 | Run lifecycle | `budget_exhausted` status + `stop_reason` + `BUDGET_EXHAUSTED` audit; terminal cancellation and failure are never overwritten |
-| API | Nested/legacy budget validation on create; `GET /runs/{id}/budget`; `budget` block in metrics |
+| Execution composition | `execute_persisted_run` resolves the persisted budget, builds the `RunBudgetManager`, and verifies the engine factory attached that exact port; a run without a resolvable budget raises `RunBudgetUnavailable` and dispatches nothing |
+| API | Nested/legacy budget validation on create; `GET /runs/{id}/budget`; `budget` block in metrics; `POST /runs/{id}/start` executes only through the composition above |
 | Dashboard | Run-ID budget panel showing limits vs usage, remaining capacity, concurrency, runtime, cost states, and exhaustion |
 
 ---
@@ -408,6 +409,7 @@ limit.
 cd backend
 python -m pytest tests/test_budget_manager.py -q
 python -m pytest tests/api/test_v1_budget.py -q
+python -m pytest tests/api/test_v1_run_execution.py -q
 python -m pytest tests/test_query_controls.py tests/test_nodus_parallel.py -q
 python -m pytest -q
 ```
@@ -420,7 +422,10 @@ ten-thread admission races, retry accounting, runtime boundaries, idempotent
 exhaustion, preservation of completed observations, cost-state honesty, remote
 slot recovery with and without a live provider task, simultaneous duplicate slot
 acquisitions, lease-aware release of a live slot, and hypothesis/evaluation
-limits. Frontend changes:
+limits. `tests/api/test_v1_run_execution.py` creates a run through the API,
+starts it through the API, and proves the persisted query limit stops it without
+any manual budget injection, including the fail-closed case where a factory
+returns an engine without the budget. Frontend changes:
 `cd frontend && npm run lint && npm run build`.
 
 ---
@@ -440,11 +445,14 @@ limits. Frontend changes:
 6. **SQLite concurrency uses a short process guard** for lock contention; the
    database conditional `UPDATE` remains the cross-process authority (MySQL in
    production).
-7. **Budget injection, not API launch.** `POST /runs/{id}/start` starts a queued
-   run through the lifecycle manager; a persisted budget governs execution only
-   when a `RunBudgetManager` is injected into `DiscoveryEngine` and
-   `ParallelEvaluationRunner`. `GET /budget` lazily initializes the counter row
-   for legacy runs.
+7. **Execution needs a configured engine factory.** `POST /runs/{id}/start`
+   always executes through `execute_persisted_run`, which resolves the persisted
+   budget and injects the `RunBudgetManager` itself; a factory cannot widen or
+   drop it. When no `RUN_ENGINE_FACTORY` is configured the run is marked running
+   but no work is dispatched (`execution.dispatched: false`), so nothing executes
+   unbudgeted. `GET /budget` lazily initializes the counter row for legacy runs.
+   Remote (`nodus_parallel`) evaluation runners refuse to be constructed without
+   a budget port unless a test explicitly opts out.
 8. **Stale remote slots stay charged while a provider task is live.** A worker
    that vanished without reporting cannot be distinguished from one whose
    provider task is still running, so `recover_stale_reservations` keeps those

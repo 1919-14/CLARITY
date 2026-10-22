@@ -49,6 +49,7 @@ from ...services.hypothesis_service import (
     HypothesisNotFoundError,
     propose_hypothesis_service,
 )
+from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
     RunConflictError,
     create_run_service,
@@ -381,10 +382,15 @@ def cancel_run(run_id: str):
 def start_run(run_id: str):
     """POST /api/v1/runs/<run_id>/start — Start execution of a queued discovery run.
 
-    Transitions run to RUNNING and connects to the orchestration service.
-    Returns 409 if already running or terminal.
+    Transitions the run to RUNNING and, when a ``RUN_ENGINE_FACTORY`` is
+    configured, executes it through ``execute_persisted_run`` so the persisted
+    per-run budget is always attached. Without a configured factory the run
+    stays RUNNING with no work dispatched; this endpoint never starts unbudgeted
+    execution. Returns 409 if already running or terminal, and 503 when the run
+    cannot be composed with its persisted budget.
     """
     db = _get_db()
+    engine_factory = current_app.config.get("RUN_ENGINE_FACTORY")
     try:
         with db.session_scope() as session:
             repo = ClarityRepository(session)
@@ -403,10 +409,44 @@ def start_run(run_id: str):
         log_safe_error("start_run db error", exc)
         return error_response("An internal error occurred while starting the run.", 500)
 
+    execution: Optional[dict] = None
+    if callable(engine_factory):
+        try:
+            result = execute_persisted_run(
+                run_id,
+                db,
+                engine_factory,
+                orchestrator=current_app.config.get("RUN_ORCHESTRATOR"),
+            )
+            execution = {
+                "dispatched": True,
+                "status": getattr(result, "status", None).value
+                if getattr(result, "status", None) is not None
+                else None,
+            }
+        except RunBudgetUnavailable as exc:
+            # Fail closed: report the run cannot execute budgeted work rather
+            # than letting it proceed unbudgeted.
+            return error_response(str(exc), 503, error="Service Unavailable")
+        except Exception as exc:  # noqa: BLE001
+            log_safe_error("start_run execution error", exc)
+            return error_response(
+                "The run was started but its execution failed.", 500
+            )
+
+    if execution is None:
+        execution = {
+            "dispatched": False,
+            "reason": "no_engine_factory_configured",
+        }
+
     return jsonify({
         "run": serialized,
         "status": progress.to_dict(),
-        "message": "Run execution started successfully.",
+        "execution": execution,
+        "message": "Run execution started successfully."
+        if execution.get("dispatched")
+        else "Run marked running; no execution provider is configured.",
     }), 200
 
 

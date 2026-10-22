@@ -486,6 +486,7 @@ class ParallelEvaluationRunner:
         fitting_config: Optional[FittingConfig] = None,
         sleep: Callable[[float], None] = time.sleep,
         budget: Optional[ParallelBudgetPort] = None,
+        allow_unbudgeted_remote: bool = False,
     ) -> None:
         self._adapter = adapter
         if budget is not None and not isinstance(budget, ParallelBudgetPort):
@@ -501,6 +502,23 @@ class ParallelEvaluationRunner:
                 ERROR_INVALID_CONFIG,
                 "config must be a ParallelEvaluationConfig.",
                 {"received_type": type(self._config).__name__},
+            )
+        if (
+            self._config.execution_mode == ParallelExecutionMode.NODUS_PARALLEL
+            and budget is None
+            and not allow_unbudgeted_remote
+        ):
+            # Remote execution without a persisted budget could not enforce the
+            # per-run remote concurrency limit, so it fails closed instead of
+            # silently running unbounded. Local sequential work needs no remote
+            # slot, so it stays usable without a budget. The flag exists only
+            # for adapter-level tests and never for application composition.
+            raise ParallelConfigurationError(
+                ERROR_INVALID_CONFIG,
+                "Remote parallel evaluation requires the per-run budget port so that "
+                "the remote concurrency limit is enforced; refusing to construct an "
+                "unbudgeted remote runner.",
+                {"execution_mode": self._config.execution_mode.value},
             )
         self._fitting_config = fitting_config if fitting_config is not None else FittingConfig()
         config_error = self._fitting_config.validate()
