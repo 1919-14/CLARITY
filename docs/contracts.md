@@ -1082,3 +1082,68 @@ python -m pytest -q
 python -m benchmarks.llm_scientist_benchmark
 ```
 
+## 10. Parallel Evaluation Task Contract (Issue #13)
+
+`backend/app/services/evaluation_task_runtime.py` defines the serializable
+contract shared by in-process and remote evaluation.
+
+### 10.1 Payload (`schema_version = "1.0"`)
+
+```text
+schema_version: "1.0"
+request_id, hypothesis_id
+candidate: HypothesisRepresentation.to_dict()
+observations: [Observation.to_dict()]      # only IDs referenced by the request
+observation_ids: [str]                     # training partition
+held_out_observation_ids: [str]
+metric_names: [str]
+fitting_config: {method, rank_tolerance}
+dataset_id: str | null
+```
+
+Payloads are validated by `build_evaluation_task_payload` (strict JSON,
+`allow_nan=False`, no ground-truth keys), again by
+`validate_evaluation_task_payload` on the worker side, and by the Nodus
+adapter's own payload validator. Missing observation IDs are not synthesized:
+the evaluation pipeline counts them as exclusions exactly as it does locally.
+
+### 10.2 Result envelope
+
+```text
+schema_version: "1.0"
+hypothesis_id, request_id
+status: "succeeded" | "failed"
+evaluation: EvaluationResult.to_dict() | null
+error: {code, message, details} | null
+```
+
+`status` describes the task. A failed fit is a **valid** scientific result: the
+envelope is `succeeded` and `evaluation.status = "failed"` with no metrics and no
+fitted specification. A task-level failure carries no evaluation object.
+
+Parsing is strict: unknown schema versions/statuses, non-finite metrics, a
+failed evaluation without an error, and hypothesis-ID mismatches are rejected
+with `NODUS_PARALLEL_INVALID_TASK_RESULT`.
+
+### 10.3 Orchestration outcomes
+
+`EvaluationTaskResult` records `task_id`, `hypothesis_id`, `request_id`,
+`outcome` (`succeeded` / `failed` / `timed_out` / `cancelled`),
+`execution_mode`, `attempts`, the validated evaluation **or** a structured error,
+provider task ID, provider metadata, task timestamps/duration, and
+`cancellation_requested`. Constructing a succeeded result without an evaluation,
+or a non-succeeded result with one, raises — a failure can never carry a score.
+
+`ParallelEvaluationBatch` contains results in original request order plus a
+`ParallelExecutionSummary` (requested/actual mode, requested/submitted/completed/
+evaluation-failure/failed/timed-out/cancelled counts, concurrency, retry attempts,
+duration, provider-metadata availability, and cost fields that stay `null` /
+`unavailable`). Missing, duplicate, unexpected, and mismatched results are
+recorded explicitly; gaps are never filled with zeros or inferred scores.
+
+### 10.4 Tests
+
+```bash
+cd backend
+python -m pytest tests/test_nodus_parallel.py -q
+```
