@@ -725,3 +725,146 @@ class TestRunOrchestrator:
         assert res == mock_result
         assert mock_engine.run.call_count == 2
         assert m.get_progress("orch-retry").status == RunLifecycleState.COMPLETED
+
+    def test_orchestrator_cancels_actively_iterating_engine(self):
+        """Verify that cancellation requested while DiscoveryEngine is actively iterating
+        stops new work from being scheduled, terminates cleanly, and confirms cancellation."""
+        from app.domain.run_orchestrator import RunOrchestrator
+        from app.domain.discovery_engine import DiscoveryEngine
+        from app.domain.discovery_contracts import (
+            DiscoveryRunConfig,
+            DiscoveryLifecycleStatus,
+            DiscoveryTerminationReason,
+        )
+        from app.domain.contracts import ExperimentInput, Observation
+
+        run_id = "orch-iter-cancel"
+        m = _new_manager()
+        _init(m, run_id)
+
+        queries_attempted = []
+
+        class IterationCancellingOracle:
+            def validate_input(self, inp):
+                return None
+
+            def query(self, inp):
+                queries_attempted.append(dict(inp.values))
+                # On the first iteration query, trigger cancellation via lifecycle manager
+                m.request_cancellation(run_id, reason="Cancel mid-execution")
+                return Observation(
+                    input_id=inp.input_id,
+                    input_values=dict(inp.values),
+                    output_values={"y": 42.0},
+                    sequence_number=len(queries_attempted),
+                )
+
+        oracle = IterationCancellingOracle()
+        config = DiscoveryRunConfig(
+            max_query_budget=10,
+            max_iterations=10,
+        )
+        engine = DiscoveryEngine(oracle, config=config, run_id=run_id)
+
+        orchestrator = RunOrchestrator(lifecycle_manager=m)
+        result = orchestrator.execute_run(run_id, engine)
+
+        # Proves no further work gets scheduled after cancellation:
+        # Budget was 10, max_iterations was 10, but exactly 1 query was executed.
+        assert len(queries_attempted) == 1
+        assert result is not None
+        assert result.status == DiscoveryLifecycleStatus.TERMINATED_CANCELLED
+        assert result.termination_reason == DiscoveryTerminationReason.CANCELLED
+
+        # Lifecycle confirmed cancellation
+        prog = m.get_progress(run_id)
+        assert prog.status == RunLifecycleState.CANCELLED
+        assert "Cancel mid-execution" in (prog.stop_reason or "")
+
+    def test_diagnostics_and_error_message_sanitization(self):
+        """Verify that error messages, stop reasons, and diagnostics strip secrets,
+        passwords, JWTs, and oracle formulas, and truncate long content."""
+        m = _new_manager()
+        _init(m, "leak-test")
+
+        # 1. Test fail_run with sensitive error message
+        secret_err = RuntimeError(
+            "Failed connecting to oracle: token=secret123 password='hunter2' with JWT: "
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.doNotLeakThis"
+        )
+        m.fail_run(
+            "leak-test",
+            error=secret_err,
+            diagnostics={
+                "debug_info": "error with ground_truth: 2*x^2 + 1 and oracle_formula=sin(x)",
+                "secret_key": "should_be_stripped",
+                "normal_detail": "regular text",
+            },
+        )
+        prog = m.get_progress("leak-test")
+        assert "hunter2" not in prog.failure_details["error_message"]
+        assert "secret123" not in prog.failure_details["error_message"]
+        assert "doNotLeakThis" not in prog.failure_details["error_message"]
+        assert "[REDACTED]" in prog.failure_details["error_message"]
+        assert "secret_key" not in prog.failure_details
+        assert "2*x^2 + 1" not in prog.failure_details["debug_info"]
+        assert "sin(x)" not in prog.failure_details["debug_info"]
+        assert prog.failure_details["normal_detail"] == "regular text"
+
+        # 2. Test truncation
+        long_text = "E" * 700
+        sanitized = m._sanitize_text(long_text)
+        assert len(sanitized) < 600
+        assert "... [truncated]" in sanitized
+
+    def test_update_progress_monotonic_counter_merging(self, tmp_path):
+        """Verify that update_progress merges usage counters monotonically and
+        does not overwrite existing higher counters written by accounting."""
+        from datetime import datetime, timezone
+        from app.adapters.persistence.database import DatabaseManager
+        from app.adapters.persistence.repository import ClarityRepository
+        from app.adapters.persistence.models import UsageRecordModel
+
+        db_path = tmp_path / "test_merge.db"
+        db = DatabaseManager(f"sqlite:///{db_path}")
+        db.create_all_tables()
+
+        m = _new_manager()
+        with db.session_scope() as session:
+            m.initialize_run("merge-1", "Test Run", max_queries=10, session=session)
+            # Normal accounting writes 5 queries executed
+            repo = ClarityRepository(session)
+            repo.record_usage(
+                UsageRecordModel(
+                    usage_id="use-1",
+                    run_id="merge-1",
+                    queries_executed=5,
+                    evaluations_completed=3,
+                    evaluations_scheduled=3,
+                    estimated_cost_usd=0.0,
+                    live_accruing_cost_usd=0.0,
+                    recorded_at=datetime.now(timezone.utc),
+                )
+            )
+
+        # Now lifecycle reports earlier progress (e.g. 2 queries used)
+        with db.session_scope() as session:
+            m.update_progress("merge-1", queries_used=2, evaluations_completed=1, session=session)
+
+        # Verify counters were merged safely and not overwritten by stale progress
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            latest = repo.get_latest_usage_for_run("merge-1")
+            assert latest.queries_executed == 5
+            assert latest.evaluations_completed == 3
+
+        # Updating with higher progress increases counters monotonically
+        with db.session_scope() as session:
+            m.update_progress("merge-1", queries_used=8, evaluations_completed=6, session=session)
+
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            latest = repo.get_latest_usage_for_run("merge-1")
+            assert latest.queries_executed == 8
+            assert latest.evaluations_completed == 6
+

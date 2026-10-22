@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import re
 import threading
 from typing import Any, Callable, Dict, List, Optional, Set
 import uuid
@@ -440,9 +441,9 @@ class RunLifecycleManager:
             if phase:
                 progress.phase = phase
             if activity:
-                progress.current_activity = activity
+                progress.current_activity = self._sanitize_text(activity)
             if stop_reason:
-                progress.stop_reason = stop_reason
+                progress.stop_reason = self._sanitize_text(stop_reason)
             if failure_details:
                 # Sanitize failure details to avoid leaking credentials or ground truth
                 progress.failure_details = self._sanitize_diagnostics(failure_details)
@@ -542,11 +543,11 @@ class RunLifecycleManager:
             if phase:
                 progress.phase = phase
             if queries_used is not None:
-                progress.queries_used = queries_used
+                progress.queries_used = max(progress.queries_used or 0, queries_used)
             if evaluations_completed is not None:
-                progress.evaluations_completed = evaluations_completed
+                progress.evaluations_completed = max(progress.evaluations_completed or 0, evaluations_completed)
             if activity:
-                progress.current_activity = activity
+                progress.current_activity = self._sanitize_text(activity)
             progress.last_updated_at = _utc_now()
 
             if session:
@@ -554,22 +555,28 @@ class RunLifecycleManager:
                 from ..adapters.persistence.models import AuditEventModel, UsageRecordModel
                 repo = ClarityRepository(session)
 
-                # Durably persist progress to usage_records table
+                # Durably persist progress to usage_records table with safe monotonic counter merging
                 latest_usage = repo.get_latest_usage_for_run(run_id)
                 queries_count = progress.queries_used
                 evals_count = progress.evaluations_completed
                 if latest_usage:
-                    latest_usage.queries_executed = queries_count
-                    latest_usage.evaluations_completed = evals_count
+                    if queries_count is not None:
+                        latest_usage.queries_executed = max(latest_usage.queries_executed or 0, queries_count)
+                    if evals_count is not None:
+                        latest_usage.evaluations_completed = max(latest_usage.evaluations_completed or 0, evals_count)
+                        if latest_usage.evaluations_scheduled is not None:
+                            latest_usage.evaluations_scheduled = max(
+                                latest_usage.evaluations_scheduled, latest_usage.evaluations_completed
+                            )
                     latest_usage.recorded_at = progress.last_updated_at
                 else:
                     repo.record_usage(
                         UsageRecordModel(
                             usage_id=f"use-prog-{uuid.uuid4().hex[:10]}",
                             run_id=run_id,
-                            queries_executed=queries_count,
-                            evaluations_scheduled=evals_count,
-                            evaluations_completed=evals_count,
+                            queries_executed=queries_count or 0,
+                            evaluations_scheduled=evals_count or 0,
+                            evaluations_completed=evals_count or 0,
                             estimated_cost_usd=0.0,
                             live_accruing_cost_usd=0.0,
                             settled_cost_usd=None,
@@ -663,7 +670,7 @@ class RunLifecycleManager:
     def confirm_cancellation(
         self,
         run_id: str,
-        reason: str = "Cancellation confirmed after task cleanup",
+        reason: Optional[str] = None,
         session=None,
     ) -> RunProgress:
         """Confirm shutdown of a cancelling run, transitioning state from CANCELLING to CANCELLED."""
@@ -679,11 +686,12 @@ class RunLifecycleManager:
                     reason=f"Cannot confirm cancellation of run in state '{progress.status.value}'.",
                 )
 
+            final_reason = self._sanitize_text(progress.stop_reason or reason or "Cancellation confirmed after task cleanup")
             return self.transition_state(
                 run_id,
                 target_state=RunLifecycleState.CANCELLED,
                 phase=RunPhase.TERMINATED,
-                stop_reason=reason or progress.stop_reason,
+                stop_reason=final_reason,
                 activity="Run cancelled: execution confirmed stopped",
                 session=session,
             )
@@ -719,10 +727,10 @@ class RunLifecycleManager:
         session=None,
     ) -> RunProgress:
         """Fail a run and record structured, sanitized diagnostic context."""
-        reason = str(error)
+        safe_reason = self._sanitize_text(str(error)) or "Unknown failure"
         diag = {
             "error_code": failure_code,
-            "error_message": reason,
+            "error_message": safe_reason,
             "timestamp": _utc_now().isoformat(),
         }
         if diagnostics and isinstance(diagnostics, dict):
@@ -731,9 +739,9 @@ class RunLifecycleManager:
             run_id,
             target_state=RunLifecycleState.FAILED,
             phase=RunPhase.TERMINATED,
-            stop_reason=reason,
+            stop_reason=safe_reason,
             failure_details=diag,
-            activity=f"Failed: {reason}",
+            activity=f"Failed: {safe_reason}",
             session=session,
         )
 
@@ -863,14 +871,50 @@ class RunLifecycleManager:
 
         raise RunNotFoundError(f"Run '{run_id}' not found.")
 
+    @staticmethod
+    def _sanitize_text(text: Optional[str]) -> Optional[str]:
+        """Strip sensitive credentials, tokens, formulas, and ground truth from text strings."""
+        if text is None:
+            return None
+        if not isinstance(text, str):
+            text = str(text)
+
+        # Redact JWT tokens
+        sanitized = re.sub(
+            r"ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+            "[REDACTED_TOKEN]",
+            text,
+        )
+
+        # Redact sensitive key-value pairs (password, secret, token, api_key, ground_truth, oracle_formula, etc.)
+        pattern = re.compile(
+            r"(?i)\b(password|secret|token|api[_-]?key|bearer|ground_truth|oracle_formula|evaluator_only|true_formula)\b(\s*[:=]\s*)(['\"]?[^\s,'\"}]+['\"]?)",
+        )
+        sanitized = pattern.sub(r"\1\2[REDACTED]", sanitized)
+
+        # Redact Authorization: Bearer <token>
+        sanitized = re.sub(
+            r"(?i)\b(Bearer\s+)[A-Za-z0-9_\-\.]{8,}\b",
+            r"\1[REDACTED]",
+            sanitized,
+        )
+
+        # Truncate length
+        if len(sanitized) > 500:
+            sanitized = sanitized[:500] + "... [truncated]"
+
+        return sanitized
+
     def _sanitize_diagnostics(self, diag: Dict[str, Any]) -> Dict[str, Any]:
-        """Strip sensitive keys and formulas from diagnostic dictionary."""
+        """Strip sensitive keys, redact sensitive text patterns, and truncate long strings."""
         sanitized = {}
         for k, v in diag.items():
-            if any(secret_term in k.lower() for secret_term in ["secret", "password", "token", "ground_truth", "oracle_formula"]):
+            if any(secret_term in k.lower() for secret_term in ["secret", "password", "token", "ground_truth", "oracle_formula", "evaluator_only"]):
                 continue
-            if isinstance(v, str) and len(v) > 500:
-                v = v[:500] + "... [truncated]"
+            if isinstance(v, str):
+                v = self._sanitize_text(v)
+            elif isinstance(v, dict):
+                v = self._sanitize_diagnostics(v)
             sanitized[k] = v
         return sanitized
 

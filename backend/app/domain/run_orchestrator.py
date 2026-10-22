@@ -59,6 +59,19 @@ class RunOrchestrator:
         def _get_session():
             return session_factory() if session_factory else None
 
+        # Register cancellation hooks and token on the engine so in-flight execution halts immediately upon cancellation
+        if hasattr(engine, "request_cancellation"):
+            self.lifecycle_manager.register_cancellation_hook(
+                run_id, lambda r_id=None: engine.request_cancellation()
+            )
+        elif hasattr(engine, "cancel"):
+            self.lifecycle_manager.register_cancellation_hook(
+                run_id, lambda r_id=None: engine.cancel()
+            )
+
+        if hasattr(engine, "set_cancellation_token"):
+            engine.set_cancellation_token(lambda: self.lifecycle_manager.is_cancellation_requested(run_id))
+
         # Check cancellation before starting computation
         if self.lifecycle_manager.is_cancellation_requested(run_id):
             session = _get_session()
@@ -108,6 +121,16 @@ class RunOrchestrator:
             )
             return result
         except Exception as exc:
+            if self.lifecycle_manager.is_cancellation_requested(run_id):
+                session = _get_session()
+                try:
+                    self.lifecycle_manager.confirm_cancellation(
+                        run_id, reason="Cancelled during discovery execution", session=session
+                    )
+                finally:
+                    if session:
+                        session.close()
+                return None
             session = _get_session()
             try:
                 category = self.retry_policy.classify_error(exc)
@@ -151,7 +174,23 @@ class RunOrchestrator:
                     session.close()
             return None
 
-        result = engine.run(initial_observations)
+        cancellation_token = lambda: self.lifecycle_manager.is_cancellation_requested(run_id)
+        try:
+            result = engine.run(initial_observations, cancellation_token=cancellation_token)
+        except TypeError:
+            result = engine.run(initial_observations)
+
+        if result is None:
+            if self.lifecycle_manager.is_cancellation_requested(run_id):
+                session = session_factory() if session_factory else None
+                try:
+                    self.lifecycle_manager.confirm_cancellation(
+                        run_id, reason="Cancelled during discovery execution", session=session
+                    )
+                finally:
+                    if session:
+                        session.close()
+            return None
 
         # Synchronize terminal result with lifecycle manager
         session = session_factory() if session_factory else None
@@ -170,7 +209,10 @@ class RunOrchestrator:
                 session=session,
             )
 
-            if self.lifecycle_manager.is_cancellation_requested(run_id):
+            if (
+                self.lifecycle_manager.is_cancellation_requested(run_id)
+                or getattr(result, "status", None) == DiscoveryLifecycleStatus.TERMINATED_CANCELLED
+            ):
                 self.lifecycle_manager.confirm_cancellation(
                     run_id, reason="Cancelled during discovery execution", session=session
                 )

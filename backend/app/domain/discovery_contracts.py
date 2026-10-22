@@ -109,6 +109,7 @@ class DiscoveryLifecycleStatus(str, Enum):
     TERMINATED_BUDGET_EXHAUSTED = "terminated_budget_exhausted"
     TERMINATED_MAX_ITERATIONS = "terminated_max_iterations"
     TERMINATED_NO_EXPERIMENTS = "terminated_no_experiments"
+    TERMINATED_CANCELLED = "terminated_cancelled"
     FAILED = "failed"
 
 
@@ -124,6 +125,7 @@ class DiscoveryTerminationReason(str, Enum):
     CONSECUTIVE_ORACLE_FAILURES = "consecutive_oracle_failures"
     COMPONENT_FAILURE = "component_failure"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
+    CANCELLED = "cancelled"
 
 
 # ==============================================================================
