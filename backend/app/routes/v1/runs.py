@@ -44,6 +44,7 @@ from ...services.budget_service import (
     persist_exhaustion,
 )
 from ...services.hypothesis_service import (
+    HypothesisAlreadyAdmittedError,
     HypothesisBudgetExhaustedError,
     HypothesisNotFoundError,
     propose_hypothesis_service,
@@ -671,6 +672,13 @@ def create_run_hypothesis(run_id: str):
             log_safe_error("persist hypothesis budget exhaustion error", persist_exc)
         return error_response(
             "The run's hypothesis generation limit has been reached.",
+            409,
+            error="Conflict",
+            details=exc.to_dict(),
+        )
+    except HypothesisAlreadyAdmittedError as exc:
+        return error_response(
+            "This hypothesis was already admitted against the run's budget.",
             409,
             error="Conflict",
             details=exc.to_dict(),

@@ -265,6 +265,44 @@ class BudgetNotFoundError(LookupError):
     """Raised when a run has no budget record and cannot be resolved."""
 
 
+class BudgetReservationReplay(Exception):
+    """Raised when an operation id replays an already-delivered reservation.
+
+    Idempotent accounting is preserved: the existing reservation row is left
+    untouched and no capacity is consumed twice. The exception exists because a
+    replay must not authorize a *second* execution of the underlying work. A
+    reservation row only proves that the operation was admitted once; it never
+    proves that the associated oracle call, evaluation, or provider task can be
+    safely repeated.
+    """
+
+    def __init__(
+        self,
+        reservation_id: str,
+        resource: BudgetResource,
+        state: str,
+        operation_id: str,
+    ):
+        self.reservation_id = reservation_id
+        self.resource = resource
+        self.state = state
+        self.operation_id = operation_id
+        super().__init__(
+            f"Operation '{operation_id}' was already reserved for "
+            f"'{resource.value}' (state '{state}'); it is not admitted twice."
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": "DUPLICATE_RESERVATION",
+            "reservation_id": self.reservation_id,
+            "resource": self.resource.value,
+            "state": self.state,
+            "operation_id": self.operation_id,
+            "admitted": False,
+        }
+
+
 # ==============================================================================
 # 4. Budget configuration
 # ==============================================================================
@@ -668,19 +706,33 @@ class RunBudgetPort(Protocol):
         """Raise ``BudgetAdmissionDenied`` when no further work may be admitted."""
 
     def reserve_oracle_query(self, operation_id: str) -> str:
-        """Atomically reserve one oracle invocation; return a reservation token."""
+        """Atomically reserve one oracle invocation; return a reservation token.
+
+        Implementations must raise ``BudgetReservationReplay`` when
+        ``operation_id`` replays an earlier reservation, so a replay can never
+        authorize a second oracle call.
+        """
 
     def record_oracle_query_outcome(self, reservation_id: str, outcome: str) -> None:
         """Record ``completed``, ``failed``, or ``released`` for a reservation."""
 
     def reserve_candidate_evaluations(self, count: int, operation_id: str) -> str:
-        """Atomically reserve *count* candidate evaluations."""
+        """Atomically reserve *count* candidate evaluations.
+
+        The whole quantity is admitted or none of it; a batch that only
+        partially fits the remaining limit is denied. Replays raise
+        ``BudgetReservationReplay``.
+        """
 
     def complete_candidate_evaluation(self, reservation_id: str, succeeded: bool) -> None:
         """Record a terminal evaluation outcome."""
 
     def reserve_hypotheses(self, count: int, operation_id: str) -> str:
-        """Atomically reserve *count* new hypothesis slots."""
+        """Atomically reserve *count* new hypothesis slots.
+
+        The whole quantity is admitted or none of it. Replays raise
+        ``BudgetReservationReplay``.
+        """
 
     def mark_exhausted(
         self,
@@ -732,6 +784,7 @@ __all__ = [
     "BudgetAdmissionDenied",
     "BudgetBackpressure",
     "BudgetNotFoundError",
+    "BudgetReservationReplay",
     "RunBudgetConfig",
     "BudgetLimitStatus",
     "BudgetStatus",

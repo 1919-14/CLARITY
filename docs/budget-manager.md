@@ -133,25 +133,46 @@ Each newly adopted hypothesis entity consumes one unit. Revisions of an existing
 hypothesis do not. Invalid, duplicate, or rejected proposals do not consume the
 budget: the engine reserves only proposals it will actually adopt.
 
-### Idempotency
+### Idempotency and replay
 
 Every reservation has a unique `(run_id, resource, operation_id)` key. Duplicate
-worker delivery of the same logical operation returns the existing reservation
-and never consumes capacity twice. Operation IDs are stable per logical attempt
-(for example `run-123:query:7`), so a crash-retry cannot silently double-charge.
+worker delivery of the same logical operation never consumes capacity twice.
+Operation IDs are stable per logical attempt (for example `run-123:query:7`), so
+a crash-retry cannot silently double-charge.
+
+Idempotent accounting is not the same as re-authorization. A reservation row
+records that an operation was admitted **once**; it never proves that the
+underlying oracle call, evaluation, or provider task may run again. A duplicate
+delivery in any state — `reserved`, `committed`, `released`, or `ambiguous` —
+raises `BudgetReservationReplay` and does not authorize a second execution:
+
+* `DiscoveryEngine` refuses the query and records `DUPLICATE_BUDGET_RESERVATION`
+  instead of calling the oracle again.
+* `ParallelEvaluationRunner` reports the batch as failed rather than dispatching
+  it a second time.
+* `propose_hypothesis_service` raises a conflict instead of writing a second
+  hypothesis under replayed accounting.
+
+Released capacity is reused only by a **new** operation id, never by replaying
+the released one.
 
 ### Atomicity
 
-Admission is a single conditional `UPDATE`:
+A reservation is admitted as a whole quantity or not at all. Admission is a
+single conditional `UPDATE`:
 
 ```sql
 UPDATE run_budget_usage
-   SET queries_reserved = queries_reserved + 1
- WHERE run_id = :run_id AND queries_reserved < :limit
+   SET queries_reserved = queries_reserved + :quantity
+ WHERE run_id = :run_id AND queries_reserved + :quantity <= :limit
 ```
 
-`rowcount = 1` means admitted; `0` means exhausted. The database, not a Python
-counter or process-local semaphore, is the admission authority, so the invariant
+`rowcount = 1` means the full quantity was admitted; `0` means none of it was.
+The predicate includes the requested quantity, so a batch that only partially
+fits the remaining capacity is refused whole instead of pushing the counter past
+the limit (a five-unit limit does not admit a six-unit batch, and does not admit
+a two-unit batch when only one unit remains). The database, not a Python counter
+or process-local semaphore, is the admission authority, so the invariant
 `admitted <= configured limit` holds across threads, workers, and service
 instances. **No transaction is held open across an oracle call, a fit, or a
 remote Nodus task**: reservations and outcomes use short transactions.
@@ -170,9 +191,17 @@ production relies on the conditional `UPDATE` and row locking.
   waiting for the rest, so concurrent runners cannot deadlock.
 * Slots are released when the task is terminal, cancelled, or definitively never
   submitted. Duplicate completion/cancellation events do not double-release.
-* Stale slots from crashed workers are recovered after 900 seconds
-  (`recover_stale_reservations`). Stale query/evaluation/hypothesis reservations
-  are marked `ambiguous` and remain charged.
+* Stale slots from crashed workers are reconciled after 900 seconds
+  (`recover_stale_reservations`). A local reservation TTL proves only that this
+  process stopped reporting; it does not prove the provider task finished. A
+  slot is therefore released only when the persisted provider state shows it
+  cannot belong to a live task, using the invariant that each in-flight remote
+  task holds exactly one slot: `active_remote_tasks - live_remote_tasks` slots
+  are provably free and are released, and every remaining stale slot is marked
+  `ambiguous` and stays charged. This keeps the concurrency ceiling intact for a
+  slow or disconnected worker whose task is still running at the provider.
+* Stale query/evaluation/hypothesis reservations are always marked `ambiguous`
+  and remain charged.
 * The existing global adapter concurrency (`NODUS_MAX_CONCURRENCY`) still applies;
   the effective batch concurrency is the minimum of the global and per-run values.
 * Saturation is **backpressure**, not exhaustion. A batch that cannot obtain
@@ -373,9 +402,12 @@ python -m pytest -q
 
 `tests/test_budget_manager.py` covers configuration validation and zero
 semantics, the exact five-query boundary and the denied sixth attempt,
+whole-quantity batch admission at and beyond the limit boundary, reservation
+replay in the `reserved`, `committed`, `released`, and `ambiguous` states,
 ten-thread admission races, retry accounting, runtime boundaries, idempotent
 exhaustion, preservation of completed observations, cost-state honesty, remote
-slot recovery, and hypothesis/evaluation limits. Frontend changes:
+slot recovery with and without a live provider task, and
+hypothesis/evaluation limits. Frontend changes:
 `cd frontend && npm run lint && npm run build`.
 
 ---
@@ -395,11 +427,17 @@ slot recovery, and hypothesis/evaluation limits. Frontend changes:
 6. **SQLite concurrency uses a short process guard** for lock contention; the
    database conditional `UPDATE` remains the cross-process authority (MySQL in
    production).
-7. **No HTTP run-start endpoint exists yet.** Budgeted execution is wired through
-   `RunBudgetManager` injection into `DiscoveryEngine` and
-   `ParallelEvaluationRunner`; `GET /budget` lazily initializes the counter row
+7. **Budget injection, not API launch.** `POST /runs/{id}/start` starts a queued
+   run through the lifecycle manager; a persisted budget governs execution only
+   when a `RunBudgetManager` is injected into `DiscoveryEngine` and
+   `ParallelEvaluationRunner`. `GET /budget` lazily initializes the counter row
    for legacy runs.
-8. **Align engine-local and persisted limits.** The persisted budget is
+8. **Stale remote slots stay charged while a provider task is live.** A worker
+   that vanished without reporting cannot be distinguished from one whose
+   provider task is still running, so `recover_stale_reservations` keeps those
+   slots charged until the persisted task reaches a terminal state. Provider-aware
+   reconciliation would tighten this further.
+9. **Align engine-local and persisted limits.** The persisted budget is
    authoritative. If a `DiscoveryRunConfig.max_query_budget` is *stricter* than
    the persisted `max_oracle_queries`, the engine stops at its local limit but
    does not falsely mark the persisted budget exhausted (the remaining persisted

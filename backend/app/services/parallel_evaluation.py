@@ -41,7 +41,11 @@ from app.domain.contracts import (
     Observation,
     StructuredError,
 )
-from app.domain.budget_contracts import BudgetAdmissionDenied, ParallelBudgetPort
+from app.domain.budget_contracts import (
+    BudgetAdmissionDenied,
+    BudgetReservationReplay,
+    ParallelBudgetPort,
+)
 from app.domain.fitting import FittingConfig
 from app.services.evaluation_task_runtime import (
     ERROR_INVALID_TASK_RESULT,
@@ -550,6 +554,35 @@ class ParallelEvaluationRunner:
             try:
                 budget_token = self._budget.reserve_candidate_evaluations(
                     len(descriptors), operation_id
+                )
+            except BudgetReservationReplay as exc:
+                # The batch was already admitted under this operation id. The
+                # provider work must not run a second time, so the batch fails
+                # explicitly instead of being dispatched without a new charge.
+                replay_mode = (
+                    MODE_LOCAL_SEQUENTIAL
+                    if self._config.execution_mode == ParallelExecutionMode.LOCAL_SEQUENTIAL
+                    else MODE_NODUS_PARALLEL
+                )
+                replay_results = tuple(
+                    self._failure_result(
+                        descriptor,
+                        attempts=0,
+                        code=ERROR_EVALUATION_BUDGET_EXHAUSTED,
+                        message=(
+                            "This evaluation batch was already reserved; it was not "
+                            "dispatched a second time."
+                        ),
+                        details=exc.to_dict(),
+                        execution_mode=replay_mode,
+                    )
+                    for descriptor in descriptors
+                )
+                return ParallelEvaluationBatch(
+                    results=replay_results,
+                    summary=self._summarize(replay_results, 0, replay_mode, 0.0),
+                    unexpected_task_ids=(),
+                    duplicate_task_ids=(),
                 )
             except BudgetAdmissionDenied as exc:
                 denied_mode = (

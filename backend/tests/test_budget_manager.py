@@ -28,6 +28,7 @@ from app.domain.budget_contracts import (
     DEFAULT_MAX_ORACLE_QUERIES,
     DEFAULT_MAX_RUNTIME_SECONDS,
     BudgetAdmissionDenied,
+    BudgetReservationReplay,
     BudgetResource,
     BudgetStopReason,
     BudgetValidationError,
@@ -45,6 +46,7 @@ from app.domain.contracts import (
     StructuredError,
 )
 from app.domain.discovery_contracts import (
+    ERROR_DUPLICATE_BUDGET_RESERVATION,
     DiscoveryLifecycleStatus,
     DiscoveryRunConfig,
     DiscoveryTerminationReason,
@@ -55,6 +57,8 @@ from app.domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
 from app.domain.ranking_contracts import RankingPolicyConfig
 from app.services.budget_service import (
     RunBudgetManager,
+    _reserve,
+    _resolve,
     cancel_outstanding_run_tasks,
     detect_expired_runs,
     get_budget_status,
@@ -401,14 +405,186 @@ class TestOracleBudget:
         assert usage["queries_completed"] == 1
         assert result.termination_reason == DiscoveryTerminationReason.BUDGET_EXHAUSTED
 
-    def test_duplicate_delivery_of_same_operation_is_idempotent(self, db):
+    def test_duplicate_delivery_keeps_accounting_idempotent(self, db):
         run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=2))
         with db.session_scope() as session:
             first, created_first = reserve_oracle_query(session, run_id, "same-operation")
-            second, created_second = reserve_oracle_query(session, run_id, "same-operation")
         assert created_first is True
-        assert created_second is False
-        assert first == second
+
+        with pytest.raises(BudgetReservationReplay) as exc:
+            with db.session_scope() as session:
+                reserve_oracle_query(session, run_id, "same-operation")
+        assert exc.value.reservation_id == first
+        assert exc.value.state == "reserved"
+        assert read_usage(db, run_id)["queries_reserved"] == 1
+
+
+# ==============================================================================
+# 2b. Whole-quantity admission
+# ==============================================================================
+
+class TestAtomicQuantityAdmission:
+    def test_batch_larger_than_limit_is_refused_whole(self, db):
+        """A six-unit batch against a five-unit limit must not be admitted."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_candidate_evaluations=5))
+        manager = make_manager(db, run_id)
+
+        with pytest.raises(BudgetAdmissionDenied) as exc:
+            manager.reserve_candidate_evaluations(6, "batch-too-big")
+        assert exc.value.reason is BudgetStopReason.EVALUATION_LIMIT_REACHED
+        assert read_usage(db, run_id)["evaluations_reserved"] == 0
+
+    def test_batch_exactly_filling_the_limit_is_admitted(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_candidate_evaluations=5))
+        manager = make_manager(db, run_id)
+        token = manager.reserve_candidate_evaluations(5, "exact-batch")
+        assert token
+        assert read_usage(db, run_id)["evaluations_reserved"] == 5
+
+    def test_batch_is_denied_when_only_one_unit_remains(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_candidate_evaluations=5))
+        manager = make_manager(db, run_id)
+        manager.reserve_candidate_evaluations(4, "first-batch")
+
+        with pytest.raises(BudgetAdmissionDenied):
+            manager.reserve_candidate_evaluations(2, "second-batch")
+        # The refusal is all-or-none: the single remaining unit was not consumed
+        # and the counter did not overshoot the limit.
+        assert read_usage(db, run_id)["evaluations_reserved"] == 4
+
+    def test_hypothesis_batch_cannot_overshoot_the_limit(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_generated_hypotheses=3))
+        manager = make_manager(db, run_id)
+
+        with pytest.raises(BudgetAdmissionDenied):
+            manager.reserve_hypotheses(4, "oversized")
+        assert read_usage(db, run_id)["hypotheses_generated"] == 0
+
+    def test_hypothesis_batch_is_denied_when_one_unit_remains(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_generated_hypotheses=3))
+        manager = make_manager(db, run_id)
+        manager.reserve_hypotheses(2, "fits")
+
+        with pytest.raises(BudgetAdmissionDenied):
+            manager.reserve_hypotheses(2, "one-left")
+        assert read_usage(db, run_id)["hypotheses_generated"] == 2
+
+    def test_unlimited_hypotheses_still_admit_batches(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_generated_hypotheses=None))
+        manager = make_manager(db, run_id)
+        assert manager.reserve_hypotheses(7, "unlimited")
+        assert read_usage(db, run_id)["hypotheses_generated"] == 7
+
+    def test_multi_unit_query_reservation_is_refused_past_the_limit(self, db):
+        """A query limit of one must not admit a two-unit reservation."""
+        clock = Clock()
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=1))
+        with pytest.raises(BudgetAdmissionDenied):
+            with db.session_scope() as session:
+                run, config, usage = _resolve(session, run_id)
+                _reserve(
+                    session,
+                    run,
+                    config,
+                    usage,
+                    BudgetResource.ORACLE_QUERY,
+                    2,
+                    "two-units",
+                    clock(),
+                )
+        assert read_usage(db, run_id)["queries_reserved"] == 0
+
+
+# ==============================================================================
+# 2c. Reservation replay never authorizes a second execution
+# ==============================================================================
+
+class TestReservationReplay:
+    def _replay(self, db, run_id, operation_id):
+        with pytest.raises(BudgetReservationReplay):
+            with db.session_scope() as session:
+                reserve_oracle_query(session, run_id, operation_id)
+
+    def test_replay_of_reserved_reservation_is_refused(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=3))
+        manager = make_manager(db, run_id)
+        manager.reserve_oracle_query("in-flight")
+
+        self._replay(db, run_id, "in-flight")
+        assert read_usage(db, run_id)["queries_reserved"] == 1
+
+    def test_replay_of_committed_reservation_is_refused(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=3))
+        manager = make_manager(db, run_id)
+        token = manager.reserve_oracle_query("done")
+        manager.record_oracle_query_outcome(token, "completed")
+
+        self._replay(db, run_id, "done")
+        usage = read_usage(db, run_id)
+        assert usage["queries_reserved"] == 1
+        assert usage["queries_completed"] == 1
+
+    def test_replay_of_released_reservation_is_refused(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=3))
+        manager = make_manager(db, run_id)
+        token = manager.reserve_oracle_query("returned")
+        manager.release_oracle_query(token)
+
+        self._replay(db, run_id, "returned")
+        # Released capacity stays usable by a *new* operation id, but the
+        # released operation id itself is never re-admitted.
+        assert read_usage(db, run_id)["queries_reserved"] == 0
+        assert manager.reserve_oracle_query("fresh-operation")
+
+    def test_replay_of_ambiguous_reservation_is_refused(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=2))
+        manager = make_manager(db, run_id)
+        token = manager.reserve_oracle_query("unknown")
+        manager.record_oracle_query_outcome(token, "ambiguous")
+
+        self._replay(db, run_id, "unknown")
+        assert read_usage(db, run_id)["queries_reserved"] == 1
+
+    def test_replay_detail_is_structured_and_leaks_nothing(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=1))
+        manager = make_manager(db, run_id)
+        manager.reserve_oracle_query("op")
+
+        with pytest.raises(BudgetReservationReplay) as exc:
+            with db.session_scope() as session:
+                reserve_oracle_query(session, run_id, "op")
+        payload = exc.value.to_dict()
+        assert payload["code"] == "DUPLICATE_RESERVATION"
+        assert payload["admitted"] is False
+        assert payload["resource"] == "oracle_query"
+        assert set(payload) == {
+            "code",
+            "reservation_id",
+            "resource",
+            "state",
+            "operation_id",
+            "admitted",
+        }
+
+    def test_engine_does_not_query_again_on_replay(self, db):
+        """A restarted run reusing the same operation id must not re-query."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=5))
+        manager = make_manager(db, run_id)
+        manager.reserve_oracle_query(f"{run_id}:query:1")
+
+        oracle = PolynomialLocalOracle()
+        engine = DiscoveryEngine(
+            oracle,
+            make_engine_config(max_query_budget=5, max_iterations=2),
+            run_id=run_id,
+            budget=manager,
+        )
+        result = engine.run()
+
+        assert oracle.query_count == 0
+        assert result.status == DiscoveryLifecycleStatus.FAILED
+        codes = [error.code for error in result.errors]
+        assert ERROR_DUPLICATE_BUDGET_RESERVATION in codes
         assert read_usage(db, run_id)["queries_reserved"] == 1
 
 
@@ -529,6 +705,87 @@ class TestBudgetConcurrency:
             )
         assert result["ambiguous"] == 1
         assert read_usage(db, run_id)["queries_reserved"] == 1
+
+    def test_stale_slot_with_a_live_remote_task_stays_charged(self, db):
+        """A local TTL expiry must not free a slot whose provider task is live."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        clock = Clock()
+        manager = RunBudgetManager(db.session_scope, run_id, clock=clock)
+        manager.try_acquire_remote_slots(1, "slow-worker")
+        with db.session_scope() as session:
+            session.add(
+                ComputeTaskModel(
+                    task_id="task-live",
+                    run_id=run_id,
+                    execution_mode="nodus_remote",
+                    provider_task_id="prov-live",
+                    status="running",
+                )
+            )
+
+        with db.session_scope() as session:
+            result = recover_stale_reservations(
+                session, run_id, now=clock() + timedelta(seconds=3600)
+            )
+
+        assert result == {"released": 0, "ambiguous": 1}
+        # The concurrency invariant holds: no new dispatch may start while the
+        # provider task is still running.
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+        assert manager.try_acquire_remote_slots(1, "second-dispatch") is None
+
+    def test_stale_slot_is_released_once_the_remote_task_is_terminal(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        clock = Clock()
+        manager = RunBudgetManager(db.session_scope, run_id, clock=clock)
+        manager.try_acquire_remote_slots(1, "finished-worker")
+        with db.session_scope() as session:
+            session.add(
+                ComputeTaskModel(
+                    task_id="task-done",
+                    run_id=run_id,
+                    execution_mode="nodus_remote",
+                    provider_task_id="prov-done",
+                    status="completed",
+                )
+            )
+
+        with db.session_scope() as session:
+            result = recover_stale_reservations(
+                session, run_id, now=clock() + timedelta(seconds=3600)
+            )
+
+        assert result["released"] == 1
+        assert read_usage(db, run_id)["active_remote_tasks"] == 0
+        assert manager.try_acquire_remote_slots(1, "next-dispatch") is not None
+
+    def test_only_the_surplus_slot_is_released(self, db):
+        """With two slots and one live task, only the provably free slot frees."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=2))
+        clock = Clock()
+        manager = RunBudgetManager(db.session_scope, run_id, clock=clock)
+        manager.try_acquire_remote_slots(1, "slot-live")
+        manager.try_acquire_remote_slots(1, "slot-orphan")
+        with db.session_scope() as session:
+            session.add(
+                ComputeTaskModel(
+                    task_id="task-live",
+                    run_id=run_id,
+                    execution_mode="nodus_remote",
+                    provider_task_id="prov-live",
+                    status="running",
+                )
+            )
+
+        with db.session_scope() as session:
+            result = recover_stale_reservations(
+                session, run_id, now=clock() + timedelta(seconds=3600)
+            )
+
+        assert result == {"released": 1, "ambiguous": 1}
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+        assert manager.try_acquire_remote_slots(1, "after-recovery") is not None
+        assert manager.try_acquire_remote_slots(1, "over-limit") is None
 
 
 # ==============================================================================

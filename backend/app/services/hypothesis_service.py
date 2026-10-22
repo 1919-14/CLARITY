@@ -18,7 +18,7 @@ from ..adapters.persistence.models import (
     ObservationModel,
 )
 from ..adapters.persistence.repository import ClarityRepository
-from ..domain.budget_contracts import BudgetAdmissionDenied
+from ..domain.budget_contracts import BudgetAdmissionDenied, BudgetReservationReplay
 from ..domain.contracts import (
     EvaluationRequest,
     EvaluationResult,
@@ -42,6 +42,17 @@ class HypothesisNotFoundError(HypothesisServiceError):
 
 class HypothesisValidationError(HypothesisServiceError):
     """Raised when hypothesis data fails validation."""
+
+
+class HypothesisAlreadyAdmittedError(HypothesisServiceError):
+    """Raised when a hypothesis id replays an already-admitted generation slot."""
+
+    def __init__(self, replay: BudgetReservationReplay):
+        self.replay = replay
+        super().__init__(str(replay))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.replay.to_dict()
 
 
 class HypothesisBudgetExhaustedError(HypothesisServiceError):
@@ -84,6 +95,11 @@ def propose_hypothesis_service(
         )
     except BudgetAdmissionDenied as exc:
         raise HypothesisBudgetExhaustedError(exc) from None
+    except BudgetReservationReplay as exc:
+        # The slot was already admitted for this hypothesis id; the hypothesis
+        # row it belongs to either exists or was rolled back. Never write a
+        # second one under the replayed accounting.
+        raise HypothesisAlreadyAdmittedError(exc) from None
 
     hypothesis = HypothesisModel(
         hypothesis_id=hyp_id,

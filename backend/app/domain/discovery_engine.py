@@ -39,6 +39,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget_contracts import (
     BudgetAdmissionDenied,
+    BudgetReservationReplay,
     BudgetResource,
     BudgetStopReason,
     BudgetValidationError,
@@ -63,6 +64,7 @@ from .contracts import (
 from .discovery_contracts import (
     DISCOVERY_ENGINE_VERSION,
     ERROR_CANDIDATE_GENERATION_FAILURE,
+    ERROR_DUPLICATE_BUDGET_RESERVATION,
     ERROR_DUPLICATE_OBSERVATION_ID,
     ERROR_DUPLICATE_OBSERVATION_INPUT,
     ERROR_DUPLICATE_QUERY,
@@ -1397,6 +1399,22 @@ class DiscoveryEngine:
                     budget_reservation = self._budget.reserve_oracle_query(
                         f"{self._run_id}:query:{attempt_number}"
                     )
+                except BudgetReservationReplay as replay:
+                    # This exact attempt was already admitted earlier. Replaying
+                    # it would send a second billable query without consuming a
+                    # second slot, so it is refused rather than treated as a
+                    # fresh admission.
+                    with self._query_lock:
+                        self._attempted_queries -= 1
+                        self._in_flight_queries = 0
+                    raise _ComponentFailure(
+                        make_structured_error(
+                            ERROR_DUPLICATE_BUDGET_RESERVATION,
+                            "The oracle query reservation was replayed; the query was "
+                            "not sent a second time.",
+                            replay=replay.to_dict(),
+                        )
+                    ) from None
                 except BudgetAdmissionDenied:
                     with self._query_lock:
                         self._attempted_queries -= 1
@@ -1947,6 +1965,20 @@ class DiscoveryEngine:
                     len(requests),
                     f"{self._run_id}:evaluations:{self._evaluation_sequence}",
                 )
+            except BudgetReservationReplay as replay:
+                # The same evaluation batch was already admitted. Re-running it
+                # would double the provider work without consuming capacity, so
+                # the refresh is reported as a component failure instead.
+                self._ranking_is_fresh = False
+                self._errors.append(
+                    make_structured_error(
+                        ERROR_DUPLICATE_BUDGET_RESERVATION,
+                        "The candidate evaluation reservation was replayed; the batch "
+                        "was not evaluated a second time.",
+                        replay=replay.to_dict(),
+                    )
+                )
+                return False
             except BudgetAdmissionDenied:
                 raise _BudgetExhausted() from None
 

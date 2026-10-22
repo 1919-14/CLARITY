@@ -43,7 +43,7 @@ from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -61,6 +61,7 @@ from ..domain.budget_contracts import (
     BudgetAdmissionDenied,
     BudgetLimitStatus,
     BudgetNotFoundError,
+    BudgetReservationReplay,
     BudgetResource,
     BudgetStatus,
     BudgetStopReason,
@@ -97,6 +98,9 @@ PROMOTABLE_RUN_STATUSES = frozenset({"pending", "queued"})
 DEFAULT_STALE_RESERVATION_SECONDS = 900
 
 CANCELLED_TASK_STATUSES = frozenset({"pending", "running"})
+
+# Compute-task states in which a provider-side execution may still be running.
+LIVE_REMOTE_TASK_STATUSES = frozenset({"pending", "running"})
 
 _COST_UNAVAILABLE_LIMITATION = (
     "Provider cost data is unavailable or not yet settled; monetary values are reported as "
@@ -634,10 +638,16 @@ def _reserve(
     *,
     details: Optional[Mapping[str, Any]] = None,
 ) -> tuple[BudgetReservationModel, bool]:
-    """Atomically admit *quantity* units of *resource*.
+    """Atomically admit all *quantity* units of *resource*, or none of them.
 
-    Raises :class:`BudgetAdmissionDenied`; the caller's transaction is expected
-    to roll back so an un-admitted reservation leaves no counter behind.
+    Each predicate requires ``used + quantity <= limit``, so a batch that only
+    partially fits the remaining capacity is denied instead of being admitted
+    past the limit.
+
+    Raises :class:`BudgetAdmissionDenied` when capacity is unavailable and
+    :class:`BudgetReservationReplay` when ``operation_id`` replays an earlier
+    reservation; in both cases the caller's transaction is expected to roll
+    back so an un-admitted reservation leaves no counter behind.
     """
     if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
         raise ValueError("quantity must be an integer >= 1")
@@ -646,9 +656,17 @@ def _reserve(
         session, run.run_id, resource, operation_id, quantity, now, details
     )
     if not created:
-        # Duplicate delivery of the same logical operation: never consume
-        # capacity twice. The caller treats a non-reserved state as settled.
-        return reservation, False
+        # Duplicate delivery of the same logical operation. Accounting stays
+        # idempotent (nothing is consumed twice), but the replay must not
+        # authorize a second execution: the row's state may be reserved,
+        # committed, released, or ambiguous, and none of those prove that the
+        # underlying work may safely run again.
+        raise BudgetReservationReplay(
+            reservation.reservation_id,
+            resource,
+            reservation.state,
+            operation_id,
+        )
 
     limit = config.limit_for(resource)
     run_id = run.run_id
@@ -659,7 +677,7 @@ def _reserve(
             update(RunBudgetUsageModel)
             .where(
                 RunBudgetUsageModel.run_id == run_id,
-                RunBudgetUsageModel.queries_reserved < limit,
+                RunBudgetUsageModel.queries_reserved + quantity <= limit,
                 RunBudgetUsageModel.is_exhausted.is_(False),
             )
             .values(
@@ -674,7 +692,7 @@ def _reserve(
             update(RunBudgetUsageModel)
             .where(
                 RunBudgetUsageModel.run_id == run_id,
-                RunBudgetUsageModel.evaluations_reserved < limit,
+                RunBudgetUsageModel.evaluations_reserved + quantity <= limit,
                 RunBudgetUsageModel.is_exhausted.is_(False),
             )
             .values(
@@ -716,7 +734,7 @@ def _reserve(
                 update(RunBudgetUsageModel)
                 .where(
                     RunBudgetUsageModel.run_id == run_id,
-                    RunBudgetUsageModel.hypotheses_generated < limit,
+                    RunBudgetUsageModel.hypotheses_generated + quantity <= limit,
                     RunBudgetUsageModel.is_exhausted.is_(False),
                 )
                 .values(
@@ -1298,10 +1316,22 @@ def recover_stale_reservations(
 ) -> Dict[str, int]:
     """Reconcile reservations whose owning worker never reported back.
 
-    Remote-task slots are released because the task is no longer active from
-    the application's perspective. Query/evaluation/hypothesis reservations are
-    marked ``ambiguous`` and stay charged: the oracle may already have executed
-    the request, so releasing them could bypass accounting.
+    Query/evaluation/hypothesis reservations are always marked ``ambiguous``
+    and stay charged: the oracle may already have executed the request, so
+    releasing them could bypass accounting.
+
+    Remote-task slots are only released when the persisted provider state shows
+    the slot cannot belong to a live task. A local reservation TTL proves only
+    that *this application process* stopped reporting; it does not prove the
+    provider task finished. Releasing on TTL alone would let a slow or
+    disconnected worker's still-running task coexist with a new dispatch and
+    exceed the configured concurrency limit in real provider execution.
+
+    The invariant used here is that every in-flight remote task holds exactly
+    one slot, so `active_remote_tasks - live_remote_tasks` slots are provably
+    not backing a live provider task. Only that surplus is released; the rest
+    is marked ``ambiguous`` and stays charged, which keeps the concurrency
+    ceiling intact until a provider-aware reconciliation resolves it.
     """
     moment = now or _utc_now()
     usage = session.get(RunBudgetUsageModel, run_id)
@@ -1317,8 +1347,8 @@ def recover_stale_reservations(
             )
         ).all()
     )
-    released = 0
-    ambiguous = 0
+
+    stale_reservations = []
     for reservation in reservations:
         expires = _as_utc(reservation.expires_at)
         if expires is not None:
@@ -1326,9 +1356,23 @@ def recover_stale_reservations(
         else:
             created = _as_utc(reservation.created_at)
             stale = created is not None and created <= cutoff
-        if not stale:
-            continue
-        if reservation.resource == BudgetResource.REMOTE_TASK.value:
+        if stale:
+            stale_reservations.append(reservation)
+
+    # Slots that cannot be backing a live provider task. Slots that can are
+    # never released here, regardless of how stale the local row looks.
+    release_budget = max(
+        0,
+        int(usage.active_remote_tasks or 0) - _live_remote_task_count(session, run_id),
+    )
+
+    released = 0
+    ambiguous = 0
+    for reservation in stale_reservations:
+        if (
+            reservation.resource == BudgetResource.REMOTE_TASK.value
+            and release_budget > 0
+        ):
             _record_outcome(
                 session,
                 reservation.reservation_id,
@@ -1336,6 +1380,7 @@ def recover_stale_reservations(
                 OUTCOME_RELEASED,
                 moment,
             )
+            release_budget -= int(reservation.quantity or 1)
             released += 1
         else:
             _record_outcome(
@@ -1348,6 +1393,22 @@ def recover_stale_reservations(
             ambiguous += 1
     session.flush()
     return {"released": released, "ambiguous": ambiguous}
+
+
+def _live_remote_task_count(session: Session, run_id: str) -> int:
+    """Remote compute tasks that may still be executing at the provider."""
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(ComputeTaskModel)
+            .where(
+                ComputeTaskModel.run_id == run_id,
+                ComputeTaskModel.execution_mode == "nodus_remote",
+                ComputeTaskModel.status.in_(LIVE_REMOTE_TASK_STATUSES),
+            )
+        )
+        or 0
+    )
 
 
 def detect_expired_runs(
