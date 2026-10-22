@@ -753,9 +753,21 @@ class ParallelBudgetPort(Protocol):
     def release_candidate_evaluations(self, reservation_id: str) -> None: ...
 
     def try_acquire_remote_slots(self, count: int, operation_id: str) -> Optional[Sequence[str]]:
-        """Acquire all *count* slots or none; return tokens, or None for backpressure."""
+        """Acquire all *count* slots or none; return lease tokens, or None.
 
-    def release_remote_slots(self, tokens: Sequence[str]) -> None: ...
+        ``None`` means temporary backpressure. Each successful acquisition mints
+        a fresh lease, and a duplicate ``operation_id`` raises
+        ``BudgetReservationReplay`` instead of returning the first caller's
+        tokens: a replay must not authorize a second dispatch or borrow an
+        active lease.
+        """
+
+    def release_remote_slots(self, tokens: Sequence[str]) -> int:
+        """Release only the slots these lease tokens authoritatively hold.
+
+        A token whose lease does not match the persisted reservation releases
+        nothing, so one caller cannot free a slot another live dispatch holds.
+        """
 
 
 __all__ = [

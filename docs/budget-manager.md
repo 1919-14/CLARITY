@@ -189,6 +189,16 @@ production relies on the conditional `UPDATE` and row locking.
 
 * A batch slot request is **all-or-none**: a runner never holds some slots while
   waiting for the rest, so concurrent runners cannot deadlock.
+* Each acquisition mints a **lease**. The returned tokens are opaque
+  `reservation_id~lease_id` pairs, and a release only frees the slot when the
+  presented lease matches the persisted one. A bare reservation id, a stale
+  lease, or another caller's lease releases nothing and is recorded as
+  `REMOTE_SLOT_RELEASE_REJECTED`, so one runner can never free a slot another
+  live dispatch still holds.
+* A duplicate `operation_id` does **not** return the first caller's tokens. It
+  raises `BudgetReservationReplay`, so a retry or duplicate delivery cannot
+  start a second dispatch on a slot that is already backing a live provider
+  task. Reuse only happens after the owner releases.
 * Slots are released when the task is terminal, cancelled, or definitively never
   submitted. Duplicate completion/cancellation events do not double-release.
 * Stale slots from crashed workers are reconciled after 900 seconds
@@ -380,7 +390,9 @@ Migration `e4b7c1a29d63_add_per_run_budget_manager.py` adds:
   `runs.budget_config_json`, `runs.deadline_at`
 * `run_budget_usage` — one authoritative counter row per run
 * `budget_reservations` — idempotent admission ledger with
-  `UNIQUE(run_id, resource, operation_id)`
+  `UNIQUE(run_id, resource, operation_id)`. Remote-task rows also carry the
+  acquisition `lease_id` in `details_json`, which is what makes release
+  owner-aware without a schema change.
 
 The migration is reversible. Existing rows remain valid; usage rows are created
 lazily with the documented defaults. `recover_stale_reservations` reconciles
@@ -406,8 +418,9 @@ whole-quantity batch admission at and beyond the limit boundary, reservation
 replay in the `reserved`, `committed`, `released`, and `ambiguous` states,
 ten-thread admission races, retry accounting, runtime boundaries, idempotent
 exhaustion, preservation of completed observations, cost-state honesty, remote
-slot recovery with and without a live provider task, and
-hypothesis/evaluation limits. Frontend changes:
+slot recovery with and without a live provider task, simultaneous duplicate slot
+acquisitions, lease-aware release of a live slot, and hypothesis/evaluation
+limits. Frontend changes:
 `cd frontend && npm run lint && npm run build`.
 
 ---

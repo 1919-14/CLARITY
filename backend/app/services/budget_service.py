@@ -544,6 +544,35 @@ def persist_exhaustion(
 # Reservation primitives
 # ==============================================================================
 
+# Separates a durable reservation id from the ephemeral lease that authorized
+# the dispatch. `_` and `-` both occur in generated ids, so a tilde is used.
+_LEASE_SEPARATOR = "~"
+
+
+def _new_lease_id() -> str:
+    """A fresh, unguessable lease identifier for one slot acquisition."""
+    return uuid.uuid4().hex
+
+
+def _lease_token(reservation_id: str, lease_id: str) -> str:
+    return f"{reservation_id}{_LEASE_SEPARATOR}{lease_id}"
+
+
+def _parse_lease_token(token: str) -> Optional[tuple[str, str]]:
+    if not isinstance(token, str) or _LEASE_SEPARATOR not in token:
+        return None
+    reservation_id, _, lease_id = token.partition(_LEASE_SEPARATOR)
+    if not reservation_id or not lease_id:
+        return None
+    return reservation_id, lease_id
+
+
+def _reservation_lease_id(reservation: BudgetReservationModel) -> Optional[str]:
+    details = reservation.details_json or {}
+    lease_id = details.get("lease_id")
+    return lease_id if isinstance(lease_id, str) else None
+
+
 def _next_state(outcome: str) -> str:
     return {
         OUTCOME_COMPLETED: RESERVATION_COMMITTED,
@@ -1610,7 +1639,14 @@ class RunBudgetManager:
     def try_acquire_remote_slots(
         self, count: int, operation_id: str
     ) -> Optional[Sequence[str]]:
-        """Acquire all *count* slots or none; ``None`` means backpressure."""
+        """Acquire all *count* slots or none; ``None`` means backpressure.
+
+        Every successful acquisition mints a fresh lease and returns opaque
+        lease tokens. A duplicate ``operation_id`` **never** hands out tokens
+        again: the first caller already owns the only dispatch authorized by
+        that operation, so a replay raises ``BudgetReservationReplay`` rather
+        than letting a second caller share (and later free) an active slot.
+        """
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("count must be an integer >= 1")
         now = self._clock()
@@ -1637,45 +1673,59 @@ class RunBudgetManager:
                         ).all()
                     )
                     if existing:
-                        if len(existing) == count and all(
-                            item.state == RESERVATION_RESERVED for item in existing
-                        ):
-                            log_tokens = [item.reservation_id for item in existing]
-                            tokens = log_tokens
-                        else:
-                            raise ValueError(
-                                "Inconsistent idempotency state for remote task reservations."
-                            )
-                    else:
-                        result = session.execute(
-                            update(RunBudgetUsageModel)
-                            .where(
-                                RunBudgetUsageModel.run_id == self._run_id,
-                                RunBudgetUsageModel.active_remote_tasks + count
-                                <= config.max_concurrent_remote_tasks,
-                                RunBudgetUsageModel.is_exhausted.is_(False),
-                            )
-                            .values(
-                                active_remote_tasks=RunBudgetUsageModel.active_remote_tasks
-                                + count,
-                                updated_at=now,
-                            )
+                        # Idempotent accounting, but not a second authorization.
+                        first = existing[0]
+                        raise BudgetReservationReplay(
+                            first.reservation_id,
+                            BudgetResource.REMOTE_TASK,
+                            first.state,
+                            operation_id,
                         )
-                        if result.rowcount != 1:
-                            tokens = None
-                        else:
-                            reserved_tokens: List[str] = []
-                            for item_operation_id in expected:
-                                reservation, _created = _create_reservation(
-                                    session,
-                                    self._run_id,
+
+                    result = session.execute(
+                        update(RunBudgetUsageModel)
+                        .where(
+                            RunBudgetUsageModel.run_id == self._run_id,
+                            RunBudgetUsageModel.active_remote_tasks + count
+                            <= config.max_concurrent_remote_tasks,
+                            RunBudgetUsageModel.is_exhausted.is_(False),
+                        )
+                        .values(
+                            active_remote_tasks=RunBudgetUsageModel.active_remote_tasks
+                            + count,
+                            updated_at=now,
+                        )
+                    )
+                    if result.rowcount != 1:
+                        tokens = None
+                    else:
+                        lease_id = _new_lease_id()
+                        reserved_tokens: List[str] = []
+                        for item_operation_id in expected:
+                            reservation, created = _create_reservation(
+                                session,
+                                self._run_id,
+                                BudgetResource.REMOTE_TASK,
+                                item_operation_id,
+                                1,
+                                now,
+                                {"lease_id": lease_id},
+                            )
+                            if not created:
+                                # A concurrent caller won the insert for this
+                                # operation id. Its lease is the only valid one,
+                                # so this caller must not be handed tokens: undo
+                                # the whole acquisition instead.
+                                raise BudgetReservationReplay(
+                                    reservation.reservation_id,
                                     BudgetResource.REMOTE_TASK,
-                                    item_operation_id,
-                                    1,
-                                    now,
+                                    reservation.state,
+                                    operation_id,
                                 )
-                                reserved_tokens.append(reservation.reservation_id)
-                            tokens = reserved_tokens
+                            reserved_tokens.append(
+                                _lease_token(reservation.reservation_id, lease_id)
+                            )
+                        tokens = reserved_tokens
             except BudgetAdmissionDenied as exc:
                 denial = exc
                 if exc.is_terminal:
@@ -1698,23 +1748,57 @@ class RunBudgetManager:
             )
         return tokens[0]
 
-    def release_remote_slots(self, tokens: Sequence[str]) -> None:
+    def release_remote_slots(self, tokens: Sequence[str]) -> int:
+        """Release the slots this caller holds, by lease.
+
+        A lease token proves the caller is the dispatch that acquired the slot.
+        A token whose lease does not match the persisted reservation, or whose
+        reservation is already settled, releases nothing, so one runner can
+        never free a slot another live dispatch still holds. Returns the number
+        of slots actually released.
+        """
         now = self._clock()
+        released = 0
+        rejected: List[str] = []
         with self._locked_scope() as session:
             for token in tokens:
-                record = session.get(BudgetReservationModel, token)
-                if record is None or record.resource != BudgetResource.REMOTE_TASK.value:
+                parsed = _parse_lease_token(token)
+                if parsed is None:
+                    rejected.append(str(token))
                     continue
+                reservation_id, lease_id = parsed
+                record = session.get(BudgetReservationModel, reservation_id)
+                if record is None or record.resource != BudgetResource.REMOTE_TASK.value:
+                    rejected.append(str(token))
+                    continue
+                if _reservation_lease_id(record) != lease_id:
+                    rejected.append(str(token))
+                    continue
+                before = record.state
                 _record_outcome(
                     session,
-                    token,
+                    reservation_id,
                     BudgetResource.REMOTE_TASK,
                     OUTCOME_RELEASED,
                     now,
                 )
+                session.refresh(record)
+                if before == RESERVATION_RESERVED and record.state == RESERVATION_RELEASED:
+                    released += 1
+            if rejected:
+                _audit(
+                    session,
+                    self._run_id,
+                    "REMOTE_SLOT_RELEASE_REJECTED",
+                    {
+                        "rejected_count": len(rejected),
+                        "reason": "lease_mismatch_or_unknown_lease",
+                    },
+                )
+        return released
 
-    def release_remote_task_slot(self, token: str) -> None:
-        self.release_remote_slots([token])
+    def release_remote_task_slot(self, token: str) -> int:
+        return self.release_remote_slots([token])
 
     # -- inspection -----------------------------------------------------
 

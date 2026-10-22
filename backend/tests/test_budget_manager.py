@@ -659,6 +659,78 @@ class TestBudgetConcurrency:
         assert manager.try_acquire_remote_slots(2, "batch-b") is None
         assert read_usage(db, run_id)["active_remote_tasks"] == 2
 
+    def test_duplicate_slot_acquisition_does_not_authorize_a_second_dispatch(self, db):
+        """The same operation id must not hand a second caller an active lease."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        manager = make_manager(db, run_id)
+        tokens = manager.try_acquire_remote_slots(1, "shared-op")
+        assert tokens
+
+        with pytest.raises(BudgetReservationReplay) as exc:
+            manager.try_acquire_remote_slots(1, "shared-op")
+        assert exc.value.resource is BudgetResource.REMOTE_TASK
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+        assert manager.try_acquire_remote_slots(1, "different-op") is None
+
+    def test_racing_duplicate_acquisitions_admit_exactly_one_owner(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        barrier = threading.Barrier(2)
+
+        def attempt(_index):
+            manager = RunBudgetManager(db.session_scope, run_id)
+            barrier.wait(timeout=10)
+            try:
+                tokens = manager.try_acquire_remote_slots(1, "same-op")
+            except BudgetReservationReplay:
+                return "replay"
+            return "admitted" if tokens else "backpressure"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(attempt, range(2)))
+
+        assert outcomes.count("admitted") == 1
+        assert sorted(outcomes) == ["admitted", "replay"]
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+
+    def test_released_lease_is_what_frees_the_capacity(self, db):
+        """A different operation gains capacity only after the owner releases."""
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        manager = make_manager(db, run_id)
+        tokens = manager.try_acquire_remote_slots(1, "owner-op")
+
+        # A duplicate cannot obtain the live lease, so it cannot free it either.
+        with pytest.raises(BudgetReservationReplay):
+            manager.try_acquire_remote_slots(1, "owner-op")
+        assert manager.try_acquire_remote_slots(1, "other-op") is None
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+
+        assert manager.release_remote_slots(tokens) == 1
+        assert manager.try_acquire_remote_slots(1, "other-op") is not None
+
+    def test_foreign_or_forged_lease_cannot_release_a_live_slot(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        manager = make_manager(db, run_id)
+        tokens = manager.try_acquire_remote_slots(1, "lease-op")
+
+        bare_ids = [token.split("~")[0] for token in tokens]
+        forged = [f"{token.split('~')[0]}~{'0' * 32}" for token in tokens]
+        assert manager.release_remote_slots(bare_ids) == 0
+        assert manager.release_remote_slots(forged) == 0
+
+        assert read_usage(db, run_id)["active_remote_tasks"] == 1
+        assert manager.try_acquire_remote_slots(1, "other-op") is None
+        assert audit_events(db, run_id, "REMOTE_SLOT_RELEASE_REJECTED")
+
+        assert manager.release_remote_slots(tokens) == 1
+        assert read_usage(db, run_id)["active_remote_tasks"] == 0
+
+    def test_single_slot_helper_also_refuses_replays(self, db):
+        run_id = make_run(db, budget=RunBudgetConfig(max_concurrent_remote_tasks=1))
+        manager = make_manager(db, run_id)
+        assert manager.acquire_remote_task_slot("solo")
+        with pytest.raises(BudgetReservationReplay):
+            manager.acquire_remote_task_slot("solo")
+
     def test_multiple_managers_share_the_persisted_limit(self, db):
         run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=5))
         manager_a = RunBudgetManager(db.session_scope, run_id, clock=Clock())
