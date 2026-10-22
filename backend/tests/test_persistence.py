@@ -11,9 +11,10 @@ Tests cover:
 8. Filter queries: filtering hypotheses by run and exclusion state, observations by training status.
 """
 
+import os
 import pytest
 from sqlalchemy.exc import IntegrityError
-from app.adapters.persistence.database import DatabaseManager
+from app.adapters.persistence.database import DatabaseManager, get_db_manager, reset_db_manager
 from app.adapters.persistence.models import (
     Base,
     RunModel,
@@ -618,3 +619,65 @@ def test_alembic_migrations_upgrade_and_downgrade_smoke(tmp_path):
     recreated_tables = {row[0] for row in cursor.fetchall()}
     conn.close()
     assert expected_tables.issubset(recreated_tables)
+
+
+def test_get_db_manager_rebinds_when_resolved_uri_differs(monkeypatch):
+    """Regression test: get_db_manager() must unconditionally update singleton when resolved URI changes."""
+    reset_db_manager()
+    try:
+        # 1. Initialize with an explicit URI
+        explicit_uri = "sqlite:///:memory:"
+        mgr1 = get_db_manager(explicit_uri)
+        assert mgr1.database_uri == explicit_uri
+
+        # 2. Set environment variable DATABASE_URL and call get_db_manager() with database_uri=None
+        env_uri = "sqlite:///test_rebind_env.db"
+        monkeypatch.setenv("DATABASE_URL", env_uri)
+        mgr2 = get_db_manager()
+        assert mgr2.database_uri == env_uri
+        assert mgr2 is not mgr1
+
+        # 3. Clear environment and verify fallback to default development URI
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mgr3 = get_db_manager()
+        assert mgr3.database_uri == "sqlite:///clarity_dev.db"
+        assert mgr3 is not mgr2
+    finally:
+        reset_db_manager()
+
+
+def test_list_observations_for_run_pagination_and_count(repo):
+    """Verify repo.list_observations_for_run applies SQL LIMIT and OFFSET, and count_observations_for_run counts correctly."""
+    run = RunModel(run_id="run-paged-obs", name="Paged Observations Test")
+    repo.create_run(run)
+    for i in range(10):
+        repo.add_observation(
+            ObservationModel(
+                observation_id=f"obs-paged-{i}",
+                run_id="run-paged-obs",
+                input_id=f"inp-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(i * 2)},
+                sequence_number=i + 1,
+                is_held_out=(i >= 8),  # 8 training, 2 held-out
+            )
+        )
+    repo.session.commit()
+
+    # Total counts
+    assert repo.count_observations_for_run("run-paged-obs") == 10
+    assert repo.count_observations_for_run("run-paged-obs", only_training=True) == 8
+
+    # Paginated queries
+    page1 = repo.list_observations_for_run("run-paged-obs", limit=3, offset=0)
+    assert len(page1) == 3
+    assert [o.sequence_number for o in page1] == [1, 2, 3]
+
+    page2 = repo.list_observations_for_run("run-paged-obs", limit=3, offset=3)
+    assert len(page2) == 3
+    assert [o.sequence_number for o in page2] == [4, 5, 6]
+
+    # Training only with limit
+    training_page = repo.list_observations_for_run("run-paged-obs", only_training=True, limit=5, offset=5)
+    assert len(training_page) == 3  # only 8 total training (items 6, 7, 8)
+    assert all(not o.is_held_out for o in training_page)

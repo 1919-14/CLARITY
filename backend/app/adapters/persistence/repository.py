@@ -6,7 +6,7 @@ services from database details.
 
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from .models import (
     RunModel,
     HypothesisModel,
@@ -40,8 +40,13 @@ class ClarityRepository:
     def get_run(self, run_id: str) -> Optional[RunModel]:
         return self.session.get(RunModel, run_id)
 
-    def list_runs(self, limit: int = 50, offset: int = 0) -> List[RunModel]:
-        stmt = select(RunModel).order_by(desc(RunModel.created_at)).limit(limit).offset(offset)
+    def list_runs(
+        self, limit: int = 50, offset: int = 0, status_filter: Optional[str] = None
+    ) -> List[RunModel]:
+        stmt = select(RunModel).order_by(desc(RunModel.created_at))
+        if status_filter:
+            stmt = stmt.where(RunModel.status == status_filter)
+        stmt = stmt.limit(limit).offset(offset)
         return list(self.session.scalars(stmt).all())
 
     def update_run_status(
@@ -126,10 +131,15 @@ class ClarityRepository:
         self.session.flush()
         return observation
 
+    def get_observation(self, observation_id: str) -> Optional[ObservationModel]:
+        return self.session.get(ObservationModel, observation_id)
+
     def list_observations_for_run(
         self,
         run_id: str,
         only_training: bool = False,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> List[ObservationModel]:
         stmt = (
             select(ObservationModel)
@@ -138,7 +148,25 @@ class ClarityRepository:
         )
         if only_training:
             stmt = stmt.where(ObservationModel.is_held_out.is_(False))
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
+
+    def count_observations_for_run(
+        self,
+        run_id: str,
+        only_training: bool = False,
+    ) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(ObservationModel)
+            .where(ObservationModel.run_id == run_id)
+        )
+        if only_training:
+            stmt = stmt.where(ObservationModel.is_held_out.is_(False))
+        return self.session.scalar(stmt) or 0
 
     # =========================================================================
     # Evaluation Operations
