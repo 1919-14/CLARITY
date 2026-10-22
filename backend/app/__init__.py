@@ -46,10 +46,12 @@ def create_app(config_name=None):
         supports_credentials=False,
     )
 
-    # Register blueprints — legacy /api routes (backward compatible health check)
+    # Register blueprints — original /api routes (backward compatible)
     from .routes.health import health_bp
+    from .routes.runs import runs_bp
 
     app.register_blueprint(health_bp, url_prefix="/api")
+    app.register_blueprint(runs_bp, url_prefix="/api")
 
     # Versioned /api/v1 routes
     from .routes.v1 import health_v1_bp, runs_v1_bp, hypotheses_v1_bp, observations_v1_bp

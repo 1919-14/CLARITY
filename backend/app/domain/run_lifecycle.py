@@ -478,6 +478,7 @@ class RunLifecycleManager:
                         "from_state": current_state.value,
                         "to_state": target_state.value,
                         "stop_reason": progress.stop_reason,
+                        "previous_status": current_state.value,
                     }
                     if progress.failure_details:
                         metadata["failure_details"] = progress.failure_details

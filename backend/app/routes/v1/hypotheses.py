@@ -11,17 +11,22 @@ Run-scoped hypothesis listing and creation live in runs.py.
 
 import uuid
 
-from flask import Blueprint, current_app, request
+from flask import Blueprint, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
-from ...adapters.persistence.models import AuditEventModel, EvaluationResultModel
 from ...adapters.persistence.repository import ClarityRepository
+from ...services.hypothesis_service import (
+    HypothesisNotFoundError,
+    HypothesisValidationError,
+    reevaluate_hypothesis_service,
+    update_hypothesis_flags_service,
+)
 from .shared import (
     error_response,
+    log_safe_error,
     serialize_evaluation,
     serialize_hypothesis,
 )
-from flask import jsonify
 
 hypotheses_v1_bp = Blueprint("hypotheses_v1", __name__)
 
@@ -46,7 +51,7 @@ def get_hypothesis(hypothesis_id: str):
                 return error_response(f"Hypothesis '{hypothesis_id}' not found.", 404)
             serialized = serialize_hypothesis(hyp, repo, include_revisions=True)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("get_hypothesis db error: %s", exc)
+        log_safe_error("get_hypothesis db error", exc)
         return error_response("An internal error occurred while retrieving the hypothesis.", 500)
 
     return jsonify({"hypothesis": serialized}), 200
@@ -86,43 +91,18 @@ def update_hypothesis(hypothesis_id: str):
     db = _get_db()
     try:
         with db.session_scope() as session:
-            repo = ClarityRepository(session)
-            hyp = repo.get_hypothesis(hypothesis_id)
-            if not hyp:
-                return error_response(f"Hypothesis '{hypothesis_id}' not found.", 404)
-
-            if has_pin and hyp.is_pinned != is_pinned:
-                event_type = "HYPOTHESIS_PINNED" if is_pinned else "HYPOTHESIS_UNPINNED"
-                repo.record_audit_event(
-                    AuditEventModel(
-                        event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                        run_id=hyp.run_id,
-                        event_type=event_type,
-                        actor="researcher",
-                        metadata_json={"hypothesis_id": hypothesis_id, "is_pinned": is_pinned},
-                    )
-                )
-
-            if has_exclude and hyp.is_excluded != is_excluded:
-                event_type = "HYPOTHESIS_EXCLUDED" if is_excluded else "HYPOTHESIS_RESTORED"
-                repo.record_audit_event(
-                    AuditEventModel(
-                        event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                        run_id=hyp.run_id,
-                        event_type=event_type,
-                        actor="researcher",
-                        metadata_json={"hypothesis_id": hypothesis_id, "is_excluded": is_excluded},
-                    )
-                )
-
-            repo.update_hypothesis_flags(
-                hypothesis_id,
+            hyp = update_hypothesis_flags_service(
+                session=session,
+                hypothesis_id=hypothesis_id,
                 is_pinned=is_pinned if has_pin else None,
                 is_excluded=is_excluded if has_exclude else None,
             )
+            repo = ClarityRepository(session)
             serialized = serialize_hypothesis(hyp, repo, include_revisions=True)
+    except HypothesisNotFoundError as exc:
+        return error_response(str(exc), 404)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("update_hypothesis db error: %s", exc)
+        log_safe_error("update_hypothesis db error", exc)
         return error_response("An internal error occurred while updating the hypothesis.", 500)
 
     return jsonify({"hypothesis": serialized}), 200
@@ -132,63 +112,44 @@ def update_hypothesis(hypothesis_id: str):
 def reevaluate_hypothesis(hypothesis_id: str):
     """POST /api/v1/hypotheses/<hypothesis_id>/reevaluate — Request re-evaluation.
 
-    Records a pending evaluation result and emits an audit event. The actual
-    evaluation work is delegated to the discovery engine's evaluation pipeline.
-    This endpoint does not perform the evaluation inline.
+    Routes re-evaluation through CLARITY's domain EvaluationPipeline against
+    run observations, or dispatches to a configured background consumer if available.
+    If EVALUATION_DEFERRED is configured, returns 501 Not Implemented with a truthful status.
     """
+    if current_app.config.get("EVALUATION_DEFERRED"):
+        return error_response(
+            "Re-evaluation is deferred in this deployment: asynchronous evaluation worker is not enabled.",
+            501,
+        )
+
     db = _get_db()
+    dispatcher = current_app.config.get("EVALUATION_DISPATCHER")
     try:
         with db.session_scope() as session:
-            repo = ClarityRepository(session)
-            hyp = repo.get_hypothesis(hypothesis_id)
-            if not hyp:
-                return error_response(f"Hypothesis '{hypothesis_id}' not found.", 404)
-
-            revisions = sorted(hyp.revisions, key=lambda r: r.revision_number)
-            if not revisions:
-                return error_response(
-                    f"Hypothesis '{hypothesis_id}' has no revisions and cannot be re-evaluated.", 422
-                )
-
-            latest_rev = revisions[-1]
-
-            # Record a pending evaluation to enqueue re-evaluation
-            eval_id = f"eva-{uuid.uuid4().hex[:12]}"
-            pending_eval = EvaluationResultModel(
-                evaluation_id=eval_id,
-                revision_id=latest_rev.revision_id,
-                run_id=hyp.run_id,
-                status="pending",
-                sample_count=0,
-                dataset_version=0,
-                metrics={},
-                held_out_metrics=None,
-                error_message=None,
+            eval_model, is_enqueued = reevaluate_hypothesis_service(
+                session=session,
+                hypothesis_id=hypothesis_id,
+                dispatcher=dispatcher,
             )
-            repo.record_evaluation(pending_eval)
-
-            repo.record_audit_event(
-                AuditEventModel(
-                    event_id=f"evt-{uuid.uuid4().hex[:12]}",
-                    run_id=hyp.run_id,
-                    event_type="HYPOTHESIS_REEVALUATE_REQUESTED",
-                    actor="researcher",
-                    metadata_json={
-                        "hypothesis_id": hypothesis_id,
-                        "revision_id": latest_rev.revision_id,
-                        "evaluation_id": eval_id,
-                    },
-                )
-            )
-            serialized_eval = serialize_evaluation(pending_eval)
+            serialized_eval = serialize_evaluation(eval_model)
+    except HypothesisNotFoundError as exc:
+        return error_response(str(exc), 404)
+    except HypothesisValidationError as exc:
+        return error_response(str(exc), 422)
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("reevaluate_hypothesis db error: %s", exc)
+        log_safe_error("reevaluate_hypothesis db error", exc)
         return error_response("An internal error occurred while requesting re-evaluation.", 500)
+
+    if is_enqueued:
+        return jsonify({
+            "evaluation": serialized_eval,
+            "message": "Re-evaluation enqueued. Poll the evaluation history for results.",
+        }), 202
 
     return jsonify({
         "evaluation": serialized_eval,
-        "message": "Re-evaluation enqueued. Poll the evaluation history for results.",
-    }), 202
+        "message": "Re-evaluation completed via evaluation pipeline.",
+    }), 200
 
 
 @hypotheses_v1_bp.route("/hypotheses/<hypothesis_id>/evaluations", methods=["GET"])
@@ -219,7 +180,7 @@ def list_hypothesis_evaluations(hypothesis_id: str):
             evals = repo.list_evaluations_for_revision(latest_rev.revision_id)
             serialized = [serialize_evaluation(e) for e in evals]
     except Exception as exc:  # noqa: BLE001
-        current_app.logger.error("list_hypothesis_evaluations db error: %s", exc)
+        log_safe_error("list_hypothesis_evaluations db error", exc)
         return error_response("An internal error occurred while retrieving evaluation history.", 500)
 
     return jsonify({

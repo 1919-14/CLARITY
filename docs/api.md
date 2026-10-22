@@ -304,8 +304,8 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
 2. **Explicit Allowlist Serialization**: Serializers in `backend/app/routes/v1/shared.py` define strict output fields. Hidden ground truth formulas, private oracle states, evaluator internal weights, and database infrastructure strings are completely filtered out.
 3. **Database Health Probe**: `GET /api/v1/health` executes a `SELECT 1` probe against the database. If unreachable, it returns HTTP 503 (`status: "degraded"`) without leaking internal error tracebacks or connection strings.
 4. **Distinction of Measured Zero vs Unavailable**: Usage metrics strictly return `null` (`None`) when data is unavailable and `0` when measured as zero. Settled costs are `null` until confirmed by billing.
-5. **Asynchronous Re-evaluation Enqueuing**: `POST /api/v1/hypotheses/{id}/reevaluate` records a pending evaluation result and emits an audit event (`HYPOTHESIS_REEVALUATE_REQUESTED`), returning HTTP 202 Accepted. Work is picked up asynchronously by discovery workers.
-6. **Bounded Pagination**: All collection listing routes enforce limits between 1 and 200 (default 50) and offset >= 0.
+5. **Evaluation Pipeline Re-evaluation**: `POST /api/v1/hypotheses/{id}/reevaluate` routes re-evaluation through CLARITY's domain `EvaluationPipeline` against accumulated run observations, returning HTTP 200 with completed/failed evaluation metrics. When an asynchronous worker queue/dispatcher is configured in `EVALUATION_DISPATCHER`, work is dispatched to the background worker returning HTTP 202 Accepted.
+6. **Bounded Database Pagination**: Collection listing routes (`runs`, `observations`) enforce strict limit (1–200, default 50) and offset constraints executed directly via database SQL queries (`LIMIT`, `OFFSET`, `SELECT COUNT(*)`), preventing unbounded in-memory collection slicing.
 
 ### 3.2 Endpoint Summary Table
 
@@ -324,7 +324,7 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
 | `POST` | `/api/v1/runs/{run_id}/hypotheses` | Submit researcher-proposed hypothesis | 201, 400, 404, 409, 500 |
 | `GET` | `/api/v1/hypotheses/{hypothesis_id}` | Retrieve hypothesis with full revisions and latest evaluation | 200, 404, 500 |
 | `PATCH` | `/api/v1/hypotheses/{hypothesis_id}` | Update flags (`is_pinned`, `is_excluded`) non-destructively | 200, 400, 404, 500 |
-| `POST` | `/api/v1/hypotheses/{hypothesis_id}/reevaluate` | Enqueue asynchronous re-evaluation (returns 202) | 202, 404, 422, 500 |
+| `POST` | `/api/v1/hypotheses/{hypothesis_id}/reevaluate` | Execute re-evaluation via EvaluationPipeline or enqueue (returns 200 or 202) | 200, 202, 404, 422, 500 |
 | `GET` | `/api/v1/hypotheses/{hypothesis_id}/evaluations` | Historical evaluation runs for current revision | 200, 404, 500 |
 | `GET` | `/api/v1/observations/{observation_id}` | Single observation details (no ground truth leakage) | 200, 404, 500 |
 
@@ -377,8 +377,30 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
   - Response (200 OK): Updated hypothesis object with new flag state. Emits audit events (`HYPOTHESIS_PINNED`, `HYPOTHESIS_UNPINNED`, `HYPOTHESIS_EXCLUDED`, or `HYPOTHESIS_RESTORED`).
 
 * **`POST /api/v1/hypotheses/{hypothesis_id}/reevaluate`**
-  - Enqueues a candidate for re-evaluation with updated observations.
-  - Response (202 Accepted):
+  - Routes re-evaluation through the domain `EvaluationPipeline` against the run's observations, returning HTTP 200 with completed/failed results. If an async task queue dispatcher is configured (`EVALUATION_DISPATCHER`), enqueues work and returns HTTP 202 Accepted.
+  - Response (200 OK — Pipeline Evaluation):
+    ```json
+    {
+      "evaluation": {
+        "evaluation_id": "eva-7a3b4c5d6e7f",
+        "status": "completed",
+        "sample_count": 25,
+        "dataset_version": 25,
+        "metrics": {
+          "mae": 0.042,
+          "rmse": 0.061
+        },
+        "held_out_metrics": {
+          "mae": 0.089,
+          "rmse": 0.112
+        },
+        "error_message": null,
+        "evaluated_at": "2026-10-22T22:30:00.000000+00:00"
+      },
+      "message": "Re-evaluation completed via evaluation pipeline."
+    }
+    ```
+  - Response (202 Accepted — Async Dispatched):
     ```json
     {
       "evaluation": {

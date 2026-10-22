@@ -215,3 +215,49 @@ def serialize_usage(usage: Optional[UsageRecordModel]) -> Dict[str, Any]:
         "exhaustion_reason": usage.exhaustion_reason,
         "recorded_at": usage.recorded_at.isoformat() if usage.recorded_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Safe structured logging (redacts DSN credentials, secrets, passwords)
+# ---------------------------------------------------------------------------
+
+import re
+
+_REDACTION_PATTERNS = [
+    # Redact URI credentials: ://user:password@ -> ://user:***@
+    (re.compile(r"://([^:@/\s]+):([^@/\s]+)@", re.IGNORECASE), r"://\1:***@"),
+    # Redact password/token/key in query strings: ?password=secret or &token=secret
+    (re.compile(r"([?&](?:password|token|api_key|secret)=)[^&\s]+", re.IGNORECASE), r"\1***"),
+    # Redact password / secret assignments with quotes or whitespace: password='xyz' or password="xyz"
+    (re.compile(r"""(password|passwd|secret|token|api_key|ground_truth)['"]?\s*[:=]\s*(?:'[^']*'|"[^"]*"|[^\s,;)]+)""", re.IGNORECASE), r"\1=***"),
+    # Redact parameters / DSN key-value pairs: pwd=..., secret=...
+    (re.compile(r"\b(pwd|password)\s*=\s*[^\s,)]+", re.IGNORECASE), r"\1=***"),
+]
+
+
+def sanitize_exception_text(text: str) -> str:
+    """Redact connection strings, credentials, and sensitive parameters from exception messages."""
+    sanitized = str(text)
+    for pattern, replacement in _REDACTION_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
+def log_safe_error(context: str, exc: Exception, logger=None) -> None:
+    """Log an exception safely using structured logging with redacted credentials and parameters."""
+    if logger is None:
+        from flask import current_app
+        logger = current_app.logger
+
+    exc_type = type(exc).__name__
+    safe_msg = sanitize_exception_text(str(exc))
+
+    if len(safe_msg) > 500:
+        safe_msg = safe_msg[:500] + "... [truncated]"
+
+    logger.error(
+        "%s | exception_type=%s | details=%s",
+        context,
+        exc_type,
+        safe_msg,
+    )
