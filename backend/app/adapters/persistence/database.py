@@ -46,9 +46,15 @@ class DatabaseManager:
 
             # Explicitly enforce foreign key constraints on SQLite connections
             @event.listens_for(self.engine, "connect")
-            def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+            def _configure_sqlite_connection(dbapi_connection, connection_record):
                 cursor = dbapi_connection.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
+                # Budget admission uses conditional UPDATEs; wait for a competing
+                # writer instead of failing immediately on a locked database.
+                cursor.execute("PRAGMA busy_timeout=5000")
+                # WAL allows a reader and a writer to coexist; in-memory databases
+                # ignore the request and keep their existing journal mode.
+                cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.close()
         else:
             # Production MySQL configuration with connection pooling and pre-ping

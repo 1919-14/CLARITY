@@ -263,6 +263,43 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /runs/{run_id}/budget:
+    get:
+      summary: Get per-run budget status
+      description: |
+        Returns the validated budget configuration, admitted/remaining capacity,
+        current and maximum remote concurrency, elapsed/remaining runtime, cost
+        states, and the structured exhaustion reason. Unavailable monetary data
+        is null, never zero. Limits are application-enforced; provider hard
+        spending caps are reported as unsupported.
+      operationId: getRunBudgetV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Per-run budget status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunBudgetStatusResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /runs/{run_id}/report:
     get:
       summary: Get scientific summary report
@@ -855,6 +892,16 @@ components:
           format: float
           nullable: true
           example: 10.0
+        max_concurrent_remote_tasks:
+          type: integer
+          nullable: true
+          example: 2
+        max_generated_hypotheses:
+          type: integer
+          nullable: true
+          example: 10
+        budget:
+          $ref: '#/components/schemas/RunBudgetConfig'
         created_at:
           type: string
           format: date-time
@@ -892,25 +939,41 @@ components:
           example: active_disagreement
         max_queries:
           type: integer
-          minimum: 1
-          description: Maximum allowed oracle queries
+          minimum: 0
+          description: |
+            Legacy alias for budget.max_oracle_queries. Zero permits no query;
+            omitted uses the documented default (10).
           example: 20
         max_evaluations:
           type: integer
-          minimum: 1
-          description: Maximum candidate evaluations
+          minimum: 0
+          description: Legacy alias for budget.max_candidate_evaluations. Zero permits no evaluation.
           example: 60
         max_runtime_seconds:
           type: integer
-          minimum: 1
-          description: Timeout limit in seconds
+          minimum: 0
+          description: Legacy alias for budget.max_runtime_seconds. Zero means no work may start.
           example: 180
         spend_ceiling_usd:
           type: number
           format: float
           minimum: 0.0
-          description: Hard spending ceiling in USD
+          description: |
+            Legacy alias for budget.max_compute_spend_usd. Application-side estimate
+            gate only; never a provider-enforced hard cap.
           example: 10.0
+        max_concurrent_remote_tasks:
+          type: integer
+          minimum: 0
+          maximum: 32
+          description: Legacy alias for budget.max_concurrent_remote_tasks.
+        max_generated_hypotheses:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Legacy alias for budget.max_generated_hypotheses.
+        budget:
+          $ref: '#/components/schemas/RunBudgetConfig'
         run_id:
           type: string
           description: Optional caller-specified unique run identifier
@@ -1191,10 +1254,216 @@ components:
           format: date-time
           nullable: true
 
+    RunBudgetConfig:
+      type: object
+      description: |
+        Canonical Issue #14 budget. Zero always means "no work of this kind";
+        null on an optional limit disables it. Mixing this object with legacy
+        flat limit fields is rejected.
+      properties:
+        max_oracle_queries:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          default: 10
+        max_candidate_evaluations:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 100
+        max_concurrent_remote_tasks:
+          type: integer
+          minimum: 0
+          maximum: 32
+          default: 4
+        max_runtime_seconds:
+          type: integer
+          minimum: 0
+          maximum: 604800
+          default: 3600
+        max_generated_hypotheses:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          nullable: true
+          description: null disables the limit.
+        max_compute_spend_usd:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 10000
+          nullable: true
+          description: null disables the application-side estimate gate.
+
+    BudgetLimitStatus:
+      type: object
+      required: [limit, used, remaining, exhausted, enforcement, disabled]
+      properties:
+        limit:
+          type: integer
+          nullable: true
+          description: null means the limit is disabled.
+        used:
+          type: integer
+        remaining:
+          type: integer
+          nullable: true
+        exhausted:
+          type: boolean
+        enforcement:
+          type: string
+          enum: [application]
+        disabled:
+          type: boolean
+
+    RunBudgetStatus:
+      type: object
+      required:
+        - run_id
+        - schema_version
+        - execution_mode
+        - status
+        - limits
+        - usage
+        - runtime
+        - cost
+        - is_exhausted
+        - stop_reason
+        - zero_semantics
+        - limitations
+      properties:
+        run_id:
+          type: string
+        schema_version:
+          type: string
+          example: '1.0'
+        execution_mode:
+          type: string
+          enum: [local, nodus_remote, mock]
+        status:
+          type: string
+          example: running
+        limits:
+          type: object
+          additionalProperties: true
+        usage:
+          type: object
+          required:
+            - oracle_queries
+            - candidate_evaluations
+            - generated_hypotheses
+            - query_outcomes
+            - evaluation_outcomes
+            - active_remote_tasks
+            - max_concurrent_remote_tasks
+          properties:
+            oracle_queries:
+              $ref: '#/components/schemas/BudgetLimitStatus'
+            candidate_evaluations:
+              $ref: '#/components/schemas/BudgetLimitStatus'
+            generated_hypotheses:
+              $ref: '#/components/schemas/BudgetLimitStatus'
+            query_outcomes:
+              type: object
+              additionalProperties:
+                type: integer
+            evaluation_outcomes:
+              type: object
+              additionalProperties:
+                type: integer
+            active_remote_tasks:
+              type: integer
+            max_concurrent_remote_tasks:
+              type: integer
+        runtime:
+          type: object
+          properties:
+            started_at:
+              type: string
+              format: date-time
+              nullable: true
+            deadline_at:
+              type: string
+              format: date-time
+              nullable: true
+            elapsed_seconds:
+              type: number
+              nullable: true
+            remaining_seconds:
+              type: number
+              nullable: true
+        cost:
+          type: object
+          required:
+            - estimated_cost_usd
+            - accruing_cost_usd
+            - settled_cost_usd
+            - data_state
+            - enforcement
+            - provider_hard_cap_supported
+          properties:
+            estimated_cost_usd:
+              type: number
+              format: float
+              nullable: true
+            accruing_cost_usd:
+              type: number
+              format: float
+              nullable: true
+            settled_cost_usd:
+              type: number
+              format: float
+              nullable: true
+            data_state:
+              type: string
+              enum: [not_started, estimated_only, pending_settlement, settled, unavailable]
+            enforcement:
+              type: string
+              enum: [not_applicable, application_estimate, unsupported, provider_hard_cap]
+            provider_hard_cap_supported:
+              type: boolean
+              example: false
+        is_exhausted:
+          type: boolean
+        stop_reason:
+          type: string
+          nullable: true
+          enum:
+            - QUERY_BUDGET_EXHAUSTED
+            - COMPUTE_BUDGET_EXHAUSTED
+            - TIME_LIMIT_EXCEEDED
+            - EVALUATION_LIMIT_REACHED
+            - HYPOTHESIS_LIMIT_REACHED
+            - CONCURRENCY_LIMIT_REACHED
+            - CANCELLED
+            - FAILED
+        raw_stop_reason:
+          type: string
+          nullable: true
+        zero_semantics:
+          type: object
+          additionalProperties:
+            type: string
+        limitations:
+          type: array
+          items:
+            type: string
+
+    RunBudgetStatusResponse:
+      type: object
+      required: [run_id, budget]
+      properties:
+        run_id:
+          type: string
+        budget:
+          $ref: '#/components/schemas/RunBudgetStatus'
+
     RunMetricsResponse:
       type: object
       required: [run_id, status, stop_reason, limits, usage]
       properties:
+        budget:
+          $ref: '#/components/schemas/RunBudgetStatus'
         run_id:
           type: string
           example: run-01
@@ -1219,6 +1488,12 @@ components:
             spend_ceiling_usd:
               type: number
               format: float
+              nullable: true
+            max_concurrent_remote_tasks:
+              type: integer
+              nullable: true
+            max_generated_hypotheses:
+              type: integer
               nullable: true
         usage:
           $ref: '#/components/schemas/UsageRecord'

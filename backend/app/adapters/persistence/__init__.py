@@ -19,6 +19,8 @@ from .models import (
     AuditEventModel,
     BenchmarkResultModel,
     ReportModel,
+    RunBudgetUsageModel,
+    BudgetReservationModel,
 )
 from .repository import ClarityRepository
 
@@ -39,5 +41,7 @@ __all__ = [
     "AuditEventModel",
     "BenchmarkResultModel",
     "ReportModel",
+    "RunBudgetUsageModel",
+    "BudgetReservationModel",
     "ClarityRepository",
 ]

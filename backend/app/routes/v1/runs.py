@@ -23,7 +23,16 @@ from flask import Blueprint, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
+from ...domain.budget_contracts import (
+    BudgetValidationError,
+    RunBudgetConfig,
+)
+from ...services.budget_service import (
+    get_budget_status,
+    persist_exhaustion,
+)
 from ...services.hypothesis_service import (
+    HypothesisBudgetExhaustedError,
     HypothesisNotFoundError,
     propose_hypothesis_service,
 )
@@ -112,30 +121,54 @@ def create_run():
     if not isinstance(sampling_strategy, str) or not sampling_strategy.strip():
         return error_response("Field 'sampling_strategy' must be a non-empty string.", 400)
 
-    # --- Numeric limit validation ---
-    def _int_limit(field: str) -> Optional[int]:
-        val = data.get(field)
-        if val is None:
-            return None
-        if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
-            raise ValueError(f"Field '{field}' must be a positive integer.")
-        return val
+    # --- Budget validation ---
+    # Canonical nested ``budget`` object, or the legacy flat v1 field names.
+    # Both forms are accepted, but mixing them is rejected as ambiguous.
+    budget_payload = data.get("budget")
+    if budget_payload is not None and not isinstance(budget_payload, dict):
+        return error_response("Field 'budget' must be a JSON object.", 400)
 
-    def _float_limit(field: str) -> Optional[float]:
-        val = data.get(field)
-        if val is None:
-            return None
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
-            raise ValueError(f"Field '{field}' must be a non-negative number.")
-        return float(val)
+    legacy_payload = {}
+    for field in (
+        "max_queries",
+        "max_evaluations",
+        "max_runtime_seconds",
+        "spend_ceiling_usd",
+        "max_concurrent_remote_tasks",
+        "max_generated_hypotheses",
+    ):
+        if field in data and data[field] is not None:
+            legacy_payload[field] = data[field]
+
+    if budget_payload is not None and legacy_payload:
+        return error_response(
+            "Provide the budget either as a 'budget' object or as legacy flat limit fields, "
+            "not both.",
+            400,
+            error="Bad Request",
+            details=[
+                {
+                    "field": "budget",
+                    "code": "CONFLICTING_SETTING",
+                    "message": "Conflicting budget payloads were supplied.",
+                }
+            ],
+        )
 
     try:
-        max_queries = _int_limit("max_queries")
-        max_evaluations = _int_limit("max_evaluations")
-        max_runtime_seconds = _int_limit("max_runtime_seconds")
-        spend_ceiling_usd = _float_limit("spend_ceiling_usd")
-    except ValueError as exc:
-        return error_response(str(exc), 400)
+        if budget_payload is not None:
+            budget_config = RunBudgetConfig.from_mapping(budget_payload)
+        else:
+            budget_config = RunBudgetConfig.from_mapping(
+                legacy_payload, allow_legacy_aliases=True
+            )
+    except BudgetValidationError as exc:
+        return error_response(
+            exc.message,
+            400,
+            error="Bad Request",
+            details=exc.details,
+        )
 
     # --- Optional caller-provided run_id ---
     run_id = data.get("run_id")
@@ -155,11 +188,8 @@ def create_run():
                 domain=domain.strip(),
                 execution_mode=execution_mode,
                 sampling_strategy=sampling_strategy.strip(),
-                max_queries=max_queries,
-                max_evaluations=max_evaluations,
-                max_runtime_seconds=max_runtime_seconds,
-                spend_ceiling_usd=spend_ceiling_usd,
                 run_id=run_id,
+                budget=budget_config,
             )
             serialized = serialize_run(run)
     except RunConflictError as exc:
@@ -287,14 +317,43 @@ def get_run_metrics(run_id: str):
                     "max_evaluations": run.max_evaluations,
                     "max_runtime_seconds": run.max_runtime_seconds,
                     "spend_ceiling_usd": run.spend_ceiling_usd,
+                    "max_concurrent_remote_tasks": run.max_concurrent_remote_tasks,
+                    "max_generated_hypotheses": run.max_generated_hypotheses,
                 },
                 "usage": serialize_usage(latest_usage),
+                "budget": get_budget_status(session, run_id).to_dict(),
             }
     except Exception as exc:  # noqa: BLE001
         log_safe_error("get_run_metrics db error", exc)
         return error_response("An internal error occurred while retrieving metrics.", 500)
 
     return jsonify(payload), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/budget", methods=["GET"])
+def get_run_budget(run_id: str):
+    """GET /api/v1/runs/<run_id>/budget — Per-run budget status contract.
+
+    Returns configured limits, admitted/remaining capacity, concurrency,
+    runtime, cost states, and the structured exhaustion reason. Unavailable
+    monetary data is null, never zero.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+            status = get_budget_status(session, run_id)
+            payload = status.to_dict()
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_budget db error", exc)
+        return error_response(
+            "An internal error occurred while retrieving the run budget.", 500
+        )
+
+    return jsonify({"run_id": run_id, "budget": payload}), 200
 
 
 @runs_v1_bp.route("/runs/<run_id>/report", methods=["GET"])
@@ -485,6 +544,20 @@ def create_run_hypothesis(run_id: str):
                 hypothesis_id=hypothesis_id,
             )
             serialized = serialize_hypothesis(hyp, repo)
+    except HypothesisBudgetExhaustedError as exc:
+        # The failed transaction was rolled back; record the terminal decision
+        # in its own transaction so it survives the error response.
+        try:
+            with db.session_scope() as session:
+                persist_exhaustion(session, run_id, exc.reason, details=exc.to_dict())
+        except Exception as persist_exc:  # noqa: BLE001
+            log_safe_error("persist hypothesis budget exhaustion error", persist_exc)
+        return error_response(
+            "The run's hypothesis generation limit has been reached.",
+            409,
+            error="Conflict",
+            details=exc.to_dict(),
+        )
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
     except Exception as exc:  # noqa: BLE001

@@ -28,7 +28,7 @@ Each retry reserves another unit of query budget before calling the oracle. A re
 
 The engine's lifecycle start is protected by a lock, preventing the same engine instance from being started twice concurrently. Query-budget reservations are also protected by a lock so concurrent reservations cannot increment attempted-query accounting beyond the configured ceiling.
 
-**Sequential execution per engine instance.** The current discovery loop submits at most one oracle experiment at a time. The duplicate-input check reads `_observations`, which is only mutated after a successful, serialized oracle response. This means the duplicate check is safe and correct for a single engine instance. Shared budgets or deduplication across multiple engine instances or remote workers require the per-run budget manager in Issue #14 and are not protected by the current `_query_lock`.
+**Sequential execution per engine instance.** The current discovery loop submits at most one oracle experiment at a time. The duplicate-input check reads `_observations`, which is only mutated after a successful, serialized oracle response. This means the duplicate check is safe and correct for a single engine instance. Shared admission across multiple engine instances, remote workers, and parallel evaluation is enforced by the persistence-backed per-run budget manager (Issue #14, [budget-manager.md](budget-manager.md)) when it is injected as `DiscoveryEngine(..., budget=...)`; the engine's `_query_lock` alone is not a cross-process control.
 
 **Cancellation (deferred scope).** Cancellation is not currently exposed as a core `DiscoveryEngine` operation. A future orchestration or API cancellation path should map the cancellation signal to an explicit terminal reason (e.g., `USER_CANCELLED`) and call the finalization path rather than interrupting the run mid-iteration. Until that support is added, a run that is externally interrupted has no graceful terminal state and will not appear as `RUNNING` only if the engine process itself is killed.
 
@@ -52,4 +52,5 @@ Run:
 cd backend
 python -m pytest tests/test_query_controls.py -q
 python -m pytest tests/test_discovery_loop.py -q
+python -m pytest tests/test_budget_manager.py -q
 ```

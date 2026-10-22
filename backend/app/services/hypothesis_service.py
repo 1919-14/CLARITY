@@ -18,6 +18,7 @@ from ..adapters.persistence.models import (
     ObservationModel,
 )
 from ..adapters.persistence.repository import ClarityRepository
+from ..domain.budget_contracts import BudgetAdmissionDenied
 from ..domain.contracts import (
     EvaluationRequest,
     EvaluationResult,
@@ -28,6 +29,7 @@ from ..domain.contracts import (
 )
 from ..domain.evaluation import EvaluationPipeline
 from ..domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
+from .budget_service import complete_hypothesis_generation, reserve_hypotheses
 
 
 class HypothesisServiceError(Exception):
@@ -40,6 +42,18 @@ class HypothesisNotFoundError(HypothesisServiceError):
 
 class HypothesisValidationError(HypothesisServiceError):
     """Raised when hypothesis data fails validation."""
+
+
+class HypothesisBudgetExhaustedError(HypothesisServiceError):
+    """Raised when the run's hypothesis-generation limit has been reached."""
+
+    def __init__(self, denial: BudgetAdmissionDenied):
+        self.denial = denial
+        self.reason = denial.reason
+        super().__init__(denial.message)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.denial.to_dict()
 
 
 def propose_hypothesis_service(
@@ -61,6 +75,16 @@ def propose_hypothesis_service(
     hyp_id = hypothesis_id or f"hyp-{uuid.uuid4().hex[:12]}"
     rev_id = f"rev-{uuid.uuid4().hex[:12]}"
 
+    # New candidate hypotheses are admitted against the run's persisted
+    # generation budget before anything is written.
+    budget_reservation = None
+    try:
+        budget_reservation, _created = reserve_hypotheses(
+            session, run_id, 1, f"hypothesis:{hyp_id}"
+        )
+    except BudgetAdmissionDenied as exc:
+        raise HypothesisBudgetExhaustedError(exc) from None
+
     hypothesis = HypothesisModel(
         hypothesis_id=hyp_id,
         run_id=run_id,
@@ -78,6 +102,8 @@ def propose_hypothesis_service(
         complexity=complexity,
         creation_source=creation_source,
     )
+    # The reservation lives in this same transaction: if the insert fails, the
+    # enclosing rollback also returns the hypothesis-generation capacity.
     repo.create_hypothesis_with_initial_revision(hypothesis, initial_rev)
 
     audit = AuditEventModel(
@@ -94,6 +120,8 @@ def propose_hypothesis_service(
         },
     )
     repo.record_audit_event(audit)
+    if budget_reservation is not None:
+        complete_hypothesis_generation(session, budget_reservation, True)
     session.flush()
     return hypothesis
 

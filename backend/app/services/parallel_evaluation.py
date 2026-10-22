@@ -26,6 +26,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ from app.domain.contracts import (
     Observation,
     StructuredError,
 )
+from app.domain.budget_contracts import BudgetAdmissionDenied, ParallelBudgetPort
 from app.domain.fitting import FittingConfig
 from app.services.evaluation_task_runtime import (
     ERROR_INVALID_TASK_RESULT,
@@ -61,6 +63,12 @@ ERROR_DISPATCH_FAILED = "NODUS_PARALLEL_DISPATCH_FAILED"
 ERROR_MISSING_TASK_RESULT = "NODUS_PARALLEL_MISSING_TASK_RESULT"
 ERROR_DUPLICATE_TASK_RESULT = "NODUS_PARALLEL_DUPLICATE_TASK_RESULT"
 ERROR_CANCELLED = "NODUS_PARALLEL_CANCELLED"
+ERROR_EVALUATION_BUDGET_EXHAUSTED = "EVALUATION_LIMIT_REACHED"
+ERROR_CONCURRENCY_LIMIT = "CONCURRENCY_LIMIT_REACHED"
+
+# Bounded wait for a per-run remote slot before the batch yields backpressure.
+MAX_SLOT_WAIT_SECONDS = 5.0
+SLOT_POLL_SECONDS = 0.05
 
 # Adapter error codes that may be retried by this orchestrator. Retries are
 # limited to failures observed *before* the provider accepted the task
@@ -473,8 +481,16 @@ class ParallelEvaluationRunner:
         *,
         fitting_config: Optional[FittingConfig] = None,
         sleep: Callable[[float], None] = time.sleep,
+        budget: Optional[ParallelBudgetPort] = None,
     ) -> None:
         self._adapter = adapter
+        if budget is not None and not isinstance(budget, ParallelBudgetPort):
+            raise ParallelConfigurationError(
+                ERROR_INVALID_CONFIG,
+                "budget must implement the ParallelBudgetPort contract.",
+                {"received_type": type(budget).__name__},
+            )
+        self._budget = budget
         self._config = config if config is not None else ParallelEvaluationConfig.from_environment()
         if not isinstance(self._config, ParallelEvaluationConfig):
             raise ParallelConfigurationError(
@@ -523,6 +539,48 @@ class ParallelEvaluationRunner:
             )
         descriptors = self._build_descriptors(requests, observations, dataset_id)
 
+        # Candidate evaluations are admitted against the persisted per-run
+        # budget before any fitting or remote submission starts. A denial
+        # produces explicit failures rather than silently dropping candidates.
+        budget_token: Optional[str] = None
+        if self._budget is not None and descriptors:
+            operation_id = (
+                f"parallel-eval:{run_id or 'run'}:{uuid.uuid4().hex[:10]}"
+            )
+            try:
+                budget_token = self._budget.reserve_candidate_evaluations(
+                    len(descriptors), operation_id
+                )
+            except BudgetAdmissionDenied as exc:
+                denied_mode = (
+                    MODE_LOCAL_SEQUENTIAL
+                    if self._config.execution_mode == ParallelExecutionMode.LOCAL_SEQUENTIAL
+                    else MODE_NODUS_PARALLEL
+                )
+                denied_results = tuple(
+                    self._failure_result(
+                        descriptor,
+                        attempts=0,
+                        code=ERROR_EVALUATION_BUDGET_EXHAUSTED,
+                        message=(
+                            "The candidate evaluation budget for this run is exhausted; "
+                            "the task was not dispatched."
+                        ),
+                        details=exc.to_dict(),
+                        execution_mode=denied_mode,
+                    )
+                    for descriptor in descriptors
+                )
+                summary = self._summarize(
+                    denied_results, 0, denied_mode, 0.0
+                )
+                return ParallelEvaluationBatch(
+                    results=denied_results,
+                    summary=summary,
+                    unexpected_task_ids=(),
+                    duplicate_task_ids=(),
+                )
+
         started = time.perf_counter()
         if self._config.execution_mode == ParallelExecutionMode.LOCAL_SEQUENTIAL:
             results, submitted = self._run_local(descriptors, cancel_event)
@@ -538,6 +596,13 @@ class ParallelEvaluationRunner:
                 duplicates,
             ) = self._run_remote(descriptors, run_id, cancel_event)
         duration = time.perf_counter() - started
+
+        if budget_token is not None:
+            if submitted > 0:
+                self._budget.complete_candidate_evaluation(budget_token, True)
+            else:
+                # Nothing was ever dispatched: return the reserved capacity.
+                self._budget.release_candidate_evaluations(budget_token)
 
         ordered = _aggregate(descriptors, results)
         summary = self._summarize(ordered, submitted, actual_mode, duration)
@@ -687,10 +752,42 @@ class ParallelEvaluationRunner:
                 attempts_by_task[descriptor.task.task_id] += 1
                 submitted.add(descriptor.task.task_id)
 
+            slot_tokens: Optional[Sequence[str]] = None
+            if self._budget is not None and round_descriptors:
+                slot_tokens = self._acquire_remote_slots(
+                    len(round_descriptors),
+                    f"{run_id or 'run'}:slots:{round_index}:{uuid.uuid4().hex[:8]}",
+                )
+                if slot_tokens is None:
+                    # Concurrency is temporary backpressure, not exhaustion.
+                    for descriptor in round_descriptors:
+                        settled[descriptor.task.task_id] = self._failure_result(
+                            descriptor,
+                            attempts=attempts_by_task[descriptor.task.task_id],
+                            code=ERROR_CONCURRENCY_LIMIT,
+                            message=(
+                                "The per-run remote concurrency limit stayed saturated; the "
+                                "task was not dispatched and no score was produced."
+                            ),
+                            details={
+                                "max_concurrent_remote_tasks": getattr(
+                                    self._budget, "max_concurrent_remote_tasks", None
+                                ),
+                                "wait_seconds": MAX_SLOT_WAIT_SECONDS,
+                            },
+                            execution_mode=self._actual_adapter_mode(),
+                        )
+                    pending = []
+                    break
+
+            effective_concurrency = self._config.max_concurrency
+            if slot_tokens is not None:
+                effective_concurrency = min(effective_concurrency, len(slot_tokens))
+
             try:
                 raw_results = self._adapter.execute_many(
                     [descriptor.task for descriptor in round_descriptors],
-                    max_concurrency=self._config.max_concurrency,
+                    max_concurrency=effective_concurrency,
                 )
             except Exception as exc:  # noqa: BLE001 - adapter boundary
                 # A batch-level exception may mean partial submission. Do not
@@ -706,6 +803,9 @@ class ParallelEvaluationRunner:
                     )
                 pending = []
                 break
+            finally:
+                if slot_tokens is not None:
+                    self._budget.release_remote_slots(slot_tokens)
 
             if isinstance(raw_results, (str, bytes)) or not isinstance(raw_results, Sequence):
                 for descriptor in round_descriptors:
@@ -773,6 +873,25 @@ class ParallelEvaluationRunner:
             tuple(sorted(unexpected)),
             tuple(sorted(duplicates)),
         )
+
+    def _acquire_remote_slots(
+        self, count: int, operation_id: str
+    ) -> Optional[Sequence[str]]:
+        """Acquire *count* persisted slots, or None after bounded backpressure.
+
+        Slot acquisition is all-or-none for a batch: a partial acquisition is
+        never held while waiting for the rest, so two concurrent runners cannot
+        deadlock on each other's slots.
+        """
+        if self._budget is None:
+            return None
+        polls = max(1, int(MAX_SLOT_WAIT_SECONDS / SLOT_POLL_SECONDS))
+        for _ in range(polls):
+            tokens = self._budget.try_acquire_remote_slots(count, operation_id)
+            if tokens is not None:
+                return tokens
+            self._sleep(SLOT_POLL_SECONDS)
+        return self._budget.try_acquire_remote_slots(count, operation_id)
 
     def _assert_remote_mode(self) -> None:
         adapter_config = getattr(self._adapter, "config", None)

@@ -342,6 +342,61 @@ Issue #12 adapter suite (70 tests) and the full backend suite remain green.
 service access.** See [nodus-parallel.md](nodus-parallel.md) and
 [nodus-readiness.md](nodus-readiness.md).
 
+## D-024 — Per-run budgets are database-admitted, not process-counted
+
+**Date:** 2026-10-23
+
+**Status:** Accepted
+
+**Issue:** #14
+
+**Context:** The discovery engine already enforced an in-process query ceiling,
+but Issue #13 introduced parallel evaluation and remote Nodus tasks, so a
+per-engine counter can no longer bound a run's total resource use. Issue #14 also
+requires an explicit, validated budget for every run, enforcement across
+concurrent workers, structured exhaustion, preserved results, and honest
+reporting of provider spending limits.
+
+**Decision:** Every run stores a validated `RunBudgetConfig` snapshot and one
+`run_budget_usage` counter row. Admission is a single conditional `UPDATE`
+(`... WHERE counter < limit`) in a short transaction, with an idempotent
+`budget_reservations` ledger keyed by `(run_id, resource, operation_id)`.
+Reservations are charged before dispatch; outcomes are recorded after the call
+outside any transaction. A reservation is released only when the caller can
+prove the work was never dispatched; ambiguous remote outcomes stay charged.
+Exhaustion is an atomic, first-reason-wins transition to `budget_exhausted` with
+a structured stop reason and a `BUDGET_EXHAUSTED` audit event. The compute-spend
+ceiling is application-side and estimate-based; provider hard caps are reported
+as unsupported.
+
+**Rationale:** The database is the only component shared by all workers, so its
+conditional update is the smallest mechanism that makes `admitted <= limit` true
+across processes without holding locks across network calls. A durable ledger
+makes restart reconciliation and duplicate delivery tractable. Separating
+reservation from outcome keeps scientific results committed even when a later
+limit is reached.
+
+**Trade-off:** Every admitted unit costs one or two short transactions, and a
+crashed dispatch may remain charged as ambiguous. SQLite (tests/dev) needs a
+short in-process guard to avoid its single-writer lock errors; MySQL remains the
+cross-process authority. Runtime limits stop admission, not running work.
+
+**Rejected alternatives:** In-memory counters or `threading.Semaphore` (not
+cross-worker); read-compare-increment (racy); a standalone budget utility
+(callers could bypass it); releasing reservations on timeout (may bypass
+accounting); treating missing cost data as `$0` (false precision); claiming a
+provider spending cap the SDK does not expose; introducing new run states
+(`budget_exhausted` already existed in the lifecycle).
+
+**Validation:** `backend/tests/test_budget_manager.py` (57 tests: validation and
+zero semantics, exact-limit boundary, 10-thread admission race, retries, runtime
+boundaries, idempotent/concurrent exhaustion, preserved observations, cost
+honesty, slot recovery, hypothesis/evaluation limits) and
+`backend/tests/api/test_v1_budget.py` (18 tests: payload validation, summary
+contract, null cost serialization, 409 exhaustion persistence). Full backend
+suite, Alembic upgrade/downgrade smoke test, and frontend lint/build remain
+green. See [budget-manager.md](budget-manager.md).
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.
@@ -350,7 +405,7 @@ service access.** See [nodus-parallel.md](nodus-parallel.md) and
 4. ~~Disagreement and uncertainty score.~~ Resolved for the first implementation by D-021 (population variance default, sample variance/max spread supported, uncertainty unavailable).
 5. ~~Nodus SDK version, task API, native budget controls, cost metadata, retry/cancellation semantics, concurrency limits.~~ Resolved by D-002 (SDK surface, pre-submission retry policy) and D-023 (batch concurrency, thread-based worker pool). Native per-call cost metadata and confirmed remote cancellation remain unavailable; live concurrency behaviour is pending verification.
 6. MySQL library/ORM and migration tool.
-7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019; run-level cancellation and durable recovery remain open for the API/persistence layer.
+7. ~~Exact run states/transitions, cancellation, recovery.~~ Resolved for the discovery loop by D-017/D-018/D-019 and for per-run resource budgets by D-024; run-level cancellation and durable recovery beyond budget reservations remain open for the API/persistence layer.
 8. Required report export formats.
 9. Deployment target and clean-start procedure.
 10. Target accuracy/error threshold and trial count for query-efficiency benchmarks.

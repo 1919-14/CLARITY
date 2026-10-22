@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from ..adapters.persistence.models import AuditEventModel, RunModel, UsageRecordModel
 from ..adapters.persistence.repository import ClarityRepository
+from ..domain.budget_contracts import RunBudgetConfig
+from .budget_service import initialize_run_budget
 
 
 class RunServiceError(Exception):
@@ -25,7 +27,9 @@ class RunConflictError(RunServiceError):
     """Raised when an operation conflicts with the current run state (e.g. terminal state)."""
 
 
-TERMINAL_RUN_STATUSES = frozenset({"completed", "stopped_by_budget", "cancelled", "failed"})
+TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "budget_exhausted", "stopped_by_budget", "cancelled", "failed"}
+)
 
 
 def create_run_service(
@@ -39,13 +43,31 @@ def create_run_service(
     max_runtime_seconds: Optional[int] = None,
     spend_ceiling_usd: Optional[float] = None,
     run_id: Optional[str] = None,
+    budget: Optional[RunBudgetConfig] = None,
 ) -> RunModel:
-    """Create a new discovery run, its initial zero usage record, and audit trail."""
+    """Create a new discovery run, its validated budget, zero usage, and audit trail.
+
+    ``budget`` is the canonical Issue #14 configuration. When omitted, the
+    legacy flat arguments are resolved into a validated budget with documented
+    defaults, so every newly created run has an explicit budget.
+    """
     repo = ClarityRepository(session)
     resolved_run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
 
     if repo.get_run(resolved_run_id):
         raise RunConflictError(f"Run with ID '{resolved_run_id}' already exists.")
+
+    if budget is None:
+        legacy_payload = {}
+        if max_queries is not None:
+            legacy_payload["max_oracle_queries"] = max_queries
+        if max_evaluations is not None:
+            legacy_payload["max_candidate_evaluations"] = max_evaluations
+        if max_runtime_seconds is not None:
+            legacy_payload["max_runtime_seconds"] = max_runtime_seconds
+        if spend_ceiling_usd is not None:
+            legacy_payload["max_compute_spend_usd"] = spend_ceiling_usd
+        budget = RunBudgetConfig.from_mapping(legacy_payload)
 
     run = RunModel(
         run_id=resolved_run_id,
@@ -54,12 +76,16 @@ def create_run_service(
         status="pending",
         execution_mode=execution_mode,
         sampling_strategy=sampling_strategy,
-        max_queries=max_queries,
-        max_evaluations=max_evaluations,
-        max_runtime_seconds=max_runtime_seconds,
-        spend_ceiling_usd=spend_ceiling_usd,
+        max_queries=budget.max_oracle_queries,
+        max_evaluations=budget.max_candidate_evaluations,
+        max_runtime_seconds=budget.max_runtime_seconds,
+        spend_ceiling_usd=budget.max_compute_spend_usd,
+        max_concurrent_remote_tasks=budget.max_concurrent_remote_tasks,
+        max_generated_hypotheses=budget.max_generated_hypotheses,
+        budget_config_json=budget.to_dict(),
     )
     repo.create_run(run)
+    initialize_run_budget(session, run, budget, actor="researcher")
 
     # Initial zero usage record
     usage = UsageRecordModel(
@@ -68,8 +94,10 @@ def create_run_service(
         queries_executed=0,
         evaluations_scheduled=0,
         evaluations_completed=0,
+        # Application-side estimate of zero is measured; accruing/settled are
+        # unknown until the provider reports them, so they are null, not zero.
         estimated_cost_usd=0.0,
-        live_accruing_cost_usd=0.0,
+        live_accruing_cost_usd=None,
         settled_cost_usd=None,
         is_budget_exhausted=False,
     )
@@ -86,11 +114,14 @@ def create_run_service(
             "domain": domain,
             "execution_mode": execution_mode,
             "limits": {
-                "max_queries": max_queries,
-                "max_evaluations": max_evaluations,
-                "max_runtime_seconds": max_runtime_seconds,
-                "spend_ceiling_usd": spend_ceiling_usd,
+                "max_queries": budget.max_oracle_queries,
+                "max_evaluations": budget.max_candidate_evaluations,
+                "max_runtime_seconds": budget.max_runtime_seconds,
+                "spend_ceiling_usd": budget.max_compute_spend_usd,
+                "max_concurrent_remote_tasks": budget.max_concurrent_remote_tasks,
+                "max_generated_hypotheses": budget.max_generated_hypotheses,
             },
+            "budget": budget.to_dict(),
         },
     )
     repo.record_audit_event(audit)
