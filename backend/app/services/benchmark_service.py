@@ -30,6 +30,8 @@ FORBIDDEN_METADATA_KEY_SUBSTRINGS = (
     "target_formula",
     "target_parameters",
     "target_coefficients",
+    "target_label",
+    "coefficients",
 )
 
 
@@ -72,6 +74,17 @@ def _inspect_metadata_node(
                 raise ValueError(
                     f"Unsafe metadata value at '{path}': contains evaluator secret seed."
                 )
+        # Check if string contains serialized target coefficients or parameters
+        if ground_truth.target_parameters:
+            import json
+            try:
+                params_repr = json.dumps(ground_truth.target_parameters, sort_keys=True).replace(" ", "").lower()
+                if len(params_repr) > 5 and params_repr in node.replace(" ", "").lower():
+                    raise ValueError(
+                        f"Unsafe metadata value at '{path}': contains secret target parameters."
+                    )
+            except Exception:
+                pass
     elif isinstance(node, (int, float)) and not isinstance(node, bool):
         if ground_truth.secret_seed is not None and int(node) == int(ground_truth.secret_seed):
             raise ValueError(

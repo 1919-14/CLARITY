@@ -523,6 +523,69 @@ class TestRunBenchmarks:
         res = client.get("/api/v1/runs/run-ghost/benchmarks")
         assert res.status_code == 404
 
+    def test_post_benchmark_rejects_injected_target_formula_or_parameters(self, client):
+        """Requirement 4: Disallow client-injected target_formula and target_parameters via API."""
+        run = _make_run(client, "Inject Test Run")
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "target_formula": "y = 999.0",
+                "target_parameters": {"degree": 0},
+            },
+        )
+        assert res.status_code == 400
+        data = res.get_json()
+        assert "Client-supplied ground truth" in data["message"]
+
+    def test_post_benchmark_rejects_injected_target_label(self, client):
+        """Requirement 4: Disallow client-injected target_label."""
+        run = _make_run(client, "Inject Label Run")
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={"target_label": "fabricated_target"},
+        )
+        assert res.status_code == 400
+        data = res.get_json()
+        assert "Client-supplied ground truth" in data["message"]
+
+    def test_post_benchmark_rejects_injected_coefficients(self, client):
+        """Requirement 4: Disallow client-injected coefficients."""
+        run = _make_run(client, "Inject Coeffs Run")
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "coefficients": {"c0": 1.0, "c1": 2.0},
+            },
+        )
+        assert res.status_code == 400
+        data = res.get_json()
+        assert "Client-supplied ground truth" in data["message"]
+
+    def test_post_benchmark_requires_registered_benchmark_case(self, client):
+        """Requirement 4: Missing or invalid benchmark_case returns 400."""
+        run = _make_run(client, "No Case Run")
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={},
+        )
+        assert res.status_code == 400
+        assert "Field 'benchmark_case' is required" in res.get_json()["message"]
+
+    def test_post_benchmark_rejects_unsafe_metadata(self, client):
+        """Requirement 5: API rejects metadata containing secret seed or forbidden keys."""
+        run = _make_run(client, "Unsafe Meta Run")
+        res = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "metadata": {"audit": {"secret_token": "leak"}},
+            },
+        )
+        assert res.status_code == 400
+        assert "Unsafe metadata" in res.get_json()["message"]
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/runs/<run_id>/observations
