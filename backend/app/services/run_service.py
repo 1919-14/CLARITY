@@ -85,25 +85,8 @@ def create_run_service(
         budget_config_json=budget.to_dict(),
     )
     repo.create_run(run)
-    initialize_run_budget(session, run, budget, actor="researcher")
 
-    # Initial zero usage record
-    usage = UsageRecordModel(
-        usage_id=f"use-{uuid.uuid4().hex[:12]}",
-        run_id=resolved_run_id,
-        queries_executed=0,
-        evaluations_scheduled=0,
-        evaluations_completed=0,
-        # Application-side estimate of zero is measured; accruing/settled are
-        # unknown until the provider reports them, so they are null, not zero.
-        estimated_cost_usd=0.0,
-        live_accruing_cost_usd=None,
-        settled_cost_usd=None,
-        is_budget_exhausted=False,
-    )
-    repo.record_usage(usage)
-
-    # Audit event
+    # Audit event for run creation
     audit = AuditEventModel(
         event_id=f"evt-{uuid.uuid4().hex[:12]}",
         run_id=resolved_run_id,
@@ -125,6 +108,24 @@ def create_run_service(
         },
     )
     repo.record_audit_event(audit)
+
+    initialize_run_budget(session, run, budget, actor="researcher")
+
+    # Initial zero usage record
+    usage = UsageRecordModel(
+        usage_id=f"use-{uuid.uuid4().hex[:12]}",
+        run_id=resolved_run_id,
+        queries_executed=0,
+        evaluations_scheduled=0,
+        evaluations_completed=0,
+        # Application-side estimate of zero is measured; accruing/settled are
+        # unknown until the provider reports them, so they are null, not zero.
+        estimated_cost_usd=0.0,
+        live_accruing_cost_usd=None,
+        settled_cost_usd=None,
+        is_budget_exhausted=False,
+    )
+    repo.record_usage(usage)
     session.flush()
     return run
 

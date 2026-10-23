@@ -503,7 +503,7 @@ class TestReservationReplay:
     def _replay(self, db, run_id, operation_id):
         with pytest.raises(BudgetReservationReplay):
             with db.session_scope() as session:
-                reserve_oracle_query(session, run_id, operation_id)
+                reserve_oracle_query(session, run_id, operation_id, now=Clock().now)
 
     def test_replay_of_reserved_reservation_is_refused(self, db):
         run_id = make_run(db, budget=RunBudgetConfig(max_oracle_queries=3))
@@ -552,7 +552,7 @@ class TestReservationReplay:
 
         with pytest.raises(BudgetReservationReplay) as exc:
             with db.session_scope() as session:
-                reserve_oracle_query(session, run_id, "op")
+                reserve_oracle_query(session, run_id, "op", now=Clock().now)
         payload = exc.value.to_dict()
         assert payload["code"] == "DUPLICATE_RESERVATION"
         assert payload["admitted"] is False
