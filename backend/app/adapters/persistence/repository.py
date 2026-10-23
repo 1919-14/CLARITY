@@ -4,9 +4,12 @@ Encapsulates SQL operations and transactions, decoupling API routes and discover
 services from database details.
 """
 
+import uuid
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, func
+
 from .models import (
     RunModel,
     HypothesisModel,
@@ -121,8 +124,14 @@ class ClarityRepository:
                 hyp.is_pinned = is_pinned
             if is_excluded is not None:
                 hyp.is_excluded = is_excluded
+            # Atomically advance version and rotate version token on every flag update
+            current_v = getattr(hyp, "version", 1) or 1
+            hyp.version = current_v + 1
+            hyp.version_token = f"vt-{uuid.uuid4().hex[:12]}"
+            hyp.updated_at = datetime.now(timezone.utc)
             self.session.flush()
         return hyp
+
 
     # =========================================================================
     # Observation Operations

@@ -96,7 +96,7 @@ def db(tmp_path):
 
 class Clock:
     def __init__(self, now=None):
-        self.now = now or datetime(2026, 10, 23, 12, 0, 0, tzinfo=timezone.utc)
+        self.now = now or datetime.now(timezone.utc)
 
     def __call__(self):
         return self.now

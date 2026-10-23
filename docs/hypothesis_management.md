@@ -74,9 +74,12 @@ y = 0.5x^2 - 1.2x + 3.0
 | Power | `^` or `**` | `x^2` or `x**3` | Exponent must be non-negative integer $\le 12$ |
 | Grouping | `(...)` | `(x + 1) * (x - 2)` | Standard parentheses |
 
-#### Parameter Coefficients
+#### Parameter Coefficients and Canonical Derivation
 
-Parameters may be supplied explicitly in the request payload or inferred from the expression:
+Parameters can either be supplied explicitly or omitted:
+- **Omitted parameters**: When `parameters` is omitted, canonical polynomial coefficients (`c0, c1, ...`) are automatically and safely derived directly from the mathematical formula AST without executing any user code (e.g., `y = 2*x + 1` derives `c0=1.0, c1=2.0` with degree 1).
+- **Explicit parameters**: When supplied, the coefficients are verified against the formula. Any mismatch (e.g., proposing `y = 2*x + 1` with `c0=99.0`) is rejected with `INVALID_PARAMETERS` (HTTP 422), guaranteeing that candidate formula representation and underlying model evaluation never diverge.
+- **Linear models**: Shorthand parameters `{"a": 2.0, "b": 1.0}` are normalized to ascending polynomial coefficients `{"c0": 1.0, "c1": 2.0}`.
 ```json
 {
   "model_family": "polynomial",
@@ -85,7 +88,6 @@ Parameters may be supplied explicitly in the request payload or inferred from th
   "complexity": 2
 }
 ```
-For linear models, shorthand parameters `{"a": 2.0, "b": 1.0}` are automatically normalized to ascending polynomial coefficients `{"c0": 1.0, "c1": 2.0}`.
 
 ---
 
@@ -195,23 +197,26 @@ When an expression is malformed or violates security boundaries, a structured er
 
 ## 5. Concurrency and Optimistic Locking
 
-To prevent race conditions and lost updates from concurrent researcher actions:
-- Callers may pass `expected_revision` in `PATCH /api/v1/hypotheses/{id}`:
+To prevent race conditions, lost updates, and silent overwrites from concurrent researcher flag mutations (pin/unpin/exclude/restore):
+- Each hypothesis maintains an atomic integer `version` (initialized to 1) and a unique `version_token` (e.g., `vt-a1b2c3d4e5f6`).
+- Every flag update (`PATCH /api/v1/hypotheses/{id}`) atomically increments `version` and rotates `version_token`.
+- Clients can provide optimistic locking constraints via `expected_version_token`, `expected_version`, or `expected_revision`:
   ```json
   {
     "is_pinned": true,
-    "expected_revision": 1
+    "expected_version_token": "vt-4a8f9c2d1e0b"
   }
   ```
-- If the current revision of the hypothesis in the database does not match `expected_revision`, the request fails with `409 Conflict`:
+- If another concurrent update has committed since the client read the hypothesis, the version token / version number will differ, and the request is immediately rejected with HTTP `409 Conflict`:
   ```json
   {
     "error": "Conflict",
-    "message": "Hypothesis 'hyp-123' revision conflict: expected revision 1, but current revision is 2.",
+    "message": "Hypothesis 'hyp-123' version conflict: expected version token 'vt-4a8f9c2d1e0b', but current token is 'vt-8f1e2d3c4b5a'. Re-read before updating.",
     "status_code": 409
   }
   ```
-- Submitting a duplicate `hypothesis_id` returns `409 Conflict`.
+- Compare-and-swap enforcement prevents two competing clients with the same base revision or version token from overwriting each other's pin/exclude states.
+- Submitting a duplicate `hypothesis_id` during proposal also returns HTTP `409 Conflict`.
 
 ---
 

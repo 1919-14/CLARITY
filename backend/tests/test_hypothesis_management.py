@@ -156,6 +156,60 @@ class TestResearcherCreatedHypotheses:
         assert data["latest_revision"]["formula"] == "y = 3*x^2 - 1.5*x + 4"
         assert data["latest_revision"]["creation_source"] == "researcher"
 
+    def test_propose_hypothesis_without_parameters_derives_exact_coefficients_and_predictions(self, db_session):
+        """Proposing y = 2*x + 1 without parameters derives c0=1, c1=2; predictions and metrics match formula."""
+        from app.domain.hypothesis_models import default_registry
+
+        run = _create_test_run(db_session)
+        # 1. Propose without parameters
+        hyp = propose_hypothesis_service(
+            session=db_session,
+            run_id=run.run_id,
+            model_family="polynomial",
+            formula="y = 2*x + 1",
+            parameters=None,
+        )
+
+        rev = hyp.revisions[0]
+        # Canonical polynomial specification must be populated with exact coefficients c0=1.0, c1=2.0
+        assert rev.parameters["family"] == "polynomial"
+        assert rev.parameters["degree"] == 1
+        assert rev.parameters["coefficients"]["c0"] == 1.0
+        assert rev.parameters["coefficients"]["c1"] == 2.0
+
+        # 2. Verify model instantiation and predictions correspond to y = 2*x + 1
+        family = default_registry().get("polynomial")
+        model, err = family.parse_specification(rev.parameters)
+        assert err is None
+        assert model.degree == 1
+        assert model.coefficient(0) == 1.0
+        for x_val, expected_y in [(0.0, 1.0), (1.0, 3.0), (2.0, 5.0), (-2.0, -3.0)]:
+            pred, p_err = family.predict(rev.parameters, {"x": x_val})
+            assert p_err is None
+            assert pred["y"] == pytest.approx(expected_y)
+
+        # 3. Add observations adhering to y = 2*x + 1 and re-evaluate
+        _add_observations(db_session, run.run_id, count=3)
+        eval_result, _ = reevaluate_hypothesis_service(db_session, hyp.hypothesis_id)
+        assert eval_result.status == "completed"
+        # Actual values are y = 2*x + 1, predictions are 2*x + 1 -> MAE and RMSE must be 0.0
+        assert eval_result.metrics["mae"] == pytest.approx(0.0, abs=1e-6)
+        assert eval_result.metrics["rmse"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_propose_hypothesis_with_conflicting_parameters_rejected(self, db_session):
+        """Formulas whose supplied parameters do not match formula coefficients are rejected."""
+        run = _create_test_run(db_session)
+        with pytest.raises(HypothesisValidationError) as exc_info:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = 2*x + 1",
+                parameters={"c0": 99.0, "c1": 99.0},
+            )
+        assert "does not match formula coefficient" in str(exc_info.value)
+
+
 
 # =============================================================================
 # 2. Expression Validation & Security (Arbitrary Code Rejection)
@@ -521,6 +575,112 @@ class TestConcurrencyAndConflicts:
         )
         assert res.status_code == 409
         assert "conflict" in res.get_json()["error"].lower()
+
+    def test_competing_flag_updates_rejected_by_version_token(self, db_session):
+        """Two competing updates starting from the same version token cannot overwrite each other."""
+        run = _create_test_run(db_session)
+        hyp = propose_hypothesis_service(db_session, run.run_id, "polynomial", "y = 2*x + 1")
+        initial_token = hyp.version_token
+        initial_version = hyp.version
+        assert initial_token is not None
+        assert initial_version == 1
+
+        # Client A updates with initial_token -> succeeds
+        updated_a = update_hypothesis_flags_service(
+            db_session,
+            hyp.hypothesis_id,
+            is_pinned=True,
+            expected_version_token=initial_token,
+        )
+        assert updated_a.is_pinned is True
+        assert updated_a.version == 2
+        assert updated_a.version_token != initial_token
+
+        # Client B submits competing update using same initial_token -> rejected with conflict
+        with pytest.raises(HypothesisConflictError) as exc_info:
+            update_hypothesis_flags_service(
+                db_session,
+                hyp.hypothesis_id,
+                is_excluded=True,
+                expected_version_token=initial_token,
+            )
+        assert "conflict" in str(exc_info.value).lower()
+
+        # Client B re-reads latest state and submits with new token -> succeeds
+        updated_b = update_hypothesis_flags_service(
+            db_session,
+            hyp.hypothesis_id,
+            is_excluded=True,
+            expected_version_token=updated_a.version_token,
+        )
+        assert updated_b.is_excluded is True
+        assert updated_b.version == 3
+
+    def test_competing_flag_updates_rejected_by_expected_revision(self, db_session):
+        """Two competing updates starting from the same expected_revision cannot overwrite each other."""
+        run = _create_test_run(db_session)
+        hyp = propose_hypothesis_service(db_session, run.run_id, "polynomial", "y = 2*x + 1")
+        assert hyp.current_revision == 1
+        assert hyp.version == 1
+
+        # Client 1 updates is_pinned=True with expected_revision=1 -> succeeds, version advances
+        updated_1 = update_hypothesis_flags_service(
+            db_session,
+            hyp.hypothesis_id,
+            is_pinned=True,
+            expected_revision=1,
+        )
+        assert updated_1.is_pinned is True
+        assert updated_1.version == 2
+
+        # Client 2 also submitting expected_revision=1 -> rejected because version advanced
+        with pytest.raises(HypothesisConflictError) as exc_info:
+            update_hypothesis_flags_service(
+                db_session,
+                hyp.hypothesis_id,
+                is_excluded=True,
+                expected_revision=1,
+            )
+        assert "conflict" in str(exc_info.value).lower()
+
+    def test_competing_flag_updates_via_api(self, client):
+        """Two clients submitting competing PATCH requests: second client receives 409 Conflict."""
+        res_run = client.post("/api/v1/runs", json={"name": "Competing Lock Run"})
+        run_id = res_run.get_json()["run"]["run_id"]
+
+        res_hyp = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={"model_family": "polynomial", "formula": "y = 2*x + 1"},
+        )
+        hyp_data = res_hyp.get_json()["hypothesis"]
+        hyp_id = hyp_data["hypothesis_id"]
+        v_token = hyp_data["version_token"]
+        assert v_token is not None
+
+        # Client A PATCH succeeds
+        res_a = client.patch(
+            f"/api/v1/hypotheses/{hyp_id}",
+            json={"is_pinned": True, "expected_version_token": v_token},
+        )
+        assert res_a.status_code == 200
+        new_token = res_a.get_json()["hypothesis"]["version_token"]
+        assert new_token != v_token
+
+        # Client B PATCH with stale v_token receives 409 Conflict
+        res_b = client.patch(
+            f"/api/v1/hypotheses/{hyp_id}",
+            json={"is_excluded": True, "expected_version_token": v_token},
+        )
+        assert res_b.status_code == 409
+        assert "conflict" in res_b.get_json()["error"].lower()
+
+        # Client B retries with new_token -> succeeds
+        res_b_retry = client.patch(
+            f"/api/v1/hypotheses/{hyp_id}",
+            json={"is_excluded": True, "expected_version_token": new_token},
+        )
+        assert res_b_retry.status_code == 200
+        assert res_b_retry.get_json()["hypothesis"]["is_excluded"] is True
 
     def test_duplicate_hypothesis_id_rejected_with_conflict(self, db_session):
         """Proposing hypothesis with existing ID raises HypothesisConflictError."""

@@ -189,6 +189,117 @@ class _SafeExpressionValidator(ast.NodeVisitor):
         raise ValueError(f"Disallowed expression construct '{type(node).__name__}'.")
 
 
+def _multiply_polynomials(
+    p1: Mapping[int, float],
+    p2: Mapping[int, float],
+    max_degree: int = HARD_MAX_POLYNOMIAL_DEGREE,
+) -> Dict[int, float]:
+    """Multiply two polynomials represented as {power: coefficient}."""
+    res: Dict[int, float] = {}
+    for pow1, coeff1 in p1.items():
+        if abs(coeff1) < 1e-15:
+            continue
+        for pow2, coeff2 in p2.items():
+            if abs(coeff2) < 1e-15:
+                continue
+            deg = pow1 + pow2
+            if deg > max_degree:
+                raise ValueError(f"Polynomial degree {deg} exceeds maximum allowed ({max_degree}).")
+            res[deg] = res.get(deg, 0.0) + coeff1 * coeff2
+    return res
+
+
+def _evaluate_polynomial_ast(
+    node: ast.AST,
+    var_names: Set[str],
+    param_dict: Mapping[str, float],
+    max_degree: int = HARD_MAX_POLYNOMIAL_DEGREE,
+) -> Dict[int, float]:
+    """Safely derive exact polynomial coefficients {power: coefficient} from an AST node without code execution."""
+    if isinstance(node, ast.Expression):
+        return _evaluate_polynomial_ast(node.body, var_names, param_dict, max_degree)
+
+    if isinstance(node, ast.Constant):
+        val = node.value
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"Constant '{val}' of type {type(val).__name__} is not allowed.")
+        if not math.isfinite(val):
+            raise ValueError(f"Non-finite numeric constant '{val}' is not allowed.")
+        return {0: float(val)}
+
+    if isinstance(node, ast.Name):
+        var_name = node.id
+        if var_name in var_names:
+            return {1: 1.0}
+        if var_name in param_dict:
+            return {0: float(param_dict[var_name])}
+        raise ValueError(f"Unknown identifier '{var_name}' in polynomial expression.")
+
+    if isinstance(node, ast.UnaryOp):
+        sub_poly = _evaluate_polynomial_ast(node.operand, var_names, param_dict, max_degree)
+        if isinstance(node.op, ast.UAdd):
+            return sub_poly
+        if isinstance(node.op, ast.USub):
+            return {k: -v for k, v in sub_poly.items()}
+        raise ValueError(f"Unsupported unary operator '{type(node.op).__name__}'.")
+
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Pow):
+            if not isinstance(node.right, ast.Constant):
+                raise ValueError("Exponents must be constant non-negative integers.")
+            exp_val = node.right.value
+            if isinstance(exp_val, bool) or not isinstance(exp_val, (int, float)) or not float(exp_val).is_integer():
+                raise ValueError(f"Non-integer exponent '{exp_val}' is not supported in polynomials.")
+            int_exp = int(exp_val)
+            if int_exp < 0:
+                raise ValueError("Negative exponents are not supported in polynomial expressions.")
+            if int_exp == 0:
+                return {0: 1.0}
+
+            left_poly = _evaluate_polynomial_ast(node.left, var_names, param_dict, max_degree)
+            left_max_pow = max((p for p, c in left_poly.items() if abs(c) > 1e-12), default=0)
+            if left_max_pow * int_exp > max_degree:
+                raise ValueError(f"Polynomial degree {left_max_pow * int_exp} exceeds maximum allowed ({max_degree}).")
+
+            result: Dict[int, float] = {0: 1.0}
+            for _ in range(int_exp):
+                result = _multiply_polynomials(result, left_poly, max_degree)
+            return result
+
+        left_poly = _evaluate_polynomial_ast(node.left, var_names, param_dict, max_degree)
+        right_poly = _evaluate_polynomial_ast(node.right, var_names, param_dict, max_degree)
+
+        if isinstance(node.op, ast.Add):
+            res = dict(left_poly)
+            for p, c in right_poly.items():
+                res[p] = res.get(p, 0.0) + c
+            return res
+
+        if isinstance(node.op, ast.Sub):
+            res = dict(left_poly)
+            for p, c in right_poly.items():
+                res[p] = res.get(p, 0.0) - c
+            return res
+
+        if isinstance(node.op, ast.Mult):
+            return _multiply_polynomials(left_poly, right_poly, max_degree)
+
+        if isinstance(node.op, ast.Div):
+            non_zero_powers = [p for p, c in right_poly.items() if abs(c) > 1e-12]
+            if not non_zero_powers:
+                raise ValueError("Division by zero in expression.")
+            if any(p != 0 for p in non_zero_powers):
+                raise ValueError("Division by variable or non-constant expression is not supported in polynomials.")
+            divisor = right_poly.get(0, 0.0)
+            if abs(divisor) < 1e-15:
+                raise ValueError("Division by zero in expression.")
+            return {k: v / divisor for k, v in left_poly.items()}
+
+        raise ValueError(f"Unsupported binary operator '{type(node.op).__name__}'.")
+
+    raise ValueError(f"Disallowed construct '{type(node).__name__}'.")
+
+
 def validate_hypothesis_expression(
     formula: str,
     model_family: str = POLYNOMIAL_FAMILY_ID,
@@ -283,7 +394,10 @@ def validate_hypothesis_expression(
     allowed_identifiers: Set[str] = {input_variable, "x", "X"}
     param_dict: Dict[str, float] = {}
     if parameters and isinstance(parameters, Mapping):
-        for k, v in parameters.items():
+        flat_params = parameters.get("coefficients", parameters) if isinstance(parameters.get("coefficients"), Mapping) else parameters
+        for k, v in flat_params.items():
+            if k in ("coefficients", "family", "coefficient_order", "input_variable", "output_variable", "degree"):
+                continue
             if not isinstance(k, str) or not k.strip():
                 return None, StructuredError(
                     code=ERROR_INVALID_PARAMETERS,
@@ -318,35 +432,70 @@ def validate_hypothesis_expression(
             message=f"Polynomial degree {detected_degree} exceeds hard ceiling of {HARD_MAX_POLYNOMIAL_DEGREE}.",
         )
 
-    # 7. Normalize parameters to canonical polynomial structure
+    # 7. Normalize parameters to canonical polynomial structure by deriving exact coefficients from the formula
     canonical_parameters: Dict[str, Any] = {}
     if norm_family == POLYNOMIAL_FAMILY_ID:
-        if "coefficients" in param_dict or any(k.startswith("c") for k in param_dict):
-            # Already using c0, c1, ...
-            coeffs = {f"c{i}": param_dict.get(f"c{i}", 0.0) for i in range(detected_degree + 1)}
-        elif "a" in param_dict or "b" in param_dict:
-            # Linear shorthand y = a*x + b -> c0 = b, c1 = a
-            coeffs = {
-                "c0": param_dict.get("b", 0.0),
-                "c1": param_dict.get("a", 1.0),
-            }
-            if detected_degree > 1:
-                for i in range(2, detected_degree + 1):
-                    coeffs[f"c{i}"] = param_dict.get(f"c{i}", 0.0)
-        else:
-            # Default ascending coefficients
-            coeffs = {f"c{i}": param_dict.get(f"c{i}", 1.0 if i == detected_degree else 0.0) for i in range(detected_degree + 1)}
+        try:
+            derived_poly = _evaluate_polynomial_ast(
+                tree,
+                var_names={input_variable, "x", "X"},
+                param_dict=param_dict,
+                max_degree=HARD_MAX_POLYNOMIAL_DEGREE,
+            )
+        except ValueError as exc:
+            return None, StructuredError(
+                code=ERROR_INVALID_EXPRESSION,
+                message=str(exc),
+            )
+
+        # Detect active non-zero degree from derived polynomial
+        non_zero_degrees = [p for p, c in derived_poly.items() if abs(c) > 1e-12]
+        effective_degree = max(non_zero_degrees, default=0)
+
+        # If user supplied parameters, verify they agree with the formula coefficients
+        if param_dict:
+            for key, val in param_dict.items():
+                if key.startswith("c") and key[1:].isdigit():
+                    idx = int(key[1:])
+                    expected = derived_poly.get(idx, 0.0)
+                    if abs(float(val) - expected) > 1e-6:
+                        return None, StructuredError(
+                            code=ERROR_INVALID_PARAMETERS,
+                            message=f"Supplied parameter '{key}' ({val}) does not match formula coefficient ({expected}).",
+                            details={"parameter": key, "supplied": val, "expected": expected},
+                        )
+                elif key == "a":
+                    expected = derived_poly.get(1, 0.0)
+                    if abs(float(val) - expected) > 1e-6:
+                        return None, StructuredError(
+                            code=ERROR_INVALID_PARAMETERS,
+                            message=f"Supplied parameter 'a' ({val}) does not match linear formula slope ({expected}).",
+                            details={"parameter": "a", "supplied": val, "expected": expected},
+                        )
+                elif key == "b":
+                    expected = derived_poly.get(0, 0.0)
+                    if abs(float(val) - expected) > 1e-6:
+                        return None, StructuredError(
+                            code=ERROR_INVALID_PARAMETERS,
+                            message=f"Supplied parameter 'b' ({val}) does not match formula constant term ({expected}).",
+                            details={"parameter": "b", "supplied": val, "expected": expected},
+                        )
+
+        final_degree = max(effective_degree, validator.highest_degree if validator.highest_degree > 0 and effective_degree == 0 else effective_degree)
+        coeffs = {f"c{i}": round(derived_poly.get(i, 0.0), 10) for i in range(final_degree + 1)}
 
         canonical_parameters = {
             "family": POLYNOMIAL_FAMILY_ID,
-            "degree": detected_degree,
+            "degree": final_degree,
             "coefficient_order": "ascending",
             "coefficients": coeffs,
             "input_variable": input_variable,
             "output_variable": output_var,
         }
+        detected_degree = final_degree
     else:
         canonical_parameters = dict(param_dict)
+
 
     # 8. Compute complexity
     computed_complexity = complexity if (complexity and isinstance(complexity, int) and complexity >= 1) else (detected_degree + 1)

@@ -130,6 +130,8 @@ def serialize_hypothesis(
         "run_id": hyp.run_id,
         "model_family": hyp.model_family,
         "current_revision": hyp.current_revision,
+        "version": getattr(hyp, "version", 1) or 1,
+        "version_token": getattr(hyp, "version_token", None) or f"vt-{hyp.hypothesis_id}-1",
         "is_pinned": hyp.is_pinned,
         "is_excluded": hyp.is_excluded,
         "created_at": hyp.created_at.isoformat() if hyp.created_at else None,
@@ -137,6 +139,7 @@ def serialize_hypothesis(
         "latest_revision": serialize_revision(latest_rev) if latest_rev else None,
         "latest_evaluation": latest_eval,
     }
+
     if include_revisions:
         result["revisions"] = [serialize_revision(r) for r in revisions]
     return result

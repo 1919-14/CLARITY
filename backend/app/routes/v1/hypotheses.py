@@ -94,6 +94,17 @@ def update_hypothesis(hypothesis_id: str):
         if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
             return error_response("Field 'expected_revision' must be an integer >= 1.", 400)
 
+    expected_version = data.get("expected_version")
+    if expected_version is not None:
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            return error_response("Field 'expected_version' must be an integer >= 1.", 400)
+
+    expected_version_token = data.get("expected_version_token")
+    if expected_version_token is not None:
+        if not isinstance(expected_version_token, str) or not expected_version_token.strip():
+            return error_response("Field 'expected_version_token' must be a non-empty string.", 400)
+        expected_version_token = expected_version_token.strip()
+
     db = _get_db()
     try:
         with db.session_scope() as session:
@@ -103,9 +114,12 @@ def update_hypothesis(hypothesis_id: str):
                 is_pinned=is_pinned if has_pin else None,
                 is_excluded=is_excluded if has_exclude else None,
                 expected_revision=expected_revision,
+                expected_version=expected_version,
+                expected_version_token=expected_version_token,
             )
             repo = ClarityRepository(session)
             serialized = serialize_hypothesis(hyp, repo, include_revisions=True)
+
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
     except HypothesisConflictError as exc:

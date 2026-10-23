@@ -170,6 +170,8 @@ def update_hypothesis_flags_service(
     is_pinned: Optional[bool] = None,
     is_excluded: Optional[bool] = None,
     expected_revision: Optional[int] = None,
+    expected_version: Optional[int] = None,
+    expected_version_token: Optional[str] = None,
 ) -> HypothesisModel:
     """Update pinning and exclusion flags on a hypothesis with optimistic locking and audit trail."""
     repo = ClarityRepository(session)
@@ -177,11 +179,32 @@ def update_hypothesis_flags_service(
     if not hyp:
         raise HypothesisNotFoundError(f"Hypothesis '{hypothesis_id}' not found.")
 
-    if expected_revision is not None and hyp.current_revision != expected_revision:
-        raise HypothesisConflictError(
-            f"Hypothesis '{hypothesis_id}' revision conflict: expected revision {expected_revision}, "
-            f"but current revision is {hyp.current_revision}."
-        )
+    # 1. Version token check
+    if expected_version_token is not None:
+        current_token = getattr(hyp, "version_token", None)
+        if current_token != expected_version_token:
+            raise HypothesisConflictError(
+                f"Hypothesis '{hypothesis_id}' version token conflict: expected token '{expected_version_token}', "
+                f"but current token is '{current_token}'."
+            )
+
+    current_ver = getattr(hyp, "version", 1) or 1
+
+    # 2. Numeric version check
+    if expected_version is not None:
+        if current_ver != expected_version:
+            raise HypothesisConflictError(
+                f"Hypothesis '{hypothesis_id}' version conflict: expected version {expected_version}, "
+                f"but current version is {current_ver}."
+            )
+
+    # 3. Expected revision check (safeguards against concurrent flag updates as well as formula updates)
+    if expected_revision is not None:
+        if hyp.current_revision != expected_revision or current_ver != expected_revision:
+            raise HypothesisConflictError(
+                f"Hypothesis '{hypothesis_id}' revision conflict: expected revision/version {expected_revision}, "
+                f"but current version is {current_ver} (current revision {hyp.current_revision})."
+            )
 
     if is_pinned is not None and hyp.is_pinned != is_pinned:
         event_type = "HYPOTHESIS_PINNED" if is_pinned else "HYPOTHESIS_UNPINNED"
@@ -220,6 +243,8 @@ def pin_hypothesis_service(
     session: Session,
     hypothesis_id: str,
     expected_revision: Optional[int] = None,
+    expected_version: Optional[int] = None,
+    expected_version_token: Optional[str] = None,
 ) -> HypothesisModel:
     """Pin a hypothesis (display preference, does not alter scores)."""
     return update_hypothesis_flags_service(
@@ -227,6 +252,8 @@ def pin_hypothesis_service(
         hypothesis_id=hypothesis_id,
         is_pinned=True,
         expected_revision=expected_revision,
+        expected_version=expected_version,
+        expected_version_token=expected_version_token,
     )
 
 
@@ -234,6 +261,8 @@ def unpin_hypothesis_service(
     session: Session,
     hypothesis_id: str,
     expected_revision: Optional[int] = None,
+    expected_version: Optional[int] = None,
+    expected_version_token: Optional[str] = None,
 ) -> HypothesisModel:
     """Unpin a hypothesis."""
     return update_hypothesis_flags_service(
@@ -241,6 +270,8 @@ def unpin_hypothesis_service(
         hypothesis_id=hypothesis_id,
         is_pinned=False,
         expected_revision=expected_revision,
+        expected_version=expected_version,
+        expected_version_token=expected_version_token,
     )
 
 
@@ -248,6 +279,8 @@ def exclude_hypothesis_service(
     session: Session,
     hypothesis_id: str,
     expected_revision: Optional[int] = None,
+    expected_version: Optional[int] = None,
+    expected_version_token: Optional[str] = None,
 ) -> HypothesisModel:
     """Exclude a hypothesis from active candidate selection without deleting history."""
     return update_hypothesis_flags_service(
@@ -255,6 +288,8 @@ def exclude_hypothesis_service(
         hypothesis_id=hypothesis_id,
         is_excluded=True,
         expected_revision=expected_revision,
+        expected_version=expected_version,
+        expected_version_token=expected_version_token,
     )
 
 
@@ -262,6 +297,8 @@ def restore_hypothesis_service(
     session: Session,
     hypothesis_id: str,
     expected_revision: Optional[int] = None,
+    expected_version: Optional[int] = None,
+    expected_version_token: Optional[str] = None,
 ) -> HypothesisModel:
     """Restore an excluded hypothesis to active candidate selection."""
     return update_hypothesis_flags_service(
@@ -269,7 +306,10 @@ def restore_hypothesis_service(
         hypothesis_id=hypothesis_id,
         is_excluded=False,
         expected_revision=expected_revision,
+        expected_version=expected_version,
+        expected_version_token=expected_version_token,
     )
+
 
 
 def _execute_pipeline_for_revision(
