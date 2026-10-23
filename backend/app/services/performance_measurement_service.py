@@ -11,14 +11,16 @@ Orchestrates reproducible measurement of:
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..adapters.persistence.models import (
     BenchmarkResultModel,
+    CandidateExperimentModel,
     ComputeTaskModel,
     ObservationModel,
     ReportModel,
@@ -222,14 +224,25 @@ class PerformanceMeasurementService:
             sample_count=sample_count,
             status=MetricAvailability.AVAILABLE if trial.held_out_rmse is not None else MetricAvailability.UNAVAILABLE,
         )
+        actual_complexity: Optional[float] = None
+        if trial.top_candidate_formula:
+            clean_formula = trial.top_candidate_formula.replace(" ", "")
+            deg = 0
+            if "x" in clean_formula:
+                deg = 1
+            for p_str in re.findall(r"x(?:\^|\*\*)(\d+)", clean_formula):
+                deg = max(deg, int(p_str))
+            actual_complexity = float(deg)
+
         complexity = MetricMeasurement(
             name="model_complexity",
-            value=float(scenario.max_hypothesis_degree),
+            value=actual_complexity,
             units=UNIT_COUNT,
-            definition="Hypothesis model family complexity (degree of polynomial search space).",
+            definition="Hypothesis candidate mathematical complexity (polynomial degree).",
             direction=DIRECTION_LOWER_IS_BETTER,
-            sample_count=1,
-            status=MetricAvailability.AVAILABLE,
+            sample_count=1 if actual_complexity is not None else 0,
+            status=MetricAvailability.AVAILABLE if actual_complexity is not None else MetricAvailability.UNAVAILABLE,
+            notes=None if actual_complexity is not None else "Model complexity unavailable: no top candidate formula found.",
         )
 
         accuracy = AccuracyMeasurements(
@@ -328,10 +341,60 @@ class PerformanceMeasurementService:
     ) -> StrategyComparisonReport:
         """Perform rigorous comparative performance analysis between active and baseline strategies."""
         comparison_id = generate_id("comp")
-        n = min(len(active_measurements), len(baseline_measurements))
+        if not active_measurements or not baseline_measurements:
+            raise ValueError("Active and baseline measurement sequences must both be non-empty for strategy comparison.")
+        if len(active_measurements) != len(baseline_measurements):
+            raise ValueError(
+                f"Active and baseline measurements must have equal sample counts for paired comparison "
+                f"(got {len(active_measurements)} and {len(baseline_measurements)})."
+            )
 
-        active_aggr = self._compute_strategy_aggregates("active_selection", active_measurements)
-        baseline_aggr = self._compute_strategy_aggregates("random_baseline", baseline_measurements)
+        # Sort measurements by seed if seeds are provided to ensure stable, fair paired alignment
+        active_sorted = sorted(active_measurements, key=lambda m: (m.seed if m.seed is not None else -1))
+        baseline_sorted = sorted(baseline_measurements, key=lambda m: (m.seed if m.seed is not None else -1))
+
+        expected_case = get_benchmark_case(scenario_id) if scenario_id else None
+        expected_scen_id = expected_case.id if expected_case else scenario_id
+
+        # Validate that each pair shares identical experimental conditions
+        for i, (act, base) in enumerate(zip(active_sorted, baseline_sorted)):
+            act_case = get_benchmark_case(act.scenario_id) if act.scenario_id else None
+            act_scen = act_case.id if act_case else act.scenario_id
+
+            base_case = get_benchmark_case(base.scenario_id) if base.scenario_id else None
+            base_scen = base_case.id if base_case else base.scenario_id
+
+            if act_scen != base_scen or (expected_scen_id and act_scen != expected_scen_id):
+                raise ValueError(
+                    f"Incompatible paired benchmark conditions at trial pair {i}: scenario mismatch "
+                    f"(active: '{act.scenario_id}', baseline: '{base.scenario_id}', expected: '{scenario_id}')."
+                )
+
+            if act.scenario_version != base.scenario_version or (scenario_version and act.scenario_version != scenario_version):
+                raise ValueError(
+                    f"Incompatible paired benchmark conditions at trial pair {i}: scenario version mismatch "
+                    f"(active: '{act.scenario_version}', baseline: '{base.scenario_version}', expected: '{scenario_version}')."
+                )
+
+            act_budget = act.query_efficiency.query_budget
+            base_budget = base.query_efficiency.query_budget
+            if act_budget != base_budget or (query_budget is not None and act_budget != query_budget):
+                raise ValueError(
+                    f"Incompatible paired benchmark conditions at trial pair {i}: per-trial budget mismatch "
+                    f"(active: {act_budget}, baseline: {base_budget}, expected: {query_budget})."
+                )
+
+            if act.seed is not None or base.seed is not None:
+                if act.seed != base.seed:
+                    raise ValueError(
+                        f"Incompatible paired benchmark conditions at trial pair {i}: seed mismatch "
+                        f"(active: {act.seed}, baseline: {base.seed}). Paired comparisons must share identical seeds."
+                    )
+
+        n = len(active_sorted)
+
+        active_aggr = self._compute_strategy_aggregates("active_selection", active_sorted)
+        baseline_aggr = self._compute_strategy_aggregates("random_baseline", baseline_sorted)
 
         # Metric comparisons
         metric_comparisons: Dict[str, MetricComparisonDetail] = {}
@@ -497,8 +560,8 @@ class PerformanceMeasurementService:
             advantage_summary=advantage_summary,
             preliminary=preliminary,
             aggregation_policy=aggregation_policy,
-            active_trial_measurements=tuple(active_measurements),
-            baseline_trial_measurements=tuple(baseline_measurements),
+            active_trial_measurements=tuple(active_sorted),
+            baseline_trial_measurements=tuple(baseline_sorted),
             measurement_method_version=MEASUREMENT_METHOD_VERSION,
         )
 
@@ -609,10 +672,31 @@ class PerformanceMeasurementService:
         elif bm and bm.execution_metadata:
             sample_count = bm.execution_metadata.get("paired_trials_count", 0)
 
-        # Candidate complexity from hypotheses
+        # Candidate complexity from relevant hypothesis revision / model representation
         hypotheses = repo.list_hypotheses_for_run(run.run_id, include_excluded=False)
-        top_hyp = hypotheses[0] if hypotheses else None
-        complexity_val = float(top_hyp.current_revision) if top_hyp else 1.0
+        top_hyp = None
+        if bm and bm.best_candidate_id:
+            top_hyp = next((h for h in hypotheses if h.hypothesis_id == bm.best_candidate_id), None)
+        if not top_hyp and hypotheses:
+            top_hyp = hypotheses[0]
+
+        complexity_val: Optional[float] = None
+        if top_hyp and top_hyp.revisions:
+            target_rev = next(
+                (r for r in top_hyp.revisions if r.revision_number == top_hyp.current_revision),
+                top_hyp.revisions[-1],
+            )
+            if target_rev:
+                if target_rev.complexity is not None:
+                    complexity_val = float(target_rev.complexity)
+                elif target_rev.formula:
+                    clean_formula = target_rev.formula.replace(" ", "")
+                    deg = 0
+                    if "x" in clean_formula:
+                        deg = 1
+                    for p_str in re.findall(r"x(?:\^|\*\*)(\d+)", clean_formula):
+                        deg = max(deg, int(p_str))
+                    complexity_val = float(deg)
 
         hit_1 = MetricMeasurement(
             name="hit_at_1",
@@ -672,10 +756,11 @@ class PerformanceMeasurementService:
             name="model_complexity",
             value=complexity_val,
             units=UNIT_COUNT,
-            definition="Hypothesis model complexity (revision/degree).",
+            definition="Hypothesis candidate mathematical complexity (independent of revision numbering).",
             direction=DIRECTION_LOWER_IS_BETTER,
-            sample_count=1,
-            status=MetricAvailability.AVAILABLE,
+            sample_count=1 if complexity_val is not None else 0,
+            status=MetricAvailability.AVAILABLE if complexity_val is not None else MetricAvailability.UNAVAILABLE,
+            notes=None if complexity_val is not None else "Model complexity unavailable: no candidate hypothesis revision found.",
         )
 
         return AccuracyMeasurements(
@@ -703,17 +788,19 @@ class PerformanceMeasurementService:
         scenario: Optional[BenchmarkCaseDefinition],
         tolerance: float,
     ) -> QueryEfficiencyMeasurements:
-        # INVARIANT: Only actual executed oracle queries (from observations) are counted, NEVER proposed experiments
-        observations = repo.list_observations_for_run(run.run_id, limit=10000)
-        executed_queries = len([o for o in observations if o.status == "success"])
-        
-        # Proposed experiments count from CandidateExperimentModel
-        stmt = select(ComputeTaskModel).where(ComputeTaskModel.run_id == run.run_id)
-        # Count candidate experiments
-        from ..adapters.persistence.models import CandidateExperimentModel
-        exp_stmt = select(CandidateExperimentModel).where(CandidateExperimentModel.run_id == run.run_id)
-        experiments = list(repo.session.scalars(exp_stmt).all())
-        proposed_count = len(experiments)
+        # INVARIANT: Only actual executed oracle queries (from observations with status == 'success') are counted, NEVER proposed experiments
+        # Database-side exact query count to prevent truncation on runs with >10,000 observations
+        executed_queries_stmt = select(func.count(ObservationModel.observation_id)).where(
+            ObservationModel.run_id == run.run_id,
+            ObservationModel.status == "success",
+        )
+        executed_queries = int(repo.session.scalar(executed_queries_stmt) or 0)
+
+        # Count candidate experiments directly in database
+        exp_count_stmt = select(func.count(CandidateExperimentModel.experiment_id)).where(
+            CandidateExperimentModel.run_id == run.run_id
+        )
+        proposed_count = int(repo.session.scalar(exp_count_stmt) or 0)
 
         budget = run.max_queries or (scenario.max_query_budget if scenario else 10)
         remaining = max(0, budget - executed_queries)

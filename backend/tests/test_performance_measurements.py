@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 import pytest
 from flask import Flask
+from sqlalchemy import insert
 
 from app import create_app
 from app.adapters.persistence.database import get_db_manager, reset_db_manager
@@ -194,6 +195,92 @@ class TestScientificAccuracyMeasurement:
         assert acc.held_out_mae.status == MetricAvailability.UNAVAILABLE
         assert acc.held_out_mae.value is None
         assert acc.mrr.value is None
+        assert acc.model_complexity.status == MetricAvailability.UNAVAILABLE
+        assert acc.model_complexity.value is None
+
+    def test_model_complexity_reflects_candidate_complexity_independent_of_revision_number(self, db_session):
+        """[P2 Regression] Candidate complexity must reflect mathematical complexity (degree), NOT revision number."""
+        repo = ClarityRepository(db_session)
+        service = PerformanceMeasurementService()
+        now = datetime.now(timezone.utc)
+
+        # 1. High revision number (revision 5), but simple linear model (complexity = 1)
+        run_rev5 = RunModel(
+            run_id="run-rev5-simple",
+            name="Run Rev 5 Simple",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run_rev5)
+        hyp_rev5 = HypothesisModel(
+            hypothesis_id="hyp-rev5",
+            run_id="run-rev5-simple",
+            model_family="1d_polynomial",
+            current_revision=5,
+        )
+        rev5 = HypothesisRevisionModel(
+            revision_id="rev-05",
+            hypothesis_id="hyp-rev5",
+            revision_number=5,
+            formula="y = 2x + 1",
+            parameters={"w1": 2.0, "w0": 1.0},
+            complexity=1,
+        )
+        repo.create_hypothesis_with_initial_revision(hyp_rev5, rev5)
+
+        # 2. Low revision number (revision 2), but complex quartic model (complexity = 4)
+        run_rev2 = RunModel(
+            run_id="run-rev2-complex",
+            name="Run Rev 2 Complex",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run_rev2)
+        hyp_rev2 = HypothesisModel(
+            hypothesis_id="hyp-rev2",
+            run_id="run-rev2-complex",
+            model_family="1d_polynomial",
+            current_revision=2,
+        )
+        rev2 = HypothesisRevisionModel(
+            revision_id="rev-02",
+            hypothesis_id="hyp-rev2",
+            revision_number=2,
+            formula="y = x^4 + 2x^2 + 1",
+            parameters={"w4": 1.0, "w2": 2.0, "w0": 1.0},
+            complexity=4,
+        )
+        repo.create_hypothesis_with_initial_revision(hyp_rev2, rev2)
+
+        # 3. Run with no hypotheses
+        run_empty = RunModel(
+            run_id="run-no-hyp",
+            name="Run No Hyp",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run_empty)
+        db_session.commit()
+
+        # Measure run 1: must report complexity 1.0, NOT 5.0
+        m1 = service.measure_run(db_session, "run-rev5-simple")
+        assert m1.accuracy.model_complexity.status == MetricAvailability.AVAILABLE
+        assert m1.accuracy.model_complexity.value == 1.0
+        assert m1.accuracy.model_complexity.value != 5.0
+
+        # Measure run 2: must report complexity 4.0, NOT 2.0
+        m2 = service.measure_run(db_session, "run-rev2-complex")
+        assert m2.accuracy.model_complexity.status == MetricAvailability.AVAILABLE
+        assert m2.accuracy.model_complexity.value == 4.0
+        assert m2.accuracy.model_complexity.value != 2.0
+
+        # Measure run 3: must be marked UNAVAILABLE and value is None
+        m3 = service.measure_run(db_session, "run-no-hyp")
+        assert m3.accuracy.model_complexity.status == MetricAvailability.UNAVAILABLE
+        assert m3.accuracy.model_complexity.value is None
 
 
 # ==============================================================================
@@ -253,6 +340,50 @@ class TestQueryEfficiencyMeasurement:
         assert qe.proposed_experiments_count == 7
         assert qe.query_budget == 10
         assert qe.remaining_budget == 7
+
+    def test_query_accounting_does_not_truncate_at_10000_observations(self, db_session):
+        """[P1 Regression] Query counting uses exact database count and does NOT truncate runs with >10,000 observations."""
+        repo = ClarityRepository(db_session)
+        service = PerformanceMeasurementService()
+        now = datetime.now(timezone.utc)
+        run_id = "run-large-obs-10005"
+
+        run = RunModel(
+            run_id=run_id,
+            name="Large Observation Run",
+            domain="polynomial",
+            status="completed",
+            max_queries=15000,
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        # Bulk insert 10,005 successful observations
+        total_obs = 10005
+        observations_data = [
+            {
+                "observation_id": f"obs-large-{i}",
+                "run_id": run_id,
+                "input_id": f"inp-large-{i}",
+                "input_values": {"x": float(i)},
+                "output_values": {"y": float(2 * i)},
+                "status": "success",
+                "sequence_number": i + 1,
+                "is_held_out": False,
+            }
+            for i in range(total_obs)
+        ]
+        db_session.execute(insert(ObservationModel), observations_data)
+        db_session.commit()
+
+        measurement = service.measure_run(db_session, run_id)
+        qe = measurement.query_efficiency
+
+        # Invariant: executed queries must be EXACTLY 10,005 (not truncated to 10,000)
+        assert qe.queries_executed == 10005
+        assert qe.query_budget == 15000
+        # Invariant: remaining budget must be 15000 - 10005 = 4995 (not overstated to 5000)
+        assert qe.remaining_budget == 4995
 
     def test_failed_to_reach_target_trial_is_represented_explicitly(self):
         """A trial that fails to reach the target within its budget is explicitly recorded."""
@@ -669,6 +800,228 @@ class TestActiveVsBaselineComparison:
 
         assert report.claims_advantage is False
         assert "Neither strategy converged" in report.advantage_summary
+
+    def test_strategy_comparison_rejects_incompatible_pairing_conditions(self):
+        """[Pairing Integrity] Comparison requires strictly compatible paired experimental conditions."""
+        service = PerformanceMeasurementService()
+        scenario = LINEAR_BENCHMARK
+
+        trial_base = BenchmarkTrialResult(
+            trial_id="t-active",
+            strategy="active_selection",
+            seed=42,
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            queries_used=4,
+            max_budget=10,
+            budget_exhausted=False,
+            target_reached=True,
+            queries_to_target=4,
+            hit_at_1=True,
+            hit_at_3=True,
+            hit_at_5=True,
+            mrr=1.0,
+            held_out_mae=0.01,
+            held_out_rmse=0.02,
+            top_candidate_formula="y = 2x + 1",
+            termination_reason="target_accuracy_reached",
+            runtime_ms=100.0,
+        )
+        trial_baseline = BenchmarkTrialResult(
+            trial_id="t-base",
+            strategy="random_baseline",
+            seed=42,
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            queries_used=8,
+            max_budget=10,
+            budget_exhausted=False,
+            target_reached=True,
+            queries_to_target=8,
+            hit_at_1=True,
+            hit_at_3=True,
+            hit_at_5=True,
+            mrr=1.0,
+            held_out_mae=0.04,
+            held_out_rmse=0.05,
+            top_candidate_formula="y = 2x + 1",
+            termination_reason="target_accuracy_reached",
+            runtime_ms=120.0,
+        )
+
+        m_active = service.measure_benchmark_trial(trial_base, scenario)
+        m_base = service.measure_benchmark_trial(trial_baseline, scenario)
+
+        # 1. Reject unequal list lengths
+        with pytest.raises(ValueError, match="equal sample counts"):
+            service.compare_strategies(
+                active_measurements=[m_active, m_active],
+                baseline_measurements=[m_base],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
+
+        # 2. Reject empty measurements
+        with pytest.raises(ValueError, match="must both be non-empty"):
+            service.compare_strategies(
+                active_measurements=[],
+                baseline_measurements=[],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
+
+        # 3. Reject mismatched seed
+        trial_diff_seed = BenchmarkTrialResult(
+            trial_id="t-base-99",
+            strategy="random_baseline",
+            seed=99,  # Mismatched seed!
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            queries_used=8,
+            max_budget=10,
+            budget_exhausted=False,
+            target_reached=True,
+            queries_to_target=8,
+            hit_at_1=True,
+            hit_at_3=True,
+            hit_at_5=True,
+            mrr=1.0,
+            held_out_mae=0.04,
+            held_out_rmse=0.05,
+            top_candidate_formula="y = 2x + 1",
+            termination_reason="target_accuracy_reached",
+            runtime_ms=120.0,
+        )
+        m_diff_seed = service.measure_benchmark_trial(trial_diff_seed, scenario)
+        with pytest.raises(ValueError, match="seed mismatch"):
+            service.compare_strategies(
+                active_measurements=[m_active],
+                baseline_measurements=[m_diff_seed],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
+
+        # 4. Reject mismatched per-trial budget
+        trial_diff_budget = BenchmarkTrialResult(
+            trial_id="t-base-b5",
+            strategy="random_baseline",
+            seed=42,
+            scenario_id=scenario.id,
+            scenario_version=scenario.version,
+            queries_used=5,
+            max_budget=5,  # Mismatched budget!
+            budget_exhausted=True,
+            target_reached=False,
+            queries_to_target=None,
+            hit_at_1=False,
+            hit_at_3=False,
+            hit_at_5=False,
+            mrr=0.0,
+            held_out_mae=1.5,
+            held_out_rmse=2.0,
+            top_candidate_formula="y = x",
+            termination_reason="budget_exhausted",
+            runtime_ms=90.0,
+        )
+        m_diff_budget = service.measure_benchmark_trial(trial_diff_budget, scenario)
+        with pytest.raises(ValueError, match="per-trial budget mismatch"):
+            service.compare_strategies(
+                active_measurements=[m_active],
+                baseline_measurements=[m_diff_budget],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
+
+        # 5. Reject mismatched scenario
+        trial_diff_scen = BenchmarkTrialResult(
+            trial_id="t-base-quad",
+            strategy="random_baseline",
+            seed=42,
+            scenario_id=QUADRATIC_BENCHMARK.id,  # Mismatched scenario!
+            scenario_version=QUADRATIC_BENCHMARK.version,
+            queries_used=8,
+            max_budget=10,
+            budget_exhausted=False,
+            target_reached=True,
+            queries_to_target=8,
+            hit_at_1=True,
+            hit_at_3=True,
+            hit_at_5=True,
+            mrr=1.0,
+            held_out_mae=0.04,
+            held_out_rmse=0.05,
+            top_candidate_formula="y = 2x^2 + 1",
+            termination_reason="target_accuracy_reached",
+            runtime_ms=120.0,
+        )
+        m_diff_scen = service.measure_benchmark_trial(trial_diff_scen, QUADRATIC_BENCHMARK)
+        with pytest.raises(ValueError, match="scenario mismatch"):
+            service.compare_strategies(
+                active_measurements=[m_active],
+                baseline_measurements=[m_diff_scen],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
+
+        # 6. Reject mismatched scenario version
+        trial_diff_ver = BenchmarkTrialResult(
+            trial_id="t-base-v2",
+            strategy="random_baseline",
+            seed=42,
+            scenario_id=scenario.id,
+            scenario_version="2.0.0",  # Mismatched version!
+            queries_used=8,
+            max_budget=10,
+            budget_exhausted=False,
+            target_reached=True,
+            queries_to_target=8,
+            hit_at_1=True,
+            hit_at_3=True,
+            hit_at_5=True,
+            mrr=1.0,
+            held_out_mae=0.04,
+            held_out_rmse=0.05,
+            top_candidate_formula="y = 2x + 1",
+            termination_reason="target_accuracy_reached",
+            runtime_ms=120.0,
+        )
+        m_diff_ver = service.measure_benchmark_trial(trial_diff_ver, scenario)
+        # Update version to 2.0.0
+        m_diff_ver = RunPerformanceMeasurement(
+            measurement_id=m_diff_ver.measurement_id,
+            run_id=m_diff_ver.run_id,
+            benchmark_id=m_diff_ver.benchmark_id,
+            scenario_id=m_diff_ver.scenario_id,
+            scenario_version="2.0.0",
+            strategy=m_diff_ver.strategy,
+            seed=m_diff_ver.seed,
+            timestamp=m_diff_ver.timestamp,
+            accuracy=m_diff_ver.accuracy,
+            query_efficiency=m_diff_ver.query_efficiency,
+            runtime=m_diff_ver.runtime,
+            cost=m_diff_ver.cost,
+            configuration=m_diff_ver.configuration,
+            measurement_method_version=m_diff_ver.measurement_method_version,
+        )
+        with pytest.raises(ValueError, match="scenario version mismatch"):
+            service.compare_strategies(
+                active_measurements=[m_active],
+                baseline_measurements=[m_diff_ver],
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                query_budget=10,
+                success_threshold=0.05,
+            )
 
 
 # ==============================================================================

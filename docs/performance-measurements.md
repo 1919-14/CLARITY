@@ -30,7 +30,7 @@ Scientific accuracy metrics measure hypothesis discovery and prediction fidelity
 | `mrr` | `ratio` | `higher_is_better` | Mean Reciprocal Rank ($1 / \text{rank}$) of the first matching candidate. | Ground-truth evaluator |
 | `held_out_mae` | `y_units` | `lower_is_better` | Mean Absolute Error $\frac{1}{N} \sum \|y_{\text{pred}} - y_{\text{true}}\|$ on reproducible held-out test points. | Evaluator held-out set |
 | `held_out_rmse` | `y_units` | `lower_is_better` | Root Mean Squared Error $\sqrt{\frac{1}{N} \sum (y_{\text{pred}} - y_{\text{true}})^2}$. | Evaluator held-out set |
-| `model_complexity` | `count` | `lower_is_better` | Hypothesis parameter or degree count. | Hypothesis revision |
+| `model_complexity` | `count` | `lower_is_better` | Hypothesis candidate mathematical complexity (e.g. polynomial degree), read directly from the candidate revision and independent of revision numbering. Marked `unavailable` (`None`) when no hypothesis revision exists. | Hypothesis revision |
 
 *Every result records `sample_count`, `benchmark_version`, `dataset_version`, and `metric_definitions_version` (`1.0.0`).*
 
@@ -42,9 +42,9 @@ Query efficiency quantifies the experimental resource consumption needed to achi
 
 | Field | Units | Description |
 | :--- | :--- | :--- |
-| `queries_executed` | `queries` | Total executed oracle queries from persisted observations. *Proposed candidate experiments are tracked separately and NEVER counted as queries.* |
+| `queries_executed` | `queries` | Total executed oracle queries derived from an exact database-side count of successful observations (without page truncation limits). *Proposed candidate experiments are tracked separately and NEVER counted as queries.* |
 | `query_budget` | `queries` | Configured maximum oracle query limit for the trial. |
-| `remaining_budget` | `queries` | $\max(0, \text{query\_budget} - \text{queries\_executed})$. |
+| `remaining_budget` | `queries` | $\max(0, \text{query\_budget} - \text{queries\_executed})$. Accurately reflects exact database-side count. |
 | `target_reached` | `boolean` | Whether `hit_at_1` is true or held-out MAE $\le \text{success\_threshold}$. |
 | `queries_to_target` | `queries` | Number of executed queries at the point target was reached (`None` if target was not reached). |
 | `budget_exhausted` | `boolean` | True if the run exhausted its query budget before convergence. |
@@ -89,13 +89,16 @@ Compute costs are tracked with explicit state separation:
 
 When comparing active experiment selection against random or uniform baselines:
 
-1. **Equivalent Conditions**: Trials run on the identical benchmark scenario, ground truth, initial observations, and query budget.
+1. **Equivalent Conditions & Strict Pairing Validation**:
+   - Trials must have equal non-empty sample counts.
+   - Strategy comparison strictly validates that every active-baseline trial pair shares the identical scenario ID, scenario version, seed, and per-trial query budget before computing aggregates or evaluating advantage claims.
+   - Mismatched conditions or unequal counts immediately raise validation errors (`ValueError`).
 2. **Absolute Differences**: Calculated as $\text{active\_metric} - \text{baseline\_metric}$.
 3. **Safe Relative Changes**:
    - For `lower_is_better` metrics: $\text{Reduction \%} = \frac{\text{baseline} - \text{active}}{\|\text{baseline}\|} \times 100\%$.
    - For `higher_is_better` metrics: $\text{Gain \%} = \frac{\text{active} - \text{baseline}}{\|\text{baseline}\|} \times 100\%$.
    - **Division by Zero Protection**: If the baseline value is $0.0$ (or either value is `None`), relative change is marked `invalid` with `relative_change_pct = None` and a reason code to prevent undefined percentages.
-4. **Honest Advantage Claims**: An advantage is asserted **only** when active selection achieves a higher success rate, lower queries-to-target, or lower held-out MAE. If neither strategy converges or active does not outperform, it is explicitly reported that no advantage was demonstrated.
+4. **Honest Advantage Claims**: An advantage is asserted **only** when active selection achieves a higher success rate, lower queries-to-target, or lower held-out MAE under identical experimental conditions. If neither strategy converges or active does not outperform, it is explicitly reported that no advantage was demonstrated.
 5. **Aggregation Policy**: Denominators for averages and success rates include all trials (successful and unsuccessful). Unsuccessful trials are never omitted.
 
 ---
