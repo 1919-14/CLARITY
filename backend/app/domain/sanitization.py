@@ -30,7 +30,7 @@ _REDACTION_PATTERNS = [
 ]
 
 SENSITIVE_KEY_PATTERN = re.compile(
-    r"(?i)(password|secret|token|api_key|apikey|auth|authorization|credential|private_key|cookie|pwd)"
+    r"(?i)(password|secret|token|api_key|apikey|auth|authorization|credential|private_key|cookie|pwd|ground_truth|bearer)"
 )
 
 
