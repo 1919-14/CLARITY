@@ -400,31 +400,27 @@ paths:
           application/json:
             schema:
               type: object
+              required: [benchmark_case]
               properties:
                 benchmark_case:
                   type: string
+                  description: Identifier of an independently registered benchmark case.
                   example: polynomial_linear_benchmark
-                target_label:
-                  type: string
-                  example: target_linear_2x_plus_1
-                target_formula:
-                  type: string
-                  example: y = 1.0 + 2.0*x
-                target_parameters:
-                  type: object
-                domain:
-                  type: string
-                  default: polynomial
-                benchmark_name:
-                  type: string
                 baseline_type:
                   type: string
                   default: random_sampling
+                  example: random_sampling
                 expected_baseline_queries:
                   type: integer
+                  description: Optional explicit query count expected under the baseline method.
+                  example: 30
+                metadata:
+                  type: object
+                  description: Optional non-sensitive execution audit metadata.
                 tolerance:
                   type: number
                   default: 0.05
+                  description: Numerical tolerance for candidate parameter matching.
       responses:
         '201':
           description: Benchmark evaluation completed and persisted

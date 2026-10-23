@@ -276,18 +276,19 @@ class TestBenchmarkCasesSuite:
 # 3. Benchmark Service Integration Tests
 # ==============================================================================
 
+@pytest.fixture
+def db_session():
+    reset_db_manager()
+    db = get_db_manager("sqlite:///:memory:")
+    db.create_all_tables()
+    with db.session_scope() as session:
+        yield session
+    db.drop_all_tables()
+    reset_db_manager()
+
+
 class TestBenchmarkService:
     """Tests for benchmark_service execution and persistence."""
-
-    @pytest.fixture
-    def db_session(self):
-        reset_db_manager()
-        db = get_db_manager("sqlite:///:memory:")
-        db.create_all_tables()
-        with db.session_scope() as session:
-            yield session
-        db.drop_all_tables()
-        reset_db_manager()
 
     def _setup_mock_run(self, session, run_id="run-test-01"):
         repo = ClarityRepository(session)
@@ -438,6 +439,59 @@ class TestBenchmarkService:
                 benchmark_case="polynomial_linear_benchmark",
             )
 
+    def test_zero_queries_yields_unavailable_efficiency_gain(self, db_session):
+        """Requirement 1: Zero queries must report efficiency_gain as None, never 1.0x."""
+        run = self._setup_mock_run(db_session, "run-svc-zero-queries")
+        repo = ClarityRepository(db_session)
+        usage = repo.get_latest_usage_for_run(run.run_id)
+        usage.queries_executed = 0
+        db_session.flush()
+
+        result = run_benchmark_evaluation(
+            session=db_session,
+            run_id=run.run_id,
+            ground_truth=LINEAR_BENCHMARK.ground_truth,
+            expected_baseline_queries=30,
+        )
+        assert result.queries_to_target == 0
+        assert result.efficiency_gain is None
+
+    def test_invented_baseline_rejected_yields_unavailable_gain(self, db_session):
+        """Requirement 2: When no explicit or registered baseline queries exist, efficiency_gain must be None."""
+        run = self._setup_mock_run(db_session, "run-svc-no-baseline")
+        custom_rule = PolynomialGroundTruthRule(
+            domain="custom_domain",
+            target_formula="y = 42.0",
+            target_parameters={"degree": 0},
+            evaluator_label="unregistered_custom_target",
+        )
+        result = run_benchmark_evaluation(
+            session=db_session,
+            run_id=run.run_id,
+            ground_truth=custom_rule,
+            expected_baseline_queries=None,
+        )
+        assert result.efficiency_gain is None
+
+    def test_missing_held_out_metrics_strictly_preserves_none(self, db_session):
+        """Requirement 3: Never fall back to training error; missing held-out error remains None."""
+        run = self._setup_mock_run(db_session, "run-svc-no-heldout")
+        repo = ClarityRepository(db_session)
+        # Overwrite evaluations to have training metrics only (held_out_metrics = None)
+        hyp = repo.list_hypotheses_for_run(run.run_id)[0]
+        for ev in hyp.revisions[0].evaluations:
+            ev.held_out_metrics = None
+        db_session.flush()
+
+        result = run_benchmark_evaluation(
+            session=db_session,
+            run_id=run.run_id,
+            ground_truth=LINEAR_BENCHMARK.ground_truth,
+            expected_baseline_queries=30,
+        )
+        assert result.held_out_mae is None
+        assert result.held_out_rmse is None
+
 
 # ==============================================================================
 # 4. REST API Endpoint Tests
@@ -540,14 +594,14 @@ class TestBenchmarkAPI:
         assert get_data["count"] == 1
         assert get_data["benchmarks"][0]["benchmark_id"] == b["benchmark_id"]
 
-    def test_post_benchmark_missing_target_or_case(self, client, app):
-        run_id = "run-api-missing-target"
+    def test_post_benchmark_missing_benchmark_case(self, client, app):
+        run_id = "run-api-missing-case"
         self._create_run_and_data(app, run_id)
 
         res = client.post(f"/api/v1/runs/{run_id}/benchmarks", json={})
         assert res.status_code == 400
         data = res.get_json()
-        assert "Either 'benchmark_case' or 'target_label' must be provided" in data["message"]
+        assert "Field 'benchmark_case' is required" in data["message"]
 
     def test_post_benchmark_unknown_case(self, client, app):
         run_id = "run-api-unknown-case"
@@ -558,6 +612,36 @@ class TestBenchmarkAPI:
             json={"benchmark_case": "unknown_case_xyz"},
         )
         assert res.status_code == 400
+
+    def test_post_benchmark_rejects_injected_target_formula_or_parameters(self, client, app):
+        """Requirement 4: Disallow client-injected target_formula and target_parameters."""
+        run_id = "run-api-inject-attempt"
+        self._create_run_and_data(app, run_id)
+
+        res = client.post(
+            f"/api/v1/runs/{run_id}/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "target_formula": "y = 999.0",
+                "target_parameters": {"degree": 0},
+            },
+        )
+        assert res.status_code == 400
+        data = res.get_json()
+        assert "Client-supplied ground truth" in data["message"]
+
+    def test_post_benchmark_rejects_injected_target_label(self, client, app):
+        """Requirement 4: Disallow client-injected target_label."""
+        run_id = "run-api-inject-label"
+        self._create_run_and_data(app, run_id)
+
+        res = client.post(
+            f"/api/v1/runs/{run_id}/benchmarks",
+            json={"target_label": "fabricated_target"},
+        )
+        assert res.status_code == 400
+        data = res.get_json()
+        assert "Client-supplied ground truth" in data["message"]
 
 
 # ==============================================================================
@@ -615,3 +699,93 @@ class TestTrustBoundaryIsolation:
             mod = importlib.import_module(mod_name)
             assert not hasattr(mod, "GroundTruthRule"), f"Module {mod_name} imports GroundTruthRule!"
             assert not hasattr(mod, "BenchmarkEvaluator"), f"Module {mod_name} imports BenchmarkEvaluator!"
+
+    def test_adversarial_metadata_rejected_with_secret_seed(self, db_session):
+        """Requirement 5: Metadata containing secret seed must be rejected before persistence."""
+        repo = ClarityRepository(db_session)
+        now = datetime.now(timezone.utc)
+        run = RunModel(
+            run_id="run-adv-seed",
+            name="Adversarial Seed Run",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        # LINEAR_BENCHMARK secret_seed is 1337
+        with pytest.raises(ValueError, match="secret seed|forbidden pattern"):
+            run_benchmark_evaluation(
+                session=db_session,
+                run_id="run-adv-seed",
+                ground_truth=LINEAR_BENCHMARK.ground_truth,
+                custom_metadata={"audit": {"seed": 1337}},
+            )
+
+    def test_adversarial_metadata_rejected_with_secret_formula(self, db_session):
+        """Requirement 5: Metadata containing reference target formula must be rejected."""
+        repo = ClarityRepository(db_session)
+        now = datetime.now(timezone.utc)
+        run = RunModel(
+            run_id="run-adv-formula",
+            name="Adversarial Formula Run",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        with pytest.raises(ValueError, match="secret target formula"):
+            run_benchmark_evaluation(
+                session=db_session,
+                run_id="run-adv-formula",
+                ground_truth=LINEAR_BENCHMARK.ground_truth,
+                custom_metadata={"notes": "Leaked formula: y = 1.0 + 2.0*x"},
+            )
+
+    def test_adversarial_metadata_rejected_with_nested_forbidden_keys(self, db_session):
+        """Requirement 5: Nested forbidden keys must be rejected before persistence."""
+        repo = ClarityRepository(db_session)
+        now = datetime.now(timezone.utc)
+        run = RunModel(
+            run_id="run-adv-keys",
+            name="Adversarial Keys Run",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        with pytest.raises(ValueError, match="forbidden pattern"):
+            run_benchmark_evaluation(
+                session=db_session,
+                run_id="run-adv-keys",
+                ground_truth=LINEAR_BENCHMARK.ground_truth,
+                custom_metadata={"deep": {"nested": {"oracle_internal_code": "SECRET"}}},
+            )
+
+    def test_api_rejects_unsafe_metadata(self, client, app):
+        """Requirement 5: API returns 400 and does not persist unsafe metadata."""
+        db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+        db = get_db_manager(db_uri)
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            now = datetime.now(timezone.utc)
+            run = RunModel(
+                run_id="run-api-unsafe-meta",
+                name="Unsafe Meta Run",
+                domain="polynomial",
+                status="completed",
+                created_at=now,
+            )
+            repo.create_run(run)
+
+        res = client.post(
+            "/api/v1/runs/run-api-unsafe-meta/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "metadata": {"secret_token": "leak_123"},
+            },
+        )
+        assert res.status_code == 400
+        assert "Unsafe metadata" in res.get_json()["message"]

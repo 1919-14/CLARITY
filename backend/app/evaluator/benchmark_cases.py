@@ -9,7 +9,6 @@ general API serializers.
 """
 
 from dataclasses import dataclass, field
-import math
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..domain.contracts import GroundTruthRule, HypothesisRepresentation
@@ -108,16 +107,17 @@ class PolynomialGroundTruthRule(GroundTruthRule):
 
 @dataclass(frozen=True)
 class BenchmarkCaseDefinition:
-    """Preconfigured benchmark case with reference ground truth and baseline expectations."""
+    """Preconfigured benchmark case with reference ground truth and baseline expectations.
+
+    ``expected_baseline_queries`` must be explicitly set to a dict mapping baseline
+    type names to independently measured query counts. When absent (None), the
+    benchmark service will report efficiency_gain as None rather than inventing a
+    comparison from an undocumented default.
+    """
     benchmark_name: str
     description: str
     ground_truth: GroundTruthRule
-    expected_baseline_queries: Dict[str, int] = field(
-        default_factory=lambda: {
-            "random_sampling": 50,
-            "passive_uniform": 40,
-        }
-    )
+    expected_baseline_queries: Optional[Dict[str, int]] = None
 
 
 # Standard benchmark suite for CLARITY discovery

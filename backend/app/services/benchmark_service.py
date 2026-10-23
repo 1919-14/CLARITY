@@ -7,7 +7,7 @@ Operates on the evaluator side of the trust boundary:
 - Guarantees zero leakage of evaluator secrets into discovery-facing objects.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from ..adapters.persistence.models import BenchmarkResultModel, HypothesisModel
@@ -20,6 +20,63 @@ from ..domain.contracts import (
 )
 from ..evaluator.benchmark_evaluator import BenchmarkEvaluator
 from ..evaluator.benchmark_cases import get_benchmark_case
+
+FORBIDDEN_METADATA_KEY_SUBSTRINGS = (
+    "ground_truth",
+    "secret",
+    "oracle_internal",
+    "evaluator_only",
+    "true_rule",
+    "target_formula",
+    "target_parameters",
+    "target_coefficients",
+)
+
+
+def _inspect_metadata_node(
+    node: Any,
+    ground_truth: GroundTruthRule,
+    path: str = "",
+) -> None:
+    """Recursively validate metadata for forbidden secret keys or leaked values."""
+    if isinstance(node, Mapping):
+        for k, v in node.items():
+            if not isinstance(k, str):
+                raise ValueError(
+                    f"Metadata keys must be strings, got {type(k).__name__} at '{path}'."
+                )
+            k_lower = k.lower()
+            for pattern in FORBIDDEN_METADATA_KEY_SUBSTRINGS:
+                if pattern in k_lower:
+                    raise ValueError(
+                        f"Unsafe metadata key '{k}' detected at '{path}': "
+                        f"contains forbidden pattern '{pattern}'."
+                    )
+            _inspect_metadata_node(v, ground_truth, f"{path}.{k}" if path else k)
+    elif isinstance(node, (list, tuple)):
+        for idx, item in enumerate(node):
+            _inspect_metadata_node(item, ground_truth, f"{path}[{idx}]")
+    elif isinstance(node, str):
+        # Check if string contains secret target formula
+        if ground_truth.target_formula:
+            clean_tgt = ground_truth.target_formula.replace(" ", "").lower()
+            clean_val = node.replace(" ", "").lower()
+            if len(clean_tgt) > 3 and clean_tgt in clean_val:
+                raise ValueError(
+                    f"Unsafe metadata value at '{path}': contains secret target formula."
+                )
+        # Check if string contains secret_seed
+        if ground_truth.secret_seed is not None and len(str(ground_truth.secret_seed)) >= 2:
+            seed_str = str(ground_truth.secret_seed)
+            if seed_str in node:
+                raise ValueError(
+                    f"Unsafe metadata value at '{path}': contains evaluator secret seed."
+                )
+    elif isinstance(node, (int, float)) and not isinstance(node, bool):
+        if ground_truth.secret_seed is not None and int(node) == int(ground_truth.secret_seed):
+            raise ValueError(
+                f"Unsafe metadata value at '{path}': matches evaluator secret seed."
+            )
 
 
 def run_benchmark_evaluation(
@@ -60,26 +117,30 @@ def run_benchmark_evaluation(
     queries_executed = _get_queries_executed(repo, run_id)
 
     # 3. Compute baseline efficiency gain
+    # Requirement 1: Zero queries must NOT report a 1.0x gain (ratio undefined -> unavailable/None).
+    # Requirement 2: Do NOT invent a default 50 queries. Require explicit or registered baseline.
     efficiency_gain = None
-    if baseline_type and queries_executed is not None:
+    if baseline_type and queries_executed is not None and queries_executed > 0:
         baseline_queries = expected_baseline_queries
         if baseline_queries is None:
-            # Check if this benchmark name/target has known baseline queries in standard suite
+            # Check if this benchmark case has a registered baseline query expectation
             case_def = get_benchmark_case(benchmark_name or ground_truth.evaluator_label)
-            if case_def and baseline_type in case_def.expected_baseline_queries:
+            if (
+                case_def
+                and case_def.expected_baseline_queries
+                and baseline_type in case_def.expected_baseline_queries
+            ):
                 baseline_queries = case_def.expected_baseline_queries[baseline_type]
-            else:
-                baseline_queries = 50  # Sensible standard default for random exploration
-        if queries_executed > 0:
+
+        if baseline_queries is not None and baseline_queries > 0:
             gain_val = float(baseline_queries) / float(queries_executed)
             efficiency_gain = f"{gain_val:.1f}x"
-        elif queries_executed == 0:
-            efficiency_gain = "1.0x"
 
     # 4. Instantiate evaluator and evaluate candidates
     evaluator = BenchmarkEvaluator(ground_truth=ground_truth, tolerance=tolerance)
     
     # 5. Extract held-out MAE and RMSE from best candidate or matching candidate
+    # Requirement 3: Strictly preserve None for missing held-out metrics; DO NOT fall back to training error.
     held_out_mae = None
     held_out_rmse = None
     
@@ -95,11 +156,6 @@ def run_benchmark_evaluation(
         m = candidate_metrics[target_id_for_metrics]
         held_out_mae = m.get("held_out_mae")
         held_out_rmse = m.get("held_out_rmse")
-        # Fall back to training MAE/RMSE if held-out is unavailable
-        if held_out_mae is None:
-            held_out_mae = m.get("mae")
-        if held_out_rmse is None:
-            held_out_rmse = m.get("rmse")
 
     report: BenchmarkReport = evaluator.evaluate_candidates(
         run_id=run_id,
@@ -114,14 +170,19 @@ def run_benchmark_evaluation(
     )
 
     # 6. Audit & build execution metadata (must not contain ground truth secrets)
-    execution_metadata = {
+    # Requirement 5: Validate and reject unsafe/secret metadata before persistence.
+    safe_custom_metadata: Dict[str, Any] = {}
+    if custom_metadata:
+        _inspect_metadata_node(custom_metadata, ground_truth)
+        safe_custom_metadata = dict(custom_metadata)
+
+    execution_metadata: Dict[str, Any] = {
         "candidate_count": len(ranked_candidates),
         "matching_candidate_found": matching_candidate_id is not None,
         "tolerance": tolerance,
         "baseline_type": baseline_type,
     }
-    if custom_metadata:
-        execution_metadata.update(custom_metadata)
+    execution_metadata.update(safe_custom_metadata)
 
     # Verify boundary integrity
     verify_no_ground_truth_leakage(execution_metadata)
@@ -197,34 +258,40 @@ def _build_and_rank_candidates(
             revision=hyp.current_revision,
         )
 
-        # Collect evaluation metrics
-        mae_val = None
-        rmse_val = None
+        # Collect evaluation metrics separately: held-out error is NEVER conflated with training error
+        held_out_mae = None
+        held_out_rmse = None
+        training_mae = None
+        training_rmse = None
+
         if latest_rev and latest_rev.evaluations:
-            # Sort evaluations to find most recent completed one
             for ev in reversed(latest_rev.evaluations):
                 if ev.status == "completed":
                     if ev.held_out_metrics:
-                        mae_val = ev.held_out_metrics.get("mae")
-                        rmse_val = ev.held_out_metrics.get("rmse")
-                    if mae_val is None and ev.metrics:
-                        mae_val = ev.metrics.get("mae")
-                        rmse_val = ev.metrics.get("rmse")
+                        held_out_mae = ev.held_out_metrics.get("mae")
+                        held_out_rmse = ev.held_out_metrics.get("rmse")
+                    if ev.metrics:
+                        training_mae = ev.metrics.get("mae")
+                        training_rmse = ev.metrics.get("rmse")
                     break
 
         candidate_metrics[hyp.hypothesis_id] = {
-            "mae": mae_val,
-            "rmse": rmse_val,
-            "held_out_mae": mae_val,
-            "held_out_rmse": rmse_val,
+            "training_mae": training_mae,
+            "training_rmse": training_rmse,
+            "held_out_mae": held_out_mae,
+            "held_out_rmse": held_out_rmse,
         }
+
+        # Ranking uses held-out error if available, else training error for relative sorting
+        rank_metric = held_out_mae if held_out_mae is not None else training_mae
+        rank_secondary = held_out_rmse if held_out_rmse is not None else (training_rmse or 0.0)
 
         # Determine score
         if hyp.hypothesis_id in report_rank_order:
             rank_idx = report_rank_order[hyp.hypothesis_id]
             candidate_scores.append((rank_idx, 0.0, complexity, cand_repr))
-        elif mae_val is not None:
-            candidate_scores.append((mae_val, rmse_val or 0.0, complexity, cand_repr))
+        elif rank_metric is not None:
+            candidate_scores.append((rank_metric, rank_secondary, complexity, cand_repr))
         else:
             unscored_candidates.append(cand_repr)
 
@@ -238,44 +305,31 @@ def _build_and_rank_candidates(
 def trigger_benchmark_service(
     session: Session,
     run_id: str,
-    benchmark_case: Optional[str] = None,
-    target_label: Optional[str] = None,
-    target_formula: Optional[str] = None,
-    target_parameters: Optional[Dict[str, Any]] = None,
-    domain: Optional[str] = "polynomial",
-    benchmark_name: Optional[str] = None,
+    benchmark_case: str,
     baseline_type: Optional[str] = "random_sampling",
     expected_baseline_queries: Optional[int] = None,
     custom_metadata: Optional[Dict[str, Any]] = None,
     tolerance: float = 0.05,
 ) -> BenchmarkResultModel:
-    """Route-facing entry point to execute a benchmark without routes importing GroundTruthRule."""
-    if benchmark_case:
-        case_def = get_benchmark_case(benchmark_case)
-        if not case_def:
-            raise ValueError(f"Unknown benchmark case '{benchmark_case}'.")
-        ground_truth = case_def.ground_truth
-        b_name = benchmark_name or case_def.benchmark_name
-    elif target_label:
-        from ..evaluator.benchmark_cases import PolynomialGroundTruthRule
-        ground_truth = PolynomialGroundTruthRule(
-            domain=domain or "polynomial",
-            target_formula=target_formula or "",
-            target_parameters=target_parameters or {},
-            evaluator_label=target_label,
-        )
-        b_name = benchmark_name or f"{domain or 'polynomial'}_benchmark"
-    else:
-        raise ValueError("Either 'benchmark_case' or 'target_label' must be provided.")
+    """Route-facing entry point. Requires an independently registered benchmark case.
+
+    Callers cannot supply or inject custom ground-truth rules, target formulas,
+    or parameters (Requirement 4).
+    """
+    if not benchmark_case or not isinstance(benchmark_case, str) or not benchmark_case.strip():
+        raise ValueError("Field 'benchmark_case' is required and must reference a registered benchmark case.")
+
+    case_def = get_benchmark_case(benchmark_case.strip())
+    if not case_def:
+        raise ValueError(f"Unknown benchmark case '{benchmark_case}'.")
 
     return run_benchmark_evaluation(
         session=session,
         run_id=run_id,
-        ground_truth=ground_truth,
-        benchmark_name=b_name,
+        ground_truth=case_def.ground_truth,
+        benchmark_name=case_def.benchmark_name,
         baseline_type=baseline_type,
         expected_baseline_queries=expected_baseline_queries,
         custom_metadata=custom_metadata,
         tolerance=tolerance,
     )
-

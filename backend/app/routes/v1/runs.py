@@ -49,20 +49,35 @@ from ...services.hypothesis_service import (
     HypothesisNotFoundError,
     propose_hypothesis_service,
 )
+from ...services.audit_service import (
+    list_audit_events_service,
+    record_audit_event_service,
+)
+from ...domain.usage_contracts import (
+    AuditEventConflictError,
+    TaskRunConflictError,
+)
 from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
     RunConflictError,
     create_run_service,
 )
 from ...services.benchmark_service import trigger_benchmark_service
+from ...services.usage_service import (
+    derive_run_usage_summary,
+    reconcile_run_usage,
+    record_task_usage_service,
+)
 from .shared import (
     error_response,
     log_safe_error,
+    serialize_audit_event,
     serialize_benchmark,
     serialize_hypothesis,
     serialize_observation,
     serialize_report,
     serialize_run,
+    serialize_task,
     serialize_usage,
 )
 
@@ -574,22 +589,35 @@ def get_run_benchmarks(run_id: str):
 def trigger_run_benchmark(run_id: str):
     """POST /api/v1/runs/<run_id>/benchmarks — Execute a ground-truth benchmark evaluation."""
     payload = request.get_json(silent=True) or {}
+
+    # Reject caller-injected ground-truth keys (Requirement 4)
+    forbidden_target_keys = {
+        "target_label",
+        "target_formula",
+        "target_parameters",
+        "target_coefficients",
+        "secret_seed",
+        "coefficients",
+    }
+    injected_keys = sorted(list(forbidden_target_keys.intersection(payload.keys())))
+    if injected_keys:
+        return error_response(
+            f"Client-supplied ground truth ({', '.join(injected_keys)}) is prohibited. "
+            "Evaluations must reference an independently held registered 'benchmark_case'.",
+            400,
+        )
+
     benchmark_case = payload.get("benchmark_case")
-    target_label = payload.get("target_label")
-    target_formula = payload.get("target_formula")
-    target_parameters = payload.get("target_parameters")
-    domain = payload.get("domain", "polynomial")
-    benchmark_name = payload.get("benchmark_name")
+    if not benchmark_case or not isinstance(benchmark_case, str) or not benchmark_case.strip():
+        return error_response(
+            "Field 'benchmark_case' is required and must reference a registered benchmark case.",
+            400,
+        )
+
     baseline_type = payload.get("baseline_type", "random_sampling")
     expected_baseline_queries = payload.get("expected_baseline_queries")
     custom_metadata = payload.get("metadata")
     tolerance = float(payload.get("tolerance", 0.05))
-
-    if not benchmark_case and not target_label:
-        return error_response(
-            "Either 'benchmark_case' or 'target_label' must be provided in request body.",
-            400,
-        )
 
     db = _get_db()
     try:
@@ -602,12 +630,7 @@ def trigger_run_benchmark(run_id: str):
             result = trigger_benchmark_service(
                 session=session,
                 run_id=run_id,
-                benchmark_case=benchmark_case,
-                target_label=target_label,
-                target_formula=target_formula,
-                target_parameters=target_parameters,
-                domain=domain,
-                benchmark_name=benchmark_name,
+                benchmark_case=benchmark_case.strip(),
                 baseline_type=baseline_type,
                 expected_baseline_queries=expected_baseline_queries,
                 custom_metadata=custom_metadata,
@@ -784,3 +807,194 @@ def create_run_hypothesis(run_id: str):
         return error_response("An internal error occurred while creating the hypothesis.", 500)
 
     return jsonify({"hypothesis": serialized}), 201
+
+
+@runs_v1_bp.route("/runs/<run_id>/usage", methods=["GET"])
+def get_run_usage(run_id: str):
+    """GET /api/v1/runs/<run_id>/usage — Comprehensive compute-usage summary.
+
+    Reconciles task-level compute with run-level usage, breaks down local vs remote
+    execution, and separates estimated, accruing, and settled costs (Issue #15).
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            summary = derive_run_usage_summary(session, run_id)
+            payload = summary.to_dict()
+    except ValueError as exc:
+        return error_response(str(exc), 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_usage db error", exc)
+        return error_response("An internal error occurred while retrieving run usage.", 500)
+
+    return jsonify({"run_id": run_id, "usage": payload}), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/tasks", methods=["GET"])
+def list_run_tasks(run_id: str):
+    """GET /api/v1/runs/<run_id>/tasks — Task-level compute execution records.
+
+    Query params:
+      status (str, optional)
+      execution_mode (str, optional: local, nodus_remote, mock)
+      limit (int, 1–200, default 50)
+      offset (int, >= 0, default 0)
+    """
+    try:
+        limit, offset = _parse_pagination(request.args)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+
+    status_filter = request.args.get("status")
+    mode_filter = request.args.get("execution_mode")
+    if mode_filter and mode_filter not in _VALID_EXECUTION_MODES:
+        return error_response(
+            f"'execution_mode' filter must be one of: {', '.join(sorted(_VALID_EXECUTION_MODES))}.",
+            400,
+        )
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            tasks = repo.list_compute_tasks_for_run(
+                run_id=run_id,
+                status=status_filter,
+                execution_mode=mode_filter,
+                limit=limit,
+                offset=offset,
+            )
+            total_count = repo.count_compute_tasks_for_run(
+                run_id=run_id,
+                status=status_filter,
+                execution_mode=mode_filter,
+            )
+            serialized = [serialize_task(t) for t in tasks]
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("list_run_tasks db error", exc)
+        return error_response("An internal error occurred while listing tasks.", 500)
+
+    return jsonify({
+        "run_id": run_id,
+        "tasks": serialized,
+        "count": len(serialized),
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/audit-events", methods=["GET"])
+def list_run_audit_events(run_id: str):
+    """GET /api/v1/runs/<run_id>/audit-events — Chronological append-only audit trail.
+
+    Query params:
+      event_type (str, optional filter)
+      limit (int, 1–200, default 50)
+      offset (int, >= 0, default 0)
+    """
+    try:
+        limit, offset = _parse_pagination(request.args)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+
+    event_type = request.args.get("event_type")
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            events, total_count = list_audit_events_service(
+                session=session,
+                run_id=run_id,
+                event_type=event_type,
+                limit=limit,
+                offset=offset,
+            )
+            serialized = [serialize_audit_event(e) for e in events]
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("list_run_audit_events db error", exc)
+        return error_response("An internal error occurred while retrieving audit events.", 500)
+
+    return jsonify({
+        "run_id": run_id,
+        "audit_events": serialized,
+        "count": len(serialized),
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "event_type": event_type,
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/audit-events", methods=["POST"])
+def record_run_audit_event(run_id: str):
+    """POST /api/v1/runs/<run_id>/audit-events — Append a new audit event for a run.
+
+    Body:
+      event_type (str, required)
+      actor (str, optional, default "researcher")
+      metadata (dict, optional)
+    """
+    if not request.is_json:
+        return error_response("Payload must be JSON with Content-Type application/json.", 400)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return error_response("Request body must be a JSON object.", 400)
+
+    event_type = data.get("event_type")
+    if not event_type or not isinstance(event_type, str) or not event_type.strip():
+        return error_response("Field 'event_type' is required and must be a non-empty string.", 400)
+
+    actor = data.get("actor", "researcher")
+    if not isinstance(actor, str) or not actor.strip():
+        actor = "researcher"
+
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return error_response("Field 'metadata' must be a JSON object when provided.", 400)
+
+    event_id = data.get("event_id")
+    if event_id is not None:
+        if not isinstance(event_id, str) or not event_id.strip():
+            return error_response("Field 'event_id' must be a non-empty string when provided.", 400)
+        event_id = event_id.strip()
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            event = record_audit_event_service(
+                session=session,
+                run_id=run_id,
+                event_type=event_type.strip(),
+                actor=actor.strip(),
+                metadata=metadata,
+                event_id=event_id,
+            )
+            serialized = serialize_audit_event(event)
+    except AuditEventConflictError as exc:
+        return error_response(str(exc), 409)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("record_run_audit_event db error", exc)
+        return error_response("An internal error occurred while recording audit event.", 500)
+
+    return jsonify({"audit_event": serialized}), 201
