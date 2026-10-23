@@ -657,6 +657,9 @@ class BenchmarkReport:
     held_out_mae: Optional[float] = None
     held_out_rmse: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
+    benchmark_name: Optional[str] = None
+    baseline_type: Optional[str] = None
+    efficiency_gain: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -672,6 +675,12 @@ class BenchmarkReport:
             "held_out_mae": self.held_out_mae,
             "held_out_rmse": self.held_out_rmse,
         }
+        if self.benchmark_name is not None:
+            data["benchmark_name"] = self.benchmark_name
+        if self.baseline_type is not None:
+            data["baseline_type"] = self.baseline_type
+        if self.efficiency_gain is not None:
+            data["efficiency_gain"] = self.efficiency_gain
         if self.metadata is not None:
             data["metadata"] = self.metadata
         return data

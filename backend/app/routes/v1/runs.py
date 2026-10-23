@@ -62,6 +62,7 @@ from ...services.run_service import (
     RunConflictError,
     create_run_service,
 )
+from ...services.benchmark_service import trigger_benchmark_service
 from ...services.usage_service import (
     derive_run_usage_summary,
     reconcile_run_usage,
@@ -582,6 +583,67 @@ def get_run_benchmarks(run_id: str):
         "benchmarks": serialized,
         "count": len(serialized),
     }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/benchmarks", methods=["POST"])
+def trigger_run_benchmark(run_id: str):
+    """POST /api/v1/runs/<run_id>/benchmarks — Execute a ground-truth benchmark evaluation."""
+    payload = request.get_json(silent=True) or {}
+
+    # Reject caller-injected ground-truth keys (Requirement 4)
+    forbidden_target_keys = {
+        "target_label",
+        "target_formula",
+        "target_parameters",
+        "target_coefficients",
+        "secret_seed",
+        "coefficients",
+    }
+    injected_keys = sorted(list(forbidden_target_keys.intersection(payload.keys())))
+    if injected_keys:
+        return error_response(
+            f"Client-supplied ground truth ({', '.join(injected_keys)}) is prohibited. "
+            "Evaluations must reference an independently held registered 'benchmark_case'.",
+            400,
+        )
+
+    benchmark_case = payload.get("benchmark_case")
+    if not benchmark_case or not isinstance(benchmark_case, str) or not benchmark_case.strip():
+        return error_response(
+            "Field 'benchmark_case' is required and must reference a registered benchmark case.",
+            400,
+        )
+
+    baseline_type = payload.get("baseline_type", "random_sampling")
+    expected_baseline_queries = payload.get("expected_baseline_queries")
+    custom_metadata = payload.get("metadata")
+    tolerance = float(payload.get("tolerance", 0.05))
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            result = trigger_benchmark_service(
+                session=session,
+                run_id=run_id,
+                benchmark_case=benchmark_case.strip(),
+                baseline_type=baseline_type,
+                expected_baseline_queries=expected_baseline_queries,
+                custom_metadata=custom_metadata,
+                tolerance=tolerance,
+            )
+            serialized = serialize_benchmark(result)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("trigger_run_benchmark error", exc)
+        return error_response("An internal error occurred while executing benchmark evaluation.", 500)
+
+    return jsonify({"benchmark": serialized}), 201
 
 
 @runs_v1_bp.route("/runs/<run_id>/observations", methods=["GET"])

@@ -383,6 +383,73 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Trigger benchmark evaluation
+      description: Executes isolated ground-truth benchmark evaluation (Hit@K, MRR, held-out accuracy, query efficiency).
+      operationId: triggerRunBenchmarkV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          description: Unique run identifier
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [benchmark_case]
+              properties:
+                benchmark_case:
+                  type: string
+                  description: Identifier of an independently registered benchmark case.
+                  example: polynomial_linear_benchmark
+                baseline_type:
+                  type: string
+                  default: random_sampling
+                  example: random_sampling
+                expected_baseline_queries:
+                  type: integer
+                  description: Optional explicit query count expected under the baseline method.
+                  example: 30
+                metadata:
+                  type: object
+                  description: Optional non-sensitive execution audit metadata.
+                tolerance:
+                  type: number
+                  default: 0.05
+                  description: Numerical tolerance for candidate parameter matching.
+      responses:
+        '201':
+          description: Benchmark evaluation completed and persisted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [benchmark]
+                properties:
+                  benchmark:
+                    $ref: '#/components/schemas/BenchmarkResult'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal execution error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /runs/{run_id}/observations:
     get:
