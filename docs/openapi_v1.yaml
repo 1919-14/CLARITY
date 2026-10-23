@@ -816,6 +816,300 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /runs/{run_id}/history:
+    get:
+      summary: Chronological researcher action history
+      description: >-
+        Returns the run's append-only audit events in deterministic order
+        (timestamp, then event id) with structured provenance (before/after,
+        reason, hypothesis/revision references). Cursor pagination stays stable
+        while new events are appended; offset pagination is supported for
+        compatibility. See docs/researcher-history.md.
+      operationId: getRunHistoryV1
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: event_type
+          in: query
+          schema:
+            type: string
+        - name: actor
+          in: query
+          schema:
+            type: string
+        - name: hypothesis_id
+          in: query
+          schema:
+            type: string
+        - name: revision_id
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Chronological history page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, events, filters, pagination]
+                properties:
+                  run_id:
+                    type: string
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HistoryEvent'
+                  filters:
+                    type: object
+                  pagination:
+                    type: object
+                    properties:
+                      count:
+                        type: integer
+                      total:
+                        type: integer
+                      limit:
+                        type: integer
+                      offset:
+                        type: integer
+                        nullable: true
+                      next_cursor:
+                        type: string
+                        nullable: true
+                      has_more:
+                        type: boolean
+        '400':
+          description: Invalid pagination, filter, or cursor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /hypotheses/{hypothesis_id}/revisions:
+    get:
+      summary: Hypothesis revision history
+      description: >-
+        Returns every immutable revision in ascending revision order, each with
+        its parent link, change reason and actor. Previous definitions are
+        returned exactly as recorded.
+      operationId: listHypothesisRevisionsV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Revision history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis_id, run_id, current_revision, revisions, count]
+                properties:
+                  hypothesis_id:
+                    type: string
+                  run_id:
+                    type: string
+                  current_revision:
+                    type: integer
+                  is_pinned:
+                    type: boolean
+                  is_excluded:
+                    type: boolean
+                  revisions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HypothesisRevision'
+                  count:
+                    type: integer
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Append a hypothesis revision (edit)
+      description: >-
+        Creates a new immutable revision. The previous revision is preserved.
+        Omitted fields inherit the current revision; a formula edit derives its
+        own canonical coefficients. Send expected_revision or
+        expected_version_token for optimistic concurrency, and Idempotency-Key
+        (header) or idempotency_key (body) to make retries safe.
+      operationId: createHypothesisRevisionV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                formula:
+                  type: string
+                parameters:
+                  type: object
+                complexity:
+                  type: integer
+                model_family:
+                  type: string
+                reason:
+                  type: string
+                expected_revision:
+                  type: integer
+                expected_version_token:
+                  type: string
+                idempotency_key:
+                  type: string
+      responses:
+        '201':
+          description: Revision created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revision, hypothesis_id, current_revision]
+                properties:
+                  revision:
+                    $ref: '#/components/schemas/HypothesisRevision'
+                  hypothesis_id:
+                    type: string
+                  current_revision:
+                    type: integer
+                  idempotent_replay:
+                    type: boolean
+        '200':
+          description: Idempotent replay of an already committed revision
+        '400':
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Hypothesis not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: >-
+            Stale expected revision, reused idempotency key with a different payload
+            (including a different model family), or lost race
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid expression or no-op edit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /hypotheses/{hypothesis_id}/revisions/{revision_id}/evaluations:
+    get:
+      summary: Evaluation history for one revision
+      description: >-
+        Returns evaluations oldest-first, each naming the dataset snapshot it
+        used. Preserves every earlier result after re-evaluation.
+      operationId: listRevisionEvaluationsV1
+      parameters:
+        - name: hypothesis_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: revision_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Revision evaluation history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hypothesis_id, revision_id, evaluations, count, total]
+                properties:
+                  hypothesis_id:
+                    type: string
+                  revision_id:
+                    type: string
+                  revision_number:
+                    type: integer
+                  evaluations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EvaluationResult'
+                  count:
+                    type: integer
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        '404':
+          description: Revision not found or not part of this hypothesis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /observations/{observation_id}:
     get:
       summary: Retrieve a single observation
@@ -1056,7 +1350,7 @@ components:
 
     HypothesisRevision:
       type: object
-      required: [revision_id, revision_number, formula, parameters, complexity, creation_source, created_at]
+      required: [revision_id, revision_number, formula, parameters, complexity, model_family, creation_source, created_at]
       properties:
         revision_id:
           type: string
@@ -1064,6 +1358,15 @@ components:
         revision_number:
           type: integer
           example: 1
+        model_family:
+          type: string
+          nullable: true
+          description: >-
+            Effective, validated model family this revision was created under.
+            This is the family evaluation replays; the parent hypothesis's
+            model_family is a current-state projection. Null only for revisions
+            written before the column existed (the migration backfills them).
+          example: polynomial
         formula:
           type: string
           example: y = 0.5x^2 - 1.0
@@ -1078,6 +1381,23 @@ components:
         creation_source:
           type: string
           example: researcher
+        previous_revision_id:
+          type: string
+          nullable: true
+          description: Reference to the preceding revision of the same hypothesis.
+          example: rev-00
+        change_reason:
+          type: string
+          nullable: true
+          description: Optional researcher-supplied explanation for the edit.
+          example: residual structure suggested curvature
+        actor:
+          type: string
+          nullable: true
+          example: researcher
+        actor_id:
+          type: string
+          nullable: true
         created_at:
           type: string
           format: date-time
@@ -1090,6 +1410,10 @@ components:
         evaluation_id:
           type: string
           example: eva-01
+        revision_id:
+          type: string
+          description: Exact hypothesis revision that was evaluated.
+          example: rev-01
         status:
           type: string
           enum: [pending, running, completed, failed]
@@ -1099,7 +1423,17 @@ components:
           example: 10
         dataset_version:
           type: integer
+          description: Number of training observations at evaluation time (descriptive only).
           example: 10
+        dataset_snapshot_id:
+          type: string
+          nullable: true
+          description: >-
+            Content-addressed fingerprint of the exact observations used: inputs,
+            outputs, status, partition and sequence are all covered, so changing an
+            observation's content while keeping its id changes this value. The
+            canonical manifest behind the fingerprint is stored with the evaluation.
+          example: dset-73628f529cdfa53b665b26175672cd10
         metrics:
           type: object
           example:
@@ -1682,3 +2016,53 @@ components:
           type: string
           format: date-time
           nullable: true
+
+    HistoryEvent:
+      type: object
+      required: [event_id, run_id, event_type, actor, timestamp, metadata]
+      description: >-
+        One append-only audit record. before/after are null when the action has
+        no snapshot on that side; an empty object means a snapshot with no
+        fields. Timestamps are UTC with an explicit +00:00 offset.
+      properties:
+        event_id:
+          type: string
+          example: evt-7a91fc82d41b
+        run_id:
+          type: string
+          example: run-4c1b0e
+        event_type:
+          type: string
+          example: HYPOTHESIS_REVISED
+        actor:
+          type: string
+          enum: [researcher, automated_agent, system, worker, lifecycle_manager, system_recovery]
+        actor_id:
+          type: string
+          nullable: true
+        hypothesis_id:
+          type: string
+          nullable: true
+        revision_id:
+          type: string
+          nullable: true
+        correlation_id:
+          type: string
+          nullable: true
+        before:
+          type: object
+          nullable: true
+        after:
+          type: object
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+        corrects_event_id:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+        timestamp:
+          type: string
+          format: date-time

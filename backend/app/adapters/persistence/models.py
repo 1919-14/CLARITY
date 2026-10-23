@@ -30,8 +30,10 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import event as sqlalchemy_event
 from .database import Base
+from ...domain.history_contracts import AppendOnlyViolationError
 
 
 def utc_now() -> datetime:
@@ -127,7 +129,25 @@ class HypothesisModel(Base):
 
 
 class HypothesisRevisionModel(Base):
-    """Immutable hypothesis revision capturing mathematical/symbolic definitions over time."""
+    """Immutable hypothesis revision capturing mathematical/symbolic definitions over time.
+
+    Revisions are the scientific record: once written they are never updated.
+    ``previous_revision_id`` chains each revision to its predecessor so a
+    hypothesis's definition history can be reconstructed exactly (Issue #17).
+    ``request_key`` carries the client-supplied idempotency key for a revision
+    request; the unique constraint on ``(hypothesis_id, request_key)`` makes a
+    replayed edit return the already-committed revision instead of writing a
+    duplicate. ``request_fingerprint`` is the canonical fingerprint of every
+    semantically relevant request field (formula, parameters, complexity, model
+    family, creation source), so replaying a key with a different payload is
+    detected even when formula/parameters/complexity happen to match.
+    ``model_family`` holds the effective, validated family this revision was
+    created under and is the source of truth when replaying an evaluation.
+    ``HypothesisModel.model_family`` is the current-state/display projection and
+    follows the newest revision. The column is nullable only for revisions
+    written before it existed; the migration backfills them from their parent
+    hypothesis.
+    """
 
     __tablename__ = "hypothesis_revisions"
 
@@ -137,14 +157,36 @@ class HypothesisRevisionModel(Base):
     formula = Column(Text, nullable=False)
     parameters = Column(JSON, nullable=False)  # Weights/coefficients dictionary
     complexity = Column(Integer, nullable=False, default=1)
-    creation_source = Column(String(64), nullable=False, default="generator")  # generator, researcher, refit
+    model_family = Column(String(64), nullable=True)  # Effective validated family for this revision
+    creation_source = Column(String(64), nullable=False, default="generator")  # generator, researcher, refit, restoration
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
+    # Researcher history provenance (Issue #17)
+    #
+    # ``previous_revision_id`` is an application-maintained reference to the
+    # preceding revision of the same hypothesis. It is deliberately not a
+    # self-referential foreign key: SQLite cannot drop a self-referencing table
+    # in FK-enforced test teardown, and the chain is only ever written by
+    # ``revise_hypothesis_service`` together with the unique revision number and
+    # request-key constraints. See docs/researcher-history.md for the guarantee.
+    previous_revision_id = Column(String(64), nullable=True)
+    change_reason = Column(Text, nullable=True)
+    actor = Column(String(64), nullable=True)  # researcher, automated_agent, system
+    actor_id = Column(String(128), nullable=True)
+    request_key = Column(String(128), nullable=True)
+    request_fingerprint = Column(String(96), nullable=True)
+
     hypothesis = relationship("HypothesisModel", back_populates="revisions")
-    evaluations = relationship("EvaluationResultModel", back_populates="revision", passive_deletes=True)
+    evaluations = relationship(
+        "EvaluationResultModel",
+        back_populates="revision",
+        passive_deletes=True,
+        foreign_keys="EvaluationResultModel.revision_id",
+    )
 
     __table_args__ = (
         UniqueConstraint("hypothesis_id", "revision_number", name="uq_hypothesis_revision_number"),
+        UniqueConstraint("hypothesis_id", "request_key", name="uq_hypothesis_revision_request_key"),
         Index("idx_revisions_hyp_rev", "hypothesis_id", "revision_number"),
     )
 
@@ -207,7 +249,15 @@ class EvaluationResultModel(Base):
     run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
     status = Column(String(32), nullable=False, default="completed")  # completed, failed, pending
     sample_count = Column(Integer, nullable=False, default=0)
-    dataset_version = Column(Integer, nullable=False, default=0)  # Number of observations available at evaluation time
+    # Number of observations available at evaluation time. Retained for API
+    # compatibility; a count is NOT a dataset identity, because observations can
+    # change independently while the count stays equal.
+    dataset_version = Column(Integer, nullable=False, default=0)
+    # Exact immutable scientific input (Issue #17): deterministic fingerprint of
+    # the canonical content of the observations that were used for this
+    # evaluation, plus the manifest those inputs were fingerprinted from.
+    dataset_snapshot_id = Column(String(96), nullable=True)
+    dataset_snapshot = Column(JSON, nullable=True)
     
     # Structured predictive metrics
     metrics = Column(JSON, nullable=False)  # {"mae": 0.045, "rmse": 0.052, ...}
@@ -220,6 +270,7 @@ class EvaluationResultModel(Base):
     __table_args__ = (
         Index("idx_evaluations_rev_run", "revision_id", "run_id"),
         Index("idx_evaluations_run_evaluated", "run_id", "evaluated_at"),
+        Index("idx_evaluations_dataset_snapshot", "dataset_snapshot_id"),
     )
 
 
@@ -371,22 +422,42 @@ class BudgetReservationModel(Base):
 
 
 class AuditEventModel(Base):
-    """Immutable audit trail for researcher interactions and system lifecycle changes."""
+    """Immutable, append-only audit record for researcher and system actions.
+
+    ``actor`` names the actor category (``researcher``, ``automated_agent``,
+    ``system``, ``worker``, ...); ``actor_id`` carries the authenticated identity
+    when one is available. ``before_json`` / ``after_json`` hold the relevant
+    state snapshots, ``reason`` the human-supplied explanation, and
+    ``corrects_event_id`` links a correction to the event it supersedes without
+    rewriting it (Issue #17).
+    """
 
     __tablename__ = "audit_events"
 
     event_id = Column(String(64), primary_key=True)
     run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
     event_type = Column(String(64), nullable=False)  # RUN_STARTED, HYPOTHESIS_PINNED, HYPOTHESIS_EXCLUDED, etc.
-    actor = Column(String(64), nullable=False, default="researcher")  # researcher, system, orchestrator
+    actor = Column(String(64), nullable=False, default="researcher")  # researcher, automated_agent, system, worker
     metadata_json = Column(JSON, nullable=True)
     timestamp = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    # Researcher history provenance (Issue #17)
+    hypothesis_id = Column(String(64), nullable=True)
+    revision_id = Column(String(64), nullable=True)
+    actor_id = Column(String(128), nullable=True)
+    correlation_id = Column(String(128), nullable=True)
+    before_json = Column(JSON, nullable=True)
+    after_json = Column(JSON, nullable=True)
+    reason = Column(Text, nullable=True)
+    corrects_event_id = Column(String(64), nullable=True)
 
     run = relationship("RunModel", back_populates="audit_events")
 
     __table_args__ = (
         Index("idx_audit_run_timestamp", "run_id", "timestamp"),
         Index("idx_audit_event_type", "event_type"),
+        Index("idx_audit_hypothesis_timestamp", "hypothesis_id", "timestamp"),
+        Index("idx_audit_correlation", "correlation_id"),
     )
 
 
@@ -443,3 +514,34 @@ class ReportModel(Base):
     __table_args__ = (
         Index("idx_reports_run_generated", "run_id", "generated_at"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Append-only enforcement (Issue #17)
+#
+# Historical records are immutable through normal application operations: the
+# ORM refuses to UPDATE or DELETE an audit event or a hypothesis revision.
+# Corrections append a new record instead. This is an ORM/session guard, not a
+# database permission grant; raw SQL executed outside the ORM is not
+# intercepted, and that limitation is documented in docs/researcher-history.md.
+# ---------------------------------------------------------------------------
+
+_IMMUTABLE_HISTORY_MODELS = (AuditEventModel, HypothesisRevisionModel)
+
+
+@sqlalchemy_event.listens_for(Session, "before_flush")
+def _reject_history_mutation(session: Session, flush_context, instances) -> None:
+    """Fail a flush that would modify or delete an append-only record."""
+    for obj in session.deleted:
+        if isinstance(obj, _IMMUTABLE_HISTORY_MODELS):
+            raise AppendOnlyViolationError(
+                f"{type(obj).__name__} records are append-only and cannot be deleted."
+            )
+    for obj in session.dirty:
+        if isinstance(obj, _IMMUTABLE_HISTORY_MODELS) and session.is_modified(
+            obj, include_collections=False
+        ):
+            raise AppendOnlyViolationError(
+                f"{type(obj).__name__} records are append-only and cannot be modified; "
+                "append a new record that references the original instead."
+            )

@@ -14,6 +14,7 @@ Endpoints:
   POST   /api/v1/runs/<run_id>/hypotheses  Propose a researcher hypothesis
   POST   /api/v1/runs/<run_id>/start       Start execution of a queued run
   POST   /api/v1/runs/<run_id>/cancel      Cancel an active or queued run
+  GET    /api/v1/runs/<run_id>/history     Auditable researcher action history
 
 Route handlers are intentionally thin. Persistence operations are
 delegated to ClarityRepository; lifecycle transitions are delegated to
@@ -51,6 +52,7 @@ from ...services.hypothesis_service import (
     HypothesisValidationError,
     propose_hypothesis_service,
 )
+from ...domain.history_contracts import InvalidHistoryCursorError
 from ...services.report_service import (
     export_report_service,
     generate_report_service,
@@ -58,6 +60,10 @@ from ...services.report_service import (
 from ...services.audit_service import (
     list_audit_events_service,
     record_audit_event_service,
+)
+from ...services.history_service import (
+    HistoryNotFoundError,
+    list_run_history,
 )
 from ...domain.usage_contracts import (
     AuditEventConflictError,
@@ -115,6 +121,27 @@ def _lifecycle_manager() -> RunLifecycleManager:
 def _get_db():
     db_uri = current_app.config.get("SQLALCHEMY_DATABASE_URI")
     return get_db_manager(db_uri)
+
+
+def _request_correlation_id() -> Optional[str]:
+    """Request tracing identifier supplied by the caller, when present."""
+    for header in ("X-Request-ID", "X-Correlation-ID"):
+        value = request.headers.get(header)
+        if value and value.strip():
+            return value.strip()[:128]
+    return None
+
+
+def _request_actor_id() -> Optional[str]:
+    """Authenticated actor identity from a trusted gateway header, if any.
+
+    CLARITY has no authentication layer yet; this is recorded as an audit
+    attribute only and never used as an authorization decision.
+    """
+    value = request.headers.get("X-Actor-ID")
+    if value and value.strip():
+        return value.strip()[:128]
+    return None
 
 
 def _parse_pagination(request_args):
@@ -852,6 +879,8 @@ def create_run_hypothesis(run_id: str):
                 complexity=complexity,
                 creation_source="researcher",
                 hypothesis_id=hypothesis_id,
+                actor_id=_request_actor_id(),
+                correlation_id=_request_correlation_id(),
             )
             serialized = serialize_hypothesis(hyp, repo)
     except HypothesisBudgetExhaustedError as exc:
@@ -969,6 +998,81 @@ def list_run_tasks(run_id: str):
         "total_count": total_count,
         "limit": limit,
         "offset": offset,
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/history", methods=["GET"])
+def get_run_history(run_id: str):
+    """GET /api/v1/runs/<run_id>/history — Chronological researcher action history.
+
+    This is the Issue #17 read model over the same append-only audit store that
+    backs ``/audit-events``. It adds structured provenance (``before``/``after``,
+    ``reason``, ``hypothesis_id``, ``revision_id``, ``correlation_id``), actor and
+    hypothesis filtering, and cursor pagination.
+
+    Query params:
+      event_type    (str, optional)
+      actor         (str, optional)
+      hypothesis_id (str, optional)
+      revision_id   (str, optional)
+      limit         (int, 1-200, default 50)
+      cursor        (str, optional — returned as ``next_cursor`` on the previous page)
+      offset        (int, optional — offset pagination for compatibility)
+
+    Ordering is ``(timestamp, event_id)`` ascending. Cursor traversal is stable
+    when new events are appended between requests; offset traversal is not.
+    """
+    cursor = request.args.get("cursor")
+    offset_param = request.args.get("offset")
+    try:
+        limit = int(request.args.get("limit", _DEFAULT_PAGE_SIZE))
+        offset = int(offset_param) if offset_param is not None else None
+    except (TypeError, ValueError):
+        return error_response("Query parameters 'limit' and 'offset' must be integers.", 400)
+    if limit <= 0 or (offset is not None and offset < 0):
+        return error_response("'limit' must be > 0 and 'offset' must be >= 0.", 400)
+
+    event_type = request.args.get("event_type")
+    actor = request.args.get("actor")
+    hypothesis_id = request.args.get("hypothesis_id")
+    revision_id = request.args.get("revision_id")
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            page = list_run_history(
+                session,
+                run_id,
+                event_type=event_type,
+                actor=actor,
+                hypothesis_id=hypothesis_id,
+                revision_id=revision_id,
+                limit=limit,
+                offset=offset if cursor is None else None,
+                cursor=cursor,
+            )
+            serialized = [serialize_audit_event(e) for e in page.events]
+            pagination = page.to_dict()
+    except HistoryNotFoundError as exc:
+        return error_response(str(exc), 404)
+    except InvalidHistoryCursorError as exc:
+        return error_response(str(exc), 400)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_history db error", exc)
+        return error_response("An internal error occurred while retrieving history.", 500)
+
+    return jsonify({
+        "run_id": run_id,
+        "events": serialized,
+        "filters": {
+            "event_type": event_type,
+            "actor": actor,
+            "hypothesis_id": hypothesis_id,
+            "revision_id": revision_id,
+        },
+        "pagination": pagination,
     }), 200
 
 

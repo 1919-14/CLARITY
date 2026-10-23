@@ -165,6 +165,23 @@ When an expression is malformed or violates security boundaries, a structured er
   - **Oracle Invariant**: Hidden ground-truth formulas and oracle parameters are never exposed.
 - **Endpoint**: `GET /api/v1/hypotheses/{hypothesis_id}/evaluations`
   - Returns the full chronological list of evaluation records for this hypothesis, ordered most-recent first.
+- **Endpoint**: `GET /api/v1/hypotheses/{hypothesis_id}/revisions`
+  - Returns every immutable revision in ascending revision order (Issue #17).
+
+### 2a. Edit Hypothesis (append a revision)
+
+- **Endpoint**: `POST /api/v1/hypotheses/{hypothesis_id}/revisions`
+- **Payload**: `{"formula": "y = a*x^2 + b", "reason": "curvature in the residual", "expected_revision": 1}`
+- **Behavior**:
+  - Appends revision *n+1*; the previous definition is preserved exactly, including the
+    model family that revision was created under.
+  - Validates the new expression and `model_family` before writing anything. The validated
+    family is stored on the revision; omitting it inherits the family of the revision being
+    extended.
+  - Supports `expected_revision` / `expected_version_token` (409 on staleness) and an
+    `Idempotency-Key` (replay returns the committed revision).
+  - Records `HYPOTHESIS_REVISED` with before/after snapshots and the optional reason.
+  - Full contract: [researcher-history.md](researcher-history.md).
 
 ### 3. Pin / Unpin Hypothesis
 
@@ -228,14 +245,20 @@ All human-in-the-loop actions are permanently recorded in the `audit_events` tab
 
 | Event Type | Actor | Metadata |
 | :--- | :--- | :--- |
-| `HYPOTHESIS_PROPOSED` | `researcher` | `hypothesis_id`, `revision_id`, `model_family`, `formula`, `complexity` |
+| `HYPOTHESIS_PROPOSED` | `researcher` | `hypothesis_id`, `revision_id`, `revision_number`, `model_family`, `formula`, `complexity` |
+| `HYPOTHESIS_REVISED` | `researcher` | `hypothesis_id`, `revision_id`, `revision_number`, `previous_revision_id`, `model_family`, `creation_source` |
 | `HYPOTHESIS_PINNED` | `researcher` | `hypothesis_id`, `is_pinned: true` |
 | `HYPOTHESIS_UNPINNED` | `researcher` | `hypothesis_id`, `is_pinned: false` |
 | `HYPOTHESIS_EXCLUDED` | `researcher` | `hypothesis_id`, `is_excluded: true` |
 | `HYPOTHESIS_RESTORED` | `researcher` | `hypothesis_id`, `is_excluded: false` |
-| `HYPOTHESIS_REEVALUATED` | `researcher` | `hypothesis_id`, `revision_id`, `evaluation_id`, `status`, `sample_count` |
+| `HYPOTHESIS_REEVALUATED` | `researcher` | `hypothesis_id`, `revision_id`, `evaluation_id`, `status`, `sample_count`, `model_family` |
 | `HYPOTHESIS_REEVALUATE_REQUESTED` | `researcher` | `hypothesis_id`, `revision_id`, `evaluation_id`, `dispatched: true` |
-| `HYPOTHESIS_REEVALUATION_CONSUMED` | `worker` | `hypothesis_id`, `revision_id`, `evaluation_id`, `status`, `sample_count` |
+| `HYPOTHESIS_REEVALUATION_CONSUMED` | `worker` | `hypothesis_id`, `revision_id`, `evaluation_id`, `status`, `sample_count`, `model_family` |
+
+Since Issue #17 every event also records `hypothesis_id`, `revision_id`, `actor_id`,
+`correlation_id`, `before`, `after`, `reason` and `corrects_event_id` as structured
+columns, and the run-wide audit trail is queryable through
+`GET /api/v1/runs/{run_id}/history`.
 
 ---
 

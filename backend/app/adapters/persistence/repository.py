@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, func
+from sqlalchemy import and_ as sa_and, or_ as sa_or, select, desc, func
 
 from .models import (
     RunModel,
@@ -97,12 +97,65 @@ class ClarityRepository:
         hyp.current_revision += 1
         revision.hypothesis_id = hypothesis_id
         revision.revision_number = hyp.current_revision
+        if revision.previous_revision_id is None:
+            latest = self.get_latest_revision(hypothesis_id)
+            revision.previous_revision_id = latest.revision_id if latest else None
         self.session.add(revision)
         self.session.flush()
         return revision
 
     def get_hypothesis(self, hypothesis_id: str) -> Optional[HypothesisModel]:
         return self.session.get(HypothesisModel, hypothesis_id)
+
+    def get_revision(self, revision_id: str) -> Optional[HypothesisRevisionModel]:
+        return self.session.get(HypothesisRevisionModel, revision_id)
+
+    def get_latest_revision(
+        self, hypothesis_id: str
+    ) -> Optional[HypothesisRevisionModel]:
+        stmt = (
+            select(HypothesisRevisionModel)
+            .where(HypothesisRevisionModel.hypothesis_id == hypothesis_id)
+            .order_by(desc(HypothesisRevisionModel.revision_number))
+            .limit(1)
+        )
+        return self.session.scalars(stmt).first()
+
+    def get_revision_by_request_key(
+        self, hypothesis_id: str, request_key: str
+    ) -> Optional[HypothesisRevisionModel]:
+        """Return the revision already committed for an idempotency key, if any."""
+        stmt = select(HypothesisRevisionModel).where(
+            HypothesisRevisionModel.hypothesis_id == hypothesis_id,
+            HypothesisRevisionModel.request_key == request_key,
+        )
+        return self.session.scalars(stmt).first()
+
+    def list_hypothesis_revisions(
+        self,
+        hypothesis_id: str,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> List[HypothesisRevisionModel]:
+        """List a hypothesis's revisions in ascending revision order."""
+        stmt = (
+            select(HypothesisRevisionModel)
+            .where(HypothesisRevisionModel.hypothesis_id == hypothesis_id)
+            .order_by(HypothesisRevisionModel.revision_number.asc())
+        )
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def count_hypothesis_revisions(self, hypothesis_id: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(HypothesisRevisionModel)
+            .where(HypothesisRevisionModel.hypothesis_id == hypothesis_id)
+        )
+        return self.session.scalar(stmt) or 0
 
     def list_hypotheses_for_run(
         self,
@@ -201,12 +254,56 @@ class ClarityRepository:
         return evaluation
 
     def list_evaluations_for_revision(
-        self, revision_id: str
+        self,
+        revision_id: str,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        order: str = "desc",
     ) -> List[EvaluationResultModel]:
+        """List evaluations for one revision, newest first unless asked otherwise.
+
+        Ordering always breaks ties on ``evaluation_id`` so a page boundary can
+        never skip or repeat a record when several evaluations share a timestamp.
+        """
+        ordering = (
+            (EvaluationResultModel.evaluated_at.asc(), EvaluationResultModel.evaluation_id.asc())
+            if order == "asc"
+            else (EvaluationResultModel.evaluated_at.desc(), EvaluationResultModel.evaluation_id.asc())
+        )
         stmt = (
             select(EvaluationResultModel)
             .where(EvaluationResultModel.revision_id == revision_id)
-            .order_by(desc(EvaluationResultModel.evaluated_at))
+            .order_by(*ordering)
+        )
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def count_evaluations_for_revision(self, revision_id: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(EvaluationResultModel)
+            .where(EvaluationResultModel.revision_id == revision_id)
+        )
+        return self.session.scalar(stmt) or 0
+
+    def list_evaluations_for_hypothesis(
+        self, hypothesis_id: str
+    ) -> List[EvaluationResultModel]:
+        """List every evaluation across all revisions of a hypothesis."""
+        stmt = (
+            select(EvaluationResultModel)
+            .join(
+                HypothesisRevisionModel,
+                EvaluationResultModel.revision_id == HypothesisRevisionModel.revision_id,
+            )
+            .where(HypothesisRevisionModel.hypothesis_id == hypothesis_id)
+            .order_by(
+                EvaluationResultModel.evaluated_at.asc(),
+                EvaluationResultModel.evaluation_id.asc(),
+            )
         )
         return list(self.session.scalars(stmt).all())
 
@@ -386,14 +483,27 @@ class ClarityRepository:
         existing = self.session.get(AuditEventModel, event.event_id)
         if existing:
             conflicts = []
-            if existing.run_id != event.run_id:
-                conflicts.append(f"run_id mismatch ('{existing.run_id}' != '{event.run_id}')")
-            if existing.event_type != event.event_type:
-                conflicts.append(f"event_type mismatch ('{existing.event_type}' != '{event.event_type}')")
-            if existing.actor != event.actor:
-                conflicts.append(f"actor mismatch ('{existing.actor}' != '{event.actor}')")
+            for field, label in (
+                ("run_id", "run_id"),
+                ("event_type", "event_type"),
+                ("actor", "actor"),
+                ("hypothesis_id", "hypothesis_id"),
+                ("revision_id", "revision_id"),
+                ("actor_id", "actor_id"),
+                ("correlation_id", "correlation_id"),
+                ("reason", "reason"),
+                ("corrects_event_id", "corrects_event_id"),
+            ):
+                old_value = getattr(existing, field, None)
+                new_value = getattr(event, field, None)
+                if old_value != new_value:
+                    conflicts.append(f"{label} mismatch ('{old_value}' != '{new_value}')")
             if (existing.metadata_json or {}) != (event.metadata_json or {}):
                 conflicts.append("metadata payload mismatch")
+            if (existing.before_json or {}) != (event.before_json or {}):
+                conflicts.append("before-state mismatch")
+            if (existing.after_json or {}) != (event.after_json or {}):
+                conflicts.append("after-state mismatch")
             if conflicts:
                 raise AuditEventConflictError(
                     f"Conflicting audit event reuse for event_id '{event.event_id}': {', '.join(conflicts)}."
@@ -406,22 +516,91 @@ class ClarityRepository:
     def get_audit_event(self, event_id: str) -> Optional[AuditEventModel]:
         return self.session.get(AuditEventModel, event_id)
 
+    def _audit_event_filters(
+        self,
+        run_id: str,
+        event_type: Optional[str] = None,
+        actor: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
+    ) -> List[Any]:
+        clauses: List[Any] = [AuditEventModel.run_id == run_id]
+        if event_type is not None:
+            clauses.append(AuditEventModel.event_type == event_type)
+        if actor is not None:
+            clauses.append(AuditEventModel.actor == actor)
+        if hypothesis_id is not None:
+            clauses.append(AuditEventModel.hypothesis_id == hypothesis_id)
+        if revision_id is not None:
+            clauses.append(AuditEventModel.revision_id == revision_id)
+        return clauses
+
     def list_audit_events_for_run(
         self,
         run_id: str,
         event_type: Optional[str] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        actor: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
     ) -> List[AuditEventModel]:
+        """List a run's audit events in deterministic chronological order.
+
+        Ordering is ``(timestamp, event_id)`` ascending; the event ID is the
+        tie-breaker that makes equal timestamps traverse in a stable order.
+        """
         stmt = (
             select(AuditEventModel)
-            .where(AuditEventModel.run_id == run_id)
+            .where(
+                *self._audit_event_filters(
+                    run_id,
+                    event_type=event_type,
+                    actor=actor,
+                    hypothesis_id=hypothesis_id,
+                    revision_id=revision_id,
+                )
+            )
             .order_by(AuditEventModel.timestamp.asc(), AuditEventModel.event_id.asc())
         )
-        if event_type is not None:
-            stmt = stmt.where(AuditEventModel.event_type == event_type)
         if offset is not None:
             stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def list_audit_events_after(
+        self,
+        run_id: str,
+        after_timestamp: datetime,
+        after_event_id: str,
+        event_type: Optional[str] = None,
+        limit: Optional[int] = None,
+        actor: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
+    ) -> List[AuditEventModel]:
+        """Keyset pagination: records strictly after ``(timestamp, event_id)``."""
+        stmt = (
+            select(AuditEventModel)
+            .where(
+                *self._audit_event_filters(
+                    run_id,
+                    event_type=event_type,
+                    actor=actor,
+                    hypothesis_id=hypothesis_id,
+                    revision_id=revision_id,
+                ),
+                sa_or(
+                    AuditEventModel.timestamp > after_timestamp,
+                    sa_and(
+                        AuditEventModel.timestamp == after_timestamp,
+                        AuditEventModel.event_id > after_event_id,
+                    ),
+                ),
+            )
+            .order_by(AuditEventModel.timestamp.asc(), AuditEventModel.event_id.asc())
+        )
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
@@ -430,14 +609,23 @@ class ClarityRepository:
         self,
         run_id: str,
         event_type: Optional[str] = None,
+        actor: Optional[str] = None,
+        hypothesis_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
     ) -> int:
         stmt = (
             select(func.count())
             .select_from(AuditEventModel)
-            .where(AuditEventModel.run_id == run_id)
+            .where(
+                *self._audit_event_filters(
+                    run_id,
+                    event_type=event_type,
+                    actor=actor,
+                    hypothesis_id=hypothesis_id,
+                    revision_id=revision_id,
+                )
+            )
         )
-        if event_type is not None:
-            stmt = stmt.where(AuditEventModel.event_type == event_type)
         return self.session.scalar(stmt) or 0
 
     # =========================================================================

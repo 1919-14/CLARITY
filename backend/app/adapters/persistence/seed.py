@@ -53,6 +53,7 @@ def seed_minimal_development_data(repo: ClarityRepository) -> str:
         formula="y = 2.0x + 1.0",
         parameters={"w1": 2.0, "w0": 1.0},
         complexity=2,
+        model_family="1d_linear",
         creation_source="generator",
     )
     repo.create_hypothesis_with_initial_revision(h1, r1)
@@ -72,6 +73,7 @@ def seed_minimal_development_data(repo: ClarityRepository) -> str:
         formula="y = 0.4x^3 - 0.8x^2 - 1.5x + 2.8",
         parameters={"w3": 0.4, "w2": -0.8, "w1": -1.5, "w0": 2.8},
         complexity=4,
+        model_family="1d_polynomial",
         creation_source="generator",
     )
     repo.create_hypothesis_with_initial_revision(h2, r2_v1)
@@ -83,6 +85,7 @@ def seed_minimal_development_data(repo: ClarityRepository) -> str:
         formula="y = 0.5x^3 - 1.0x^2 - 2.0x + 3.0",
         parameters={"w3": 0.5, "w2": -1.0, "w1": -2.0, "w0": 3.0},
         complexity=4,
+        model_family="1d_polynomial",
         creation_source="refit",
     )
     repo.add_hypothesis_revision("hyp-seed-2", r2_v2)
