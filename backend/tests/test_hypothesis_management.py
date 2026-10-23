@@ -207,7 +207,218 @@ class TestResearcherCreatedHypotheses:
                 formula="y = 2*x + 1",
                 parameters={"c0": 99.0, "c1": 99.0},
             )
-        assert "does not match formula coefficient" in str(exc_info.value)
+    def test_formula_with_symbolic_parameters_consistent_values(self, db_session):
+        """Formulas referencing arbitrary parameter names resolve exact canonical coefficients and predict accurately."""
+        from app.domain.hypothesis_models import default_registry
+
+        run = _create_test_run(db_session)
+        # y = a*x + b with a=3.0, b=-1.5
+        hyp = propose_hypothesis_service(
+            session=db_session,
+            run_id=run.run_id,
+            model_family="linear",
+            formula="y = a*x + b",
+            parameters={"a": 3.0, "b": -1.5},
+        )
+        rev = hyp.revisions[0]
+        assert rev.parameters["family"] == "polynomial"
+        assert rev.parameters["degree"] == 1
+        assert rev.parameters["coefficients"]["c0"] == -1.5
+        assert rev.parameters["coefficients"]["c1"] == 3.0
+
+        family = default_registry().get("polynomial")
+        for x_val, expected_y in [(0.0, -1.5), (1.0, 1.5), (2.0, 4.5), (-1.0, -4.5)]:
+            pred, p_err = family.predict(rev.parameters, {"x": x_val})
+            assert p_err is None
+            assert pred["y"] == pytest.approx(expected_y)
+
+        # Arbitrary parameter names: y = m*x + c
+        hyp2 = propose_hypothesis_service(
+            session=db_session,
+            run_id=run.run_id,
+            model_family="polynomial",
+            formula="y = m*x + c",
+            parameters={"m": 2.0, "c": 1.0},
+        )
+        rev2 = hyp2.revisions[0]
+        assert rev2.parameters["coefficients"]["c0"] == 1.0
+        assert rev2.parameters["coefficients"]["c1"] == 2.0
+
+        # Arbitrary quadratic parameters: y = alpha*x^2 + beta*x + gamma
+        hyp3 = propose_hypothesis_service(
+            session=db_session,
+            run_id=run.run_id,
+            model_family="polynomial",
+            formula="y = alpha*x^2 + beta*x + gamma",
+            parameters={"alpha": 1.0, "beta": -2.0, "gamma": 3.0},
+        )
+        rev3 = hyp3.revisions[0]
+        assert rev3.parameters["degree"] == 2
+        assert rev3.parameters["coefficients"]["c0"] == 3.0
+        assert rev3.parameters["coefficients"]["c1"] == -2.0
+        assert rev3.parameters["coefficients"]["c2"] == 1.0
+
+    def test_formula_with_symbolic_parameters_inconsistent_values_rejected(self, db_session):
+        """Inconsistent parameter values for formulas with symbolic parameter names are rejected."""
+        run = _create_test_run(db_session)
+
+        # 1. Supplied canonical coefficient c1 contradicts symbolic parameter a
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters={"a": 2.0, "b": 1.0, "c1": 99.0},
+            )
+        assert "does not match formula coefficient" in str(exc.value)
+
+        # 2. Supplied canonical coefficient c0 contradicts symbolic parameter b
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters={"a": 2.0, "b": 1.0, "c0": 42.0},
+            )
+        assert "does not match formula coefficient" in str(exc.value)
+
+        # 3. Non-numeric parameter value for symbolic parameter
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="linear",
+                formula="y = a*x + b",
+                parameters={"a": "invalid", "b": 1.0},
+            )
+        assert "must be a numeric value" in str(exc.value)
+
+        # 4. Non-finite parameter value (NaN)
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="linear",
+                formula="y = a*x + b",
+                parameters={"a": float("nan"), "b": 1.0},
+            )
+        assert "must be finite" in str(exc.value)
+
+        # 4. Inconsistent degree supplied in parameters
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters={"a": 2.0, "b": 1.0, "degree": 4},
+            )
+        assert "Supplied degree (4) does not match formula degree (1)" in str(exc.value)
+
+        # 5. Missing referenced parameter (b is omitted)
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters={"a": 2.0},
+            )
+        assert "Formula references parameter(s) ['b'] which were not supplied" in str(exc.value)
+
+        # 6. Entire parameters mapping omitted when formula has symbolic variables
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters=None,
+            )
+        assert "Formula references parameter(s) ['a', 'b'] which were not supplied" in str(exc.value)
+
+    def test_parameter_names_supplied_but_not_referenced_rejected(self, db_session):
+        """Supplied parameters not actually referenced in the formula are strictly rejected."""
+        run = _create_test_run(db_session)
+
+        # 1. Unreferenced parameter passed with y = a*x + b
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = a*x + b",
+                parameters={"a": 2.0, "b": 1.0, "unused_param": 42.0},
+            )
+        assert "Supplied parameter(s) ['unused_param'] are not referenced in the formula" in str(exc.value)
+
+        # 2. Parameters a and b passed for concrete formula y = 2*x + 1 (where they are not referenced)
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = 2*x + 1",
+                parameters={"a": 2.0, "b": 1.0},
+            )
+        assert "Supplied parameter(s) ['a', 'b'] are not referenced in the formula" in str(exc.value)
+
+        # 3. Arbitrary extra parameter for concrete formula
+        with pytest.raises(HypothesisValidationError) as exc:
+            propose_hypothesis_service(
+                session=db_session,
+                run_id=run.run_id,
+                model_family="polynomial",
+                formula="y = 2*x + 1",
+                parameters={"extra": 10.0},
+            )
+        assert "Supplied parameter(s) ['extra'] are not referenced in the formula" in str(exc.value)
+
+    def test_symbolic_and_unreferenced_parameters_via_api(self, client):
+        """API properly validates symbolic parameter resolution and rejects unreferenced parameters."""
+        res_run = client.post("/api/v1/runs", json={"name": "Symbolic Param Run"})
+        run_id = res_run.get_json()["run"]["run_id"]
+
+        # Valid y = a*x + b -> 201 Created
+        res_ok = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={
+                "model_family": "linear",
+                "formula": "y = a*x + b",
+                "parameters": {"a": 2.0, "b": 1.0},
+            },
+        )
+        assert res_ok.status_code == 201
+        hyp = res_ok.get_json()["hypothesis"]
+        rev_params = hyp["latest_revision"]["parameters"]
+        assert rev_params["coefficients"]["c1"] == 2.0
+        assert rev_params["coefficients"]["c0"] == 1.0
+
+        # Unreferenced parameter -> 422 Unprocessable Entity
+        res_unref = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={
+                "model_family": "linear",
+                "formula": "y = a*x + b",
+                "parameters": {"a": 2.0, "b": 1.0, "discarded_extra": 99.0},
+            },
+        )
+        assert res_unref.status_code == 422
+        assert "not referenced in the formula" in res_unref.get_json()["message"]
+
+        # Inconsistent parameter (c1 contradicts a) -> 422 Unprocessable Entity
+        res_incons = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={
+                "model_family": "linear",
+                "formula": "y = a*x + b",
+                "parameters": {"a": 2.0, "b": 1.0, "c1": 99.0},
+            },
+        )
+        assert res_incons.status_code == 422
+        assert "does not match formula coefficient" in res_incons.get_json()["message"]
 
 
 

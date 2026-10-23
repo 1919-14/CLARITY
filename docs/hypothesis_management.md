@@ -77,14 +77,16 @@ y = 0.5x^2 - 1.2x + 3.0
 #### Parameter Coefficients and Canonical Derivation
 
 Parameters can either be supplied explicitly or omitted:
-- **Omitted parameters**: When `parameters` is omitted, canonical polynomial coefficients (`c0, c1, ...`) are automatically and safely derived directly from the mathematical formula AST without executing any user code (e.g., `y = 2*x + 1` derives `c0=1.0, c1=2.0` with degree 1).
-- **Explicit parameters**: When supplied, the coefficients are verified against the formula. Any mismatch (e.g., proposing `y = 2*x + 1` with `c0=99.0`) is rejected with `INVALID_PARAMETERS` (HTTP 422), guaranteeing that candidate formula representation and underlying model evaluation never diverge.
-- **Linear models**: Shorthand parameters `{"a": 2.0, "b": 1.0}` are normalized to ascending polynomial coefficients `{"c0": 1.0, "c1": 2.0}`.
+- **Omitted parameters**: When `parameters` is omitted for formulas with concrete coefficients, canonical polynomial coefficients (`c0, c1, ...`) are automatically and safely derived directly from the mathematical formula AST without executing any user code (e.g., `y = 2*x + 1` derives `c0=1.0, c1=2.0` with degree 1).
+- **Arbitrary symbolic parameters**: Formulas referencing arbitrary parameter names (e.g., `y = a*x + b`, `y = m*x + c`, or `y = alpha*x^2 + beta*x + gamma`) require that every referenced symbol be explicitly provided in `parameters`. The symbols are resolved exactly into canonical ascending coefficients (`c0, c1, ...`) upon persistence.
+- **Missing parameters**: If any symbolic parameter referenced in the formula is omitted from `parameters`, the request is rejected with `INVALID_PARAMETERS` (HTTP 422).
+- **Unreferenced parameters**: Any parameter name supplied in `parameters` that is neither referenced in the formula nor a canonical polynomial coefficient (`c0, c1, ...`) is strictly rejected with `INVALID_PARAMETERS` (HTTP 422). For example, passing `{"unused": 10.0}` with `y = 2*x + 1`, or passing `{"a": 2.0, "b": 1.0, "extra": 5.0}` with `y = a*x + b`.
+- **Parameter consistency check**: When canonical coefficients (`c0`, `c1`, ...) are supplied alongside symbolic parameters or concrete formulas, they are checked against the derived polynomial. Any mismatch (e.g., proposing `y = a*x + b` with `{"a": 2.0, "b": 1.0, "c1": 99.0}`) is rejected with `INVALID_PARAMETERS` (HTTP 422), guaranteeing that candidate formula representation and evaluated models never diverge.
 ```json
 {
-  "model_family": "polynomial",
-  "formula": "y = 2.0*x + 1.0",
-  "parameters": {"c0": 1.0, "c1": 2.0},
+  "model_family": "linear",
+  "formula": "y = a*x + b",
+  "parameters": {"a": 2.0, "b": 1.0},
   "complexity": 2
 }
 ```

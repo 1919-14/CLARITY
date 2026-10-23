@@ -106,7 +106,7 @@ def propose_hypothesis_service(
     rev_id = f"rev-{uuid.uuid4().hex[:12]}"
 
     final_complexity = complexity if (complexity and complexity >= 1) else (validated.complexity if validated else 1)
-    final_params = dict(parameters) if parameters else (validated.parameters if validated else {})
+    final_params = validated.parameters if validated and validated.parameters else (dict(parameters) if parameters else {})
 
     # New candidate hypotheses are admitted against the run's persisted
     # generation budget before anything is written.

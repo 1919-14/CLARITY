@@ -70,6 +70,34 @@ SUPPORTED_MODEL_FAMILIES: FrozenSet[str] = frozenset({
 })
 
 
+# System identifiers and functions forbidden in hypothesis expressions
+FORBIDDEN_IDENTIFIERS: FrozenSet[str] = frozenset({
+    "__import__",
+    "__class__",
+    "__bases__",
+    "__subclasses__",
+    "__builtins__",
+    "__globals__",
+    "__code__",
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "breakpoint",
+    "globals",
+    "locals",
+    "getattr",
+    "setattr",
+    "delattr",
+    "hasattr",
+    "system",
+    "os",
+    "sys",
+    "subprocess",
+    "shutil",
+})
+
+
 @dataclass(frozen=True)
 class ValidatedExpression:
     """Structured result of a successful expression validation."""
@@ -88,7 +116,7 @@ class ValidatedExpression:
 class _SafeExpressionValidator(ast.NodeVisitor):
     """AST visitor that ensures the expression contains only allowed mathematical constructs."""
 
-    def __init__(self, allowed_variables: Set[str]):
+    def __init__(self, allowed_variables: Optional[Set[str]] = None):
         self.allowed_variables = allowed_variables
         self.referenced_variables: Set[str] = set()
         self.highest_degree = 0
@@ -156,13 +184,14 @@ class _SafeExpressionValidator(ast.NodeVisitor):
 
         if isinstance(node, ast.Name):
             var_name = node.id
+            if var_name.startswith("_") or var_name in FORBIDDEN_IDENTIFIERS:
+                raise ValueError("Unsafe expression rejected: dynamic execution, imports, and system calls are strictly forbidden.")
             self.referenced_variables.add(var_name)
-            if var_name not in self.allowed_variables:
+            if self.allowed_variables is not None and var_name not in self.allowed_variables:
                 raise ValueError(
-                    f"Unknown variable or identifier '{var_name}'. "
-                    f"Only the task input variable '{', '.join(sorted(self.allowed_variables))}' and parameter coefficients are allowed."
+                    f"Unknown variable or identifier '{var_name}'."
                 )
-            if var_name in ("x", "input") and self.highest_degree < 1:
+            if var_name in ("x", "input", "X") and self.highest_degree < 1:
                 self.highest_degree = 1
             return
 
@@ -390,11 +419,21 @@ def validate_hypothesis_expression(
             message=f"Failed to parse mathematical expression ({type(exc).__name__}).",
         )
 
-    # 6. AST Walk and validation
-    allowed_identifiers: Set[str] = {input_variable, "x", "X"}
+    # 6. Parse and validate supplied parameters
     param_dict: Dict[str, float] = {}
-    if parameters and isinstance(parameters, Mapping):
-        flat_params = parameters.get("coefficients", parameters) if isinstance(parameters.get("coefficients"), Mapping) else parameters
+    if parameters is not None:
+        if not isinstance(parameters, Mapping):
+            return None, StructuredError(
+                code=ERROR_INVALID_PARAMETERS,
+                message="Parameters must be a JSON object / dictionary.",
+            )
+        flat_params: Dict[str, Any] = {}
+        for k, v in parameters.items():
+            if k == "coefficients" and isinstance(v, Mapping):
+                flat_params.update(v)
+            else:
+                flat_params[k] = v
+
         for k, v in flat_params.items():
             if k in ("coefficients", "family", "coefficient_order", "input_variable", "output_variable", "degree"):
                 continue
@@ -413,15 +452,14 @@ def validate_hypothesis_expression(
                     code=ERROR_INVALID_PARAMETERS,
                     message=f"Parameter '{k}' must be finite.",
                 )
-            allowed_identifiers.add(k.strip())
             param_dict[k.strip()] = float(v)
 
-    validator = _SafeExpressionValidator(allowed_identifiers)
+    validator = _SafeExpressionValidator()
     try:
         validator.visit(tree)
     except ValueError as exc:
         return None, StructuredError(
-            code=ERROR_UNSAFE_EXPRESSION if "not permitted" in str(exc) else ERROR_INVALID_EXPRESSION,
+            code=ERROR_UNSAFE_EXPRESSION if ("not permitted" in str(exc) or "Unsafe" in str(exc)) else ERROR_INVALID_EXPRESSION,
             message=str(exc),
         )
 
@@ -432,13 +470,37 @@ def validate_hypothesis_expression(
             message=f"Polynomial degree {detected_degree} exceeds hard ceiling of {HARD_MAX_POLYNOMIAL_DEGREE}.",
         )
 
+    task_input_vars = {input_variable, "x", "X"}
+    formula_params = {v for v in validator.referenced_variables if v not in task_input_vars}
+
+    # 1. Verify that all symbolic parameters referenced in the formula are supplied
+    missing_params = sorted(formula_params - set(param_dict.keys()))
+    if missing_params:
+        return None, StructuredError(
+            code=ERROR_INVALID_PARAMETERS,
+            message=f"Formula references parameter(s) {missing_params} which were not supplied in parameters.",
+            details={"missing_parameters": missing_params, "formula": clean_formula},
+        )
+
+    # 2. Verify that no unreferenced parameters were supplied (unless canonical coefficient keys c0, c1, ...)
+    unreferenced_params = sorted(
+        k for k in param_dict.keys()
+        if k not in formula_params and not (k.startswith("c") and k[1:].isdigit())
+    )
+    if unreferenced_params:
+        return None, StructuredError(
+            code=ERROR_INVALID_PARAMETERS,
+            message=f"Supplied parameter(s) {unreferenced_params} are not referenced in the formula.",
+            details={"unreferenced_parameters": unreferenced_params, "formula": clean_formula},
+        )
+
     # 7. Normalize parameters to canonical polynomial structure by deriving exact coefficients from the formula
     canonical_parameters: Dict[str, Any] = {}
     if norm_family == POLYNOMIAL_FAMILY_ID:
         try:
             derived_poly = _evaluate_polynomial_ast(
                 tree,
-                var_names={input_variable, "x", "X"},
+                var_names=task_input_vars,
                 param_dict=param_dict,
                 max_degree=HARD_MAX_POLYNOMIAL_DEGREE,
             )
@@ -452,7 +514,7 @@ def validate_hypothesis_expression(
         non_zero_degrees = [p for p, c in derived_poly.items() if abs(c) > 1e-12]
         effective_degree = max(non_zero_degrees, default=0)
 
-        # If user supplied parameters, verify they agree with the formula coefficients
+        # If user supplied canonical coefficients c0, c1, ..., verify they agree with the derived polynomial
         if param_dict:
             for key, val in param_dict.items():
                 if key.startswith("c") and key[1:].isdigit():
@@ -464,24 +526,19 @@ def validate_hypothesis_expression(
                             message=f"Supplied parameter '{key}' ({val}) does not match formula coefficient ({expected}).",
                             details={"parameter": key, "supplied": val, "expected": expected},
                         )
-                elif key == "a":
-                    expected = derived_poly.get(1, 0.0)
-                    if abs(float(val) - expected) > 1e-6:
-                        return None, StructuredError(
-                            code=ERROR_INVALID_PARAMETERS,
-                            message=f"Supplied parameter 'a' ({val}) does not match linear formula slope ({expected}).",
-                            details={"parameter": "a", "supplied": val, "expected": expected},
-                        )
-                elif key == "b":
-                    expected = derived_poly.get(0, 0.0)
-                    if abs(float(val) - expected) > 1e-6:
-                        return None, StructuredError(
-                            code=ERROR_INVALID_PARAMETERS,
-                            message=f"Supplied parameter 'b' ({val}) does not match formula constant term ({expected}).",
-                            details={"parameter": "b", "supplied": val, "expected": expected},
-                        )
 
         final_degree = max(effective_degree, validator.highest_degree if validator.highest_degree > 0 and effective_degree == 0 else effective_degree)
+
+        # If parameters explicitly specified degree, verify it matches
+        if isinstance(parameters, Mapping) and "degree" in parameters:
+            supplied_deg = parameters["degree"]
+            if isinstance(supplied_deg, int) and supplied_deg != final_degree:
+                return None, StructuredError(
+                    code=ERROR_INVALID_PARAMETERS,
+                    message=f"Supplied degree ({supplied_deg}) does not match formula degree ({final_degree}).",
+                    details={"supplied_degree": supplied_deg, "formula_degree": final_degree},
+                )
+
         coeffs = {f"c{i}": round(derived_poly.get(i, 0.0), 10) for i in range(final_degree + 1)}
 
         canonical_parameters = {
