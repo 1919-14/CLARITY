@@ -426,6 +426,7 @@ class ReportModel(Base):
     limitations = Column(Text, nullable=True)
     artifact_uri = Column(String(255), nullable=True)
     generated_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    report_json = Column(JSON, nullable=True)
 
     run = relationship("RunModel", back_populates="reports")
 

@@ -12,6 +12,7 @@ Strictly enforces:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
@@ -26,6 +27,9 @@ from .contracts import (
 )
 from .evidence_tracker import collect_evidence
 from .hypothesis_models import ModelFamilyRegistry, default_registry
+from .sanitization import sanitize_exception_text
+
+logger = logging.getLogger(__name__)
 from .ranking_contracts import (
     EvaluationTier,
     EvidenceClassification,
@@ -56,6 +60,46 @@ def _safe_float(val: Any) -> Optional[float]:
         f = float(val)
         return f if math.isfinite(f) else None
     except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _predict_hypothesis(
+    registry: ModelFamilyRegistry,
+    family_id: str,
+    parameters: Mapping[str, Any],
+    input_values: Mapping[str, Any],
+) -> Optional[float]:
+    """Evaluate a candidate model's scalar prediction at a proposed input."""
+    family = registry.get(family_id)
+    if family is None:
+        return None
+    spec = dict(parameters)
+    if family_id == "polynomial":
+        spec.setdefault("family", "polynomial")
+        spec.setdefault("input_variable", "x")
+        spec.setdefault("output_variable", "y")
+        spec.setdefault("coefficient_order", "ascending")
+        if "degree" not in spec and "coefficients" in spec:
+            spec["degree"] = max(0, len(spec["coefficients"]) - 1)
+        allowed_keys = {
+            "family",
+            "degree",
+            "coefficient_order",
+            "coefficients",
+            "input_variable",
+            "output_variable",
+        }
+        spec = {k: v for k, v in spec.items() if k in allowed_keys}
+    try:
+        outputs, error = family.predict(spec, input_values)
+        if error or not isinstance(outputs, Mapping):
+            return None
+        val = next(iter(outputs.values()), None)
+        if val is None or isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except Exception:
         return None
 
 
@@ -208,6 +252,8 @@ def generate_scientific_report(
         # Collect evidence records
         supporting_items: List[EvidenceItem] = []
         contradicting_items: List[EvidenceItem] = []
+        evidence_failed = False
+        evidence_failure_reason: Optional[str] = None
 
         if eval_res and observations:
             try:
@@ -235,10 +281,20 @@ def generate_scientific_report(
                         supporting_items.append(item)
                     elif ev.classification == EvidenceClassification.CONTRADICTING:
                         contradicting_items.append(item)
-            except Exception:
-                pass
+            except Exception as exc:
+                evidence_failed = True
+                evidence_failure_reason = sanitize_exception_text(str(exc)) or "Unknown error during evidence collection"
+                logger.warning(
+                    "Evidence collection failed for hypothesis '%s': %s",
+                    rc.hypothesis_id,
+                    evidence_failure_reason,
+                )
 
         hyp_limitations = list(rc.limitations)
+        if evidence_failed:
+            hyp_limitations.append(
+                f"Evidence generation failed: {evidence_failure_reason}."
+            )
         if eval_res and eval_res.status == EvaluationStatus.FAILED:
             hyp_limitations.append(
                 f"Evaluation failed: {eval_res.error.message if eval_res.error else 'Unknown error'}."
@@ -250,6 +306,12 @@ def generate_scientific_report(
         model_family_str = cand.model_family if cand else "unknown"
         params_dict = dict(cand.parameters) if cand else {}
         rev_num = cand.revision if cand else 1
+
+        ev_dataset_version = (
+            eval_res.dataset_ids.get("dataset_version")
+            if eval_res and isinstance(eval_res.dataset_ids, Mapping) and eval_res.dataset_ids.get("dataset_version") is not None
+            else dataset_version
+        )
 
         report_hypotheses.append(
             ReportHypothesis(
@@ -269,7 +331,7 @@ def generate_scientific_report(
                 training_score=rc.training_score,
                 complexity_score=rc.complexity,
                 dataset_id=rc.dataset_id,
-                dataset_version=dataset_version,
+                dataset_version=ev_dataset_version,
                 explanation=rc.explanation,
                 supporting_evidence=tuple(supporting_items),
                 contradicting_evidence=tuple(contradicting_items),
@@ -382,45 +444,82 @@ def generate_scientific_report(
         overall_limitations.append(
             f"Low Sample Count: Only {dataset_version} observation(s) available; generalization metrics may have high variance."
         )
+    for h in report_hypotheses:
+        for lim in h.uncertainty_and_limitations:
+            if lim.startswith("Evidence generation failed:"):
+                overall_limitations.append(
+                    f"Evidence Generation Notice for candidate '{h.hypothesis_id}': {lim}"
+                )
 
     # 9. Next Experiment Recommendation
     next_exp_rec: NextExperimentRecommendation
     if len(report_hypotheses) >= 2:
         top_a = report_hypotheses[0]
         top_b = report_hypotheses[1]
-        
-        # Check if candidate experiments exist
+
         chosen_exp_id: Optional[str] = None
         chosen_input: Optional[Dict[str, Any]] = None
         strategy = "active_disagreement"
-        disagreement_score: Optional[float] = None
+        best_disagreement: Optional[float] = None
 
         if candidate_experiments:
             for exp in candidate_experiments:
                 if exp.get("execution_status") in ("proposed", "eligible"):
-                    chosen_exp_id = exp.get("experiment_id")
-                    chosen_input = exp.get("proposed_input")
-                    rationale = exp.get("selection_rationale") or {}
-                    disagreement_score = _safe_float(rationale.get("disagreement_score"))
-                    strategy = rationale.get("strategy", strategy)
-                    break
+                    cand_input = exp.get("proposed_input")
+                    if not cand_input:
+                        continue
+                    val_a = _predict_hypothesis(registry, top_a.model_family, top_a.parameters, cand_input)
+                    val_b = _predict_hypothesis(registry, top_b.model_family, top_b.parameters, cand_input)
+                    if val_a is not None and val_b is not None:
+                        disagree = abs(val_a - val_b)
+                        if disagree > 1e-4 and (best_disagreement is None or disagree > best_disagreement):
+                            best_disagreement = disagree
+                            chosen_exp_id = exp.get("experiment_id")
+                            chosen_input = dict(cand_input)
+                            rationale = exp.get("selection_rationale") or {}
+                            strategy = rationale.get("strategy", strategy)
 
-        if chosen_input is None and observations:
-            # Recommend an interpolated/extrapolated test input based on first observation keys
+        if chosen_input is None and observations and observations[0].input_values:
+            # Probe input space to verify whether models diverge at candidate point
             ref_keys = list(observations[0].input_values.keys())
-            chosen_input = {k: 5.0 for k in ref_keys}
+            candidate_test_input = {k: 5.0 for k in ref_keys}
+            val_a = _predict_hypothesis(registry, top_a.model_family, top_a.parameters, candidate_test_input)
+            val_b = _predict_hypothesis(registry, top_b.model_family, top_b.parameters, candidate_test_input)
+            if val_a is not None and val_b is not None:
+                disagree = abs(val_a - val_b)
+                if disagree > 1e-4:
+                    best_disagreement = disagree
+                    chosen_input = candidate_test_input
 
-        next_exp_rec = NextExperimentRecommendation(
-            recommended=True,
-            experiment_id=chosen_exp_id,
-            input_values=chosen_input,
-            justification=(
-                f"Candidate query distinguishes leading hypotheses '{top_a.hypothesis_id}' "
-                f"and '{top_b.hypothesis_id}' where their mathematical models diverge."
-            ),
-            selection_strategy=strategy,
-            predicted_disagreement=disagreement_score,
-        )
+        if chosen_input is not None and best_disagreement is not None and best_disagreement > 1e-4:
+            next_exp_rec = NextExperimentRecommendation(
+                recommended=True,
+                experiment_id=chosen_exp_id,
+                input_values=chosen_input,
+                justification=(
+                    f"Candidate query distinguishes leading hypotheses '{top_a.hypothesis_id}' "
+                    f"and '{top_b.hypothesis_id}' where their mathematical models diverge "
+                    f"(predicted disagreement: {best_disagreement:.4f})."
+                ),
+                selection_strategy=strategy,
+                predicted_disagreement=best_disagreement,
+            )
+        else:
+            justification = (
+                f"No validated recommendation is available: leading candidate models "
+                f"'{top_a.hypothesis_id}' and '{top_b.hypothesis_id}' do not exhibit significant "
+                "predicted disagreement at evaluated candidate inputs."
+                if observations and observations[0].input_values
+                else "No validated recommendation is available: no observations or candidate inputs exist to evaluate model disagreement."
+            )
+            next_exp_rec = NextExperimentRecommendation(
+                recommended=False,
+                experiment_id=None,
+                input_values=None,
+                justification=justification,
+                selection_strategy=None,
+                predicted_disagreement=None,
+            )
     else:
         next_exp_rec = NextExperimentRecommendation(
             recommended=False,

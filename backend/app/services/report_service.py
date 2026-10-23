@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import os
+import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
@@ -71,20 +72,43 @@ class ReportNotAvailableError(ReportServiceError):
 
 
 REPORTS_STORAGE_DIR = os.environ.get("CLARITY_REPORTS_DIR", "reports")
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _validate_safe_identifier(name: str, field_name: str = "identifier") -> str:
+    """Validate that an identifier contains no path traversal sequences or illegal characters."""
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Invalid {field_name}: must be a non-empty string.")
+    if ".." in name or "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError(f"Path traversal detected in {field_name}: '{name}'.")
+    if not SAFE_IDENTIFIER_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid characters in {field_name} '{name}': must be alphanumeric, hyphen, or underscore."
+        )
+    return name
 
 
 def _save_report_artifact(run_id: str, report_id: str, content: str) -> str:
     """Save report JSON artifact to disk and return relative artifact URI."""
+    _validate_safe_identifier(run_id, "run_id")
+    _validate_safe_identifier(report_id, "report_id")
+
+    base_dir = os.path.abspath(REPORTS_STORAGE_DIR)
+    filename = f"{run_id}_{report_id}.json"
+    filepath = os.path.abspath(os.path.join(base_dir, filename))
+
+    # Path traversal safety check: ensure target filepath is strictly within base_dir
+    if not filepath.startswith(base_dir + os.sep) and filepath != base_dir:
+        raise ValueError(f"Path traversal detected: path '{filepath}' is outside storage dir '{base_dir}'.")
+
     try:
-        os.makedirs(REPORTS_STORAGE_DIR, exist_ok=True)
-        filename = f"{run_id}_{report_id}.json"
-        filepath = os.path.join(REPORTS_STORAGE_DIR, filename)
+        os.makedirs(base_dir, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
         return f"reports/{filename}"
-    except Exception:
+    except (OSError, IOError):
         # Fall back to virtual relative URI if filesystem write fails (e.g. read-only env)
-        return f"reports/{run_id}_{report_id}.json"
+        return f"reports/{filename}"
 
 
 def _load_report_artifact(artifact_uri: str) -> Optional[Dict[str, Any]]:
@@ -94,9 +118,21 @@ def _load_report_artifact(artifact_uri: str) -> Optional[Dict[str, Any]]:
     try:
         norm_path = artifact_uri
         if norm_path.startswith("reports/"):
-            norm_path = os.path.join(REPORTS_STORAGE_DIR, norm_path[len("reports/"):])
-        if os.path.isfile(norm_path):
-            with open(norm_path, "r", encoding="utf-8") as f:
+            rel_name = norm_path[len("reports/"):]
+        else:
+            rel_name = norm_path
+
+        # Validate that rel_name does not traverse directories
+        if ".." in rel_name or "/" in rel_name or "\\" in rel_name or "\x00" in rel_name:
+            return None
+
+        base_dir = os.path.abspath(REPORTS_STORAGE_DIR)
+        full_path = os.path.abspath(os.path.join(base_dir, rel_name))
+        if not full_path.startswith(base_dir + os.sep):
+            return None
+
+        if os.path.isfile(full_path):
+            with open(full_path, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception:
         pass
@@ -125,41 +161,28 @@ def generate_report_service(
     if existing_report and existing_report.status == "generated" and not force_recompute:
         loaded = _load_report_artifact(existing_report.artifact_uri)
         if loaded:
-            # Reconstruct ScientificReport from saved JSON
             report_obj = _dict_to_scientific_report(loaded)
             return existing_report, report_obj
-
-    # 1. Load domain entities from database
-    # Hypotheses
-    hypotheses: List[HypothesisRepresentation] = []
-    for hyp in run.hypotheses:
-        if hyp.is_excluded:
-            continue
-        revisions = hyp.revisions
-        if not revisions:
-            continue
-        latest_rev = max(revisions, key=lambda r: r.revision_number)
-        parameters = dict(latest_rev.parameters or {})
-        if hyp.model_family == "polynomial":
-            parameters.setdefault("family", "polynomial")
-            parameters.setdefault("input_variable", "x")
-            parameters.setdefault("output_variable", "y")
-            parameters.setdefault("coefficient_order", "ascending")
-            if "degree" not in parameters and "coefficients" in parameters:
-                parameters["degree"] = max(0, len(parameters["coefficients"]) - 1)
-
-        candidate_repr = HypothesisRepresentation(
-            model_family=hyp.model_family,
-            formula=latest_rev.formula or f"Candidate {hyp.hypothesis_id}",
-            parameters=parameters,
-            complexity=latest_rev.complexity or 1,
-            hypothesis_id=hyp.hypothesis_id,
-            revision=latest_rev.revision_number,
-            status=HypothesisStatus.EVALUATED,
+        if existing_report.report_json:
+            report_obj = _dict_to_scientific_report(existing_report.report_json)
+            return existing_report, report_obj
+        # Fail explicitly rather than silently replacing historical reports
+        raise ReportNotAvailableError(
+            f"Historical report '{existing_report.report_id}' exists for run '{run_id}' but its artifact cannot be loaded. Historical reports are immutable and cannot be silently regenerated."
         )
-        hypotheses.append(candidate_repr)
 
-    # Observations
+    def _canonical_parameters(family_id: str, raw_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        params = dict(raw_params or {})
+        if family_id == "polynomial":
+            params.setdefault("family", "polynomial")
+            params.setdefault("input_variable", "x")
+            params.setdefault("output_variable", "y")
+            params.setdefault("coefficient_order", "ascending")
+            if "degree" not in params and "coefficients" in params:
+                params["degree"] = max(0, len(params["coefficients"]) - 1)
+        return params
+
+    # 1. Load domain observations
     sorted_obs = sorted(run.observations, key=lambda o: (o.sequence_number or 0, o.observation_id))
     domain_observations: List[Observation] = []
     training_ids: List[str] = []
@@ -186,64 +209,99 @@ def generate_report_service(
             )
         )
 
-    # Evaluations
+    # 2. Select deterministic latest eligible evaluation per hypothesis and bind exact revision
+    hypotheses: List[HypothesisRepresentation] = []
     evaluations_by_hyp: Dict[str, EvaluationResult] = {}
+
     for hyp in run.hypotheses:
+        if hyp.is_excluded:
+            continue
         revisions = hyp.revisions
         if not revisions:
             continue
-        latest_rev = max(revisions, key=lambda r: r.revision_number)
-        parameters = dict(latest_rev.parameters or {})
-        if hyp.model_family == "polynomial":
-            parameters.setdefault("family", "polynomial")
-            parameters.setdefault("input_variable", "x")
-            parameters.setdefault("output_variable", "y")
-            parameters.setdefault("coefficient_order", "ascending")
-            if "degree" not in parameters and "coefficients" in parameters:
-                parameters["degree"] = max(0, len(parameters["coefficients"]) - 1)
 
+        # Collect all (revision, evaluation) pairs
+        eval_pairs = []
         for rev in revisions:
             for ev in rev.evaluations:
-                status_enum = (
-                    EvaluationStatus.COMPLETED
-                    if ev.status == "completed"
-                    else EvaluationStatus.FAILED
+                eval_pairs.append((rev, ev))
+
+        # Deterministic ordering:
+        # 1. Latest revision number
+        # 2. Completed evaluation status preferred
+        # 3. Latest dataset version
+        # 4. Latest creation timestamp
+        # 5. Evaluation ID tie-break
+        if eval_pairs:
+            eval_pairs.sort(
+                key=lambda pair: (
+                    pair[0].revision_number,
+                    1 if pair[1].status == "completed" else 0,
+                    pair[1].dataset_version or 0,
+                    pair[1].evaluated_at.timestamp() if getattr(pair[1], "evaluated_at", None) else 0.0,
+                    pair[1].evaluation_id,
+                ),
+                reverse=True,
+            )
+            selected_rev, selected_ev = eval_pairs[0]
+        else:
+            selected_rev = max(revisions, key=lambda r: (r.revision_number, r.revision_id))
+            selected_ev = None
+
+        # Bind formula, parameters, and complexity to the EXACT selected revision
+        selected_params = _canonical_parameters(hyp.model_family, selected_rev.parameters)
+        candidate_repr = HypothesisRepresentation(
+            model_family=hyp.model_family,
+            formula=selected_rev.formula or f"Candidate {hyp.hypothesis_id}",
+            parameters=selected_params,
+            complexity=selected_rev.complexity or 1,
+            hypothesis_id=hyp.hypothesis_id,
+            revision=selected_rev.revision_number,
+            status=HypothesisStatus.EVALUATED if selected_ev else HypothesisStatus.PROPOSED,
+        )
+        hypotheses.append(candidate_repr)
+
+        if selected_ev is not None:
+            status_enum = (
+                EvaluationStatus.COMPLETED
+                if selected_ev.status == "completed"
+                else EvaluationStatus.FAILED
+            )
+            err = (
+                StructuredError(code="EVALUATION_FAILED", message=selected_ev.error_message)
+                if selected_ev.error_message
+                else (
+                    StructuredError(code="EVALUATION_FAILED", message="Evaluation failed")
+                    if status_enum == EvaluationStatus.FAILED
+                    else None
                 )
-                err = (
-                    StructuredError(code="EVALUATION_FAILED", message=ev.error_message)
-                    if ev.error_message
-                    else (
-                        StructuredError(code="EVALUATION_FAILED", message="Evaluation failed")
-                        if status_enum == EvaluationStatus.FAILED
-                        else None
-                    )
-                )
-                eval_res = EvaluationResult(
-                    evaluation_id=ev.evaluation_id,
-                    hypothesis_id=hyp.hypothesis_id,
-                    status=status_enum,
-                    metrics=ev.metrics or {},
-                    held_out_metrics=ev.held_out_metrics,
-                    sample_count=ev.sample_count or len(training_ids),
-                    held_out_sample_count=len(held_out_ids) if ev.held_out_metrics else None,
-                    error=err,
-                    model_family=hyp.model_family,
-                    fitted_specification=parameters,
-                    metric_version="1.0.0",
-                    metric_definitions={
-                        "mae": "Mean Absolute Error",
-                        "rmse": "Root Mean Squared Error",
-                        "r2": "R2 Score",
-                    },
-                    dataset_ids={
-                        "dataset_id": run_id,
-                        "observation_ids": training_ids,
-                        "training_observation_ids": training_ids,
-                        "held_out_observation_ids": held_out_ids,
-                    },
-                )
-                # Keep latest evaluation per hypothesis
-                evaluations_by_hyp[hyp.hypothesis_id] = eval_res
+            )
+            eval_res = EvaluationResult(
+                evaluation_id=selected_ev.evaluation_id,
+                hypothesis_id=hyp.hypothesis_id,
+                status=status_enum,
+                metrics=selected_ev.metrics or {},
+                held_out_metrics=selected_ev.held_out_metrics,
+                sample_count=selected_ev.sample_count or len(training_ids),
+                held_out_sample_count=len(held_out_ids) if selected_ev.held_out_metrics else None,
+                error=err,
+                model_family=hyp.model_family,
+                fitted_specification=selected_params,
+                metric_version="1.0.0",
+                metric_definitions={
+                    "mae": "Mean Absolute Error",
+                    "rmse": "Root Mean Squared Error",
+                    "r2": "R2 Score",
+                },
+                dataset_ids={
+                    "dataset_id": run_id,
+                    "dataset_version": selected_ev.dataset_version,
+                    "observation_ids": training_ids,
+                    "training_observation_ids": training_ids,
+                    "held_out_observation_ids": held_out_ids,
+                },
+            )
+            evaluations_by_hyp[hyp.hypothesis_id] = eval_res
 
     # Candidate Experiments
     experiments_data: List[Dict[str, Any]] = []
@@ -336,6 +394,7 @@ def generate_report_service(
         limitations="; ".join(scientific_report.limitations),
         artifact_uri=artifact_uri,
         generated_at=datetime.now(timezone.utc),
+        report_json=scientific_report.to_dict(),
     )
     repo.save_report(report_model)
 
@@ -394,13 +453,16 @@ def export_report_service(
         # Automatically generate report if none exists
         report_model, report_obj = generate_report_service(session, run_id, actor=actor)
     else:
-        # Load structured report from disk or reconstruct
+        # Load structured report from disk or fallback to canonical DB payload
         loaded = _load_report_artifact(report_model.artifact_uri)
         if loaded:
             report_obj = _dict_to_scientific_report(loaded)
+        elif report_model.report_json:
+            report_obj = _dict_to_scientific_report(report_model.report_json)
         else:
-            # Reconstruct via fresh generation
-            _, report_obj = generate_report_service(session, run_id, force_recompute=True, actor=actor)
+            raise ReportNotAvailableError(
+                f"Historical report '{report_model.report_id}' exists for run '{run_id}' but its artifact cannot be loaded. Historical reports are immutable and cannot be silently regenerated."
+            )
 
     format_norm = format_type.lower().strip()
     if format_norm in ("markdown", "md", "text/markdown"):
@@ -468,6 +530,32 @@ def _dict_to_scientific_report(d: Dict[str, Any]) -> ScientificReport:
 
     ranked_hypotheses: List[ReportHypothesis] = []
     for h in d.get("ranked_hypotheses", []):
+        sup_items = [
+            EvidenceItem(
+                observation_id=ei.get("observation_id", ""),
+                sequence_number=ei.get("sequence_number"),
+                input_values=ei.get("input_values", {}),
+                observed_value=ei.get("observed_value"),
+                predicted_value=ei.get("predicted_value"),
+                residual=ei.get("residual"),
+                is_held_out=bool(ei.get("is_held_out", False)),
+                tolerance=ei.get("tolerance"),
+            )
+            for ei in h.get("supporting_evidence", [])
+        ]
+        contra_items = [
+            EvidenceItem(
+                observation_id=ei.get("observation_id", ""),
+                sequence_number=ei.get("sequence_number"),
+                input_values=ei.get("input_values", {}),
+                observed_value=ei.get("observed_value"),
+                predicted_value=ei.get("predicted_value"),
+                residual=ei.get("residual"),
+                is_held_out=bool(ei.get("is_held_out", False)),
+                tolerance=ei.get("tolerance"),
+            )
+            for ei in h.get("contradicting_evidence", [])
+        ]
         ranked_hypotheses.append(
             ReportHypothesis(
                 rank=h.get("rank", 1),
@@ -488,8 +576,8 @@ def _dict_to_scientific_report(d: Dict[str, Any]) -> ScientificReport:
                 dataset_id=h.get("dataset_id"),
                 dataset_version=h.get("dataset_version"),
                 explanation=h.get("explanation", ""),
-                supporting_evidence=tuple(),
-                contradicting_evidence=tuple(),
+                supporting_evidence=tuple(sup_items),
+                contradicting_evidence=tuple(contra_items),
                 indeterminate_count=h.get("indeterminate_count", 0),
                 uncertainty_and_limitations=tuple(h.get("uncertainty_and_limitations", [])),
             )

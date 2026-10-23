@@ -47,8 +47,14 @@ from app.domain.report_exporters import (
     export_report_as_json,
     export_report_as_markdown,
 )
+import os
+from unittest.mock import patch
+
 from app.domain.report_generator import generate_scientific_report
 from app.services.report_service import (
+    ReportNotAvailableError,
+    _load_report_artifact,
+    _save_report_artifact,
     export_report_service,
     generate_report_service,
     get_report_service,
@@ -518,3 +524,436 @@ class TestReportApiEndpoints:
 
         res_exp = client.get("/api/v1/runs/non-existent-run/report/export")
         assert res_exp.status_code == 404
+
+
+class TestNextExperimentCalculation:
+    """Item 1: Next-experiment recommendation is calculated rather than fabricated."""
+
+    def test_candidates_agree_at_x5_yields_no_recommendation(self):
+        """When leading candidates agree at x=5, no distinguishing recommendation is available."""
+        # Candidate A: y = 2x + 1 -> at x=5, y=11
+        # Candidate B: y = x + 6  -> at x=5, y=11
+        cand_a = HypothesisRepresentation(
+            hypothesis_id="hyp-agree-a",
+            model_family="polynomial",
+            formula="y = 2.0*x + 1.0",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [1.0, 2.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        cand_b = HypothesisRepresentation(
+            hypothesis_id="hyp-agree-b",
+            model_family="polynomial",
+            formula="y = 1.0*x + 6.0",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [6.0, 1.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        eval_a = EvaluationResult(
+            evaluation_id="ev-agree-a",
+            hypothesis_id=cand_a.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.05, "rmse": 0.05, "r2": 0.95},
+            held_out_metrics=None,
+            sample_count=5,
+            model_family="polynomial",
+            fitted_specification=cand_a.parameters,
+        )
+        eval_b = EvaluationResult(
+            evaluation_id="ev-agree-b",
+            hypothesis_id=cand_b.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.06, "rmse": 0.06, "r2": 0.94},
+            held_out_metrics=None,
+            sample_count=5,
+            model_family="polynomial",
+            fitted_specification=cand_b.parameters,
+        )
+        obs = [
+            Observation(
+                observation_id="obs-1",
+                input_id="inp-1",
+                input_values={"x": 1.0},
+                output_values={"y": 3.0},
+                status=ObservationStatus.SUCCESS,
+                sequence_number=1,
+                is_held_out=False,
+            )
+        ]
+
+        report = generate_scientific_report(
+            run_id="run-agree-x5",
+            run_name="Candidates Agree at x=5",
+            domain="1d_polynomial",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+            run_status="completed",
+            stop_reason=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            budget_limits=None,
+            usage_data=None,
+            candidates=[cand_a, cand_b],
+            evaluations_by_hypothesis={cand_a.hypothesis_id: eval_a, cand_b.hypothesis_id: eval_b},
+            observations=obs,
+        )
+
+        assert report.next_experiment.recommended is False
+        assert report.next_experiment.predicted_disagreement is None
+        assert report.next_experiment.input_values is None
+        assert "do not exhibit significant predicted disagreement" in report.next_experiment.justification
+
+    def test_no_observations_yields_no_recommendation(self):
+        """When no observations or candidate inputs exist, no recommendation is made."""
+        cand_a = HypothesisRepresentation(
+            hypothesis_id="hyp-no-obs-a",
+            model_family="polynomial",
+            formula="y = 2.0*x + 1.0",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [1.0, 2.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        cand_b = HypothesisRepresentation(
+            hypothesis_id="hyp-no-obs-b",
+            model_family="polynomial",
+            formula="y = 3.0*x + 1.0",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [1.0, 3.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        eval_a = EvaluationResult(
+            evaluation_id="ev-no-obs-a",
+            hypothesis_id=cand_a.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.05, "rmse": 0.05, "r2": 0.95},
+            held_out_metrics=None,
+            sample_count=0,
+            model_family="polynomial",
+            fitted_specification=cand_a.parameters,
+        )
+        eval_b = EvaluationResult(
+            evaluation_id="ev-no-obs-b",
+            hypothesis_id=cand_b.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.06, "rmse": 0.06, "r2": 0.94},
+            held_out_metrics=None,
+            sample_count=0,
+            model_family="polynomial",
+            fitted_specification=cand_b.parameters,
+        )
+
+        report = generate_scientific_report(
+            run_id="run-no-obs",
+            run_name="No Observations Run",
+            domain="1d_polynomial",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+            run_status="completed",
+            stop_reason=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            budget_limits=None,
+            usage_data=None,
+            candidates=[cand_a, cand_b],
+            evaluations_by_hypothesis={cand_a.hypothesis_id: eval_a, cand_b.hypothesis_id: eval_b},
+            observations=[],
+            candidate_experiments=None,
+        )
+
+        assert report.next_experiment.recommended is False
+        assert report.next_experiment.predicted_disagreement is None
+        assert report.next_experiment.input_values is None
+        assert "no observations or candidate inputs exist" in report.next_experiment.justification
+
+    def test_candidate_experiment_verified_predicted_disagreement(self):
+        """Candidate experiments are scored and chosen by verified calculated disagreement."""
+        cand_a = HypothesisRepresentation(
+            hypothesis_id="hyp-exp-a",
+            model_family="polynomial",
+            formula="y = 2.0*x",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [0.0, 2.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        cand_b = HypothesisRepresentation(
+            hypothesis_id="hyp-exp-b",
+            model_family="polynomial",
+            formula="y = 1.0*x",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [0.0, 1.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        eval_a = EvaluationResult(
+            evaluation_id="ev-exp-a",
+            hypothesis_id=cand_a.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.05, "rmse": 0.05, "r2": 0.95},
+            held_out_metrics=None,
+            sample_count=2,
+            model_family="polynomial",
+            fitted_specification=cand_a.parameters,
+        )
+        eval_b = EvaluationResult(
+            evaluation_id="ev-exp-b",
+            hypothesis_id=cand_b.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.06, "rmse": 0.06, "r2": 0.94},
+            held_out_metrics=None,
+            sample_count=2,
+            model_family="polynomial",
+            fitted_specification=cand_b.parameters,
+        )
+        candidate_exps = [
+            {
+                "experiment_id": "exp-calc-10",
+                "proposed_input": {"x": 10.0},
+                "selection_rationale": {"strategy": "active_disagreement"},
+                "execution_status": "proposed",
+            }
+        ]
+
+        report = generate_scientific_report(
+            run_id="run-exp-calc",
+            run_name="Calculated Disagreement Run",
+            domain="1d_polynomial",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+            run_status="completed",
+            stop_reason=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            budget_limits=None,
+            usage_data=None,
+            candidates=[cand_a, cand_b],
+            evaluations_by_hypothesis={cand_a.hypothesis_id: eval_a, cand_b.hypothesis_id: eval_b},
+            observations=[],
+            candidate_experiments=candidate_exps,
+        )
+
+        assert report.next_experiment.recommended is True
+        # At x=10, cand_a predicts 20, cand_b predicts 10 -> disagreement is 10.0
+        assert report.next_experiment.predicted_disagreement == pytest.approx(10.0)
+        assert report.next_experiment.input_values == {"x": 10.0}
+        assert report.next_experiment.experiment_id == "exp-calc-10"
+
+
+class TestReportEvaluationProvenanceBinding:
+    """Item 2: Deterministic revision-to-evaluation provenance binding."""
+
+    def test_evaluation_provenance_strictly_matches_evaluated_revision(self, db_session):
+        """Selected evaluation must bind to the exact revision that was evaluated."""
+        run = RunModel(
+            run_id="run-prov-01",
+            name="Provenance Test Run",
+            domain="1d_polynomial",
+            status="completed",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+            stop_reason="target_accuracy_reached",
+        )
+        db_session.add(run)
+
+        # Hypothesis with 2 revisions:
+        # Revision 1: y = 1.0*x + 1.0 (older, dataset_version=2, mae=0.5)
+        # Revision 2: y = 3.0*x + 2.0 (latest, dataset_version=5, mae=0.01)
+        hyp = HypothesisModel(
+            hypothesis_id="hyp-prov-1",
+            run_id=run.run_id,
+            model_family="polynomial",
+            current_revision=2,
+        )
+        db_session.add(hyp)
+
+        r1 = HypothesisRevisionModel(
+            revision_id="rev-prov-1",
+            hypothesis_id=hyp.hypothesis_id,
+            revision_number=1,
+            formula="y = 1.0*x + 1.0",
+            parameters={"coefficients": [1.0, 1.0], "degree": 1},
+            complexity=2,
+        )
+        db_session.add(r1)
+        ev1 = EvaluationResultModel(
+            evaluation_id="ev-prov-rev1",
+            revision_id=r1.revision_id,
+            run_id=run.run_id,
+            status="completed",
+            sample_count=2,
+            dataset_version=2,
+            metrics={"mae": 0.5, "rmse": 0.5, "r2": 0.5},
+            held_out_metrics=None,
+        )
+        db_session.add(ev1)
+
+        r2 = HypothesisRevisionModel(
+            revision_id="rev-prov-2",
+            hypothesis_id=hyp.hypothesis_id,
+            revision_number=2,
+            formula="y = 3.0*x + 2.0",
+            parameters={"coefficients": [2.0, 3.0], "degree": 1},
+            complexity=2,
+        )
+        db_session.add(r2)
+        ev2 = EvaluationResultModel(
+            evaluation_id="ev-prov-rev2",
+            revision_id=r2.revision_id,
+            run_id=run.run_id,
+            status="completed",
+            sample_count=5,
+            dataset_version=5,
+            metrics={"mae": 0.01, "rmse": 0.01, "r2": 0.99},
+            held_out_metrics=None,
+        )
+        db_session.add(ev2)
+        db_session.flush()
+
+        model, report = generate_report_service(db_session, run.run_id)
+        assert len(report.ranked_hypotheses) == 1
+        rep_hyp = report.ranked_hypotheses[0]
+
+        # Verify that revision, formula, parameters, evaluation_id, and dataset_version all agree
+        assert rep_hyp.revision_number == 2
+        assert rep_hyp.formula == "y = 3.0*x + 2.0"
+        assert rep_hyp.evaluation_id == "ev-prov-rev2"
+        assert list(rep_hyp.parameters["coefficients"]) == [2.0, 3.0]
+        assert rep_hyp.dataset_version == 5
+        assert rep_hyp.training_score == pytest.approx(0.01)
+
+
+class TestEvidenceCollectionErrorHandling:
+    """Item 3: Evidence collection failure is not silently swallowed."""
+
+    def test_evidence_collection_failure_records_explicit_limitation(self):
+        """When collect_evidence raises an error, an explicit limitation is recorded and logged safely."""
+        cand = HypothesisRepresentation(
+            hypothesis_id="hyp-ev-err",
+            model_family="polynomial",
+            formula="y = 2.0*x + 1.0",
+            parameters={"family": "polynomial", "degree": 1, "coefficients": [1.0, 2.0]},
+            complexity=2,
+            revision=1,
+            status=HypothesisStatus.EVALUATED,
+        )
+        eval_res = EvaluationResult(
+            evaluation_id="ev-err-1",
+            hypothesis_id=cand.hypothesis_id,
+            status=EvaluationStatus.COMPLETED,
+            metrics={"mae": 0.05, "rmse": 0.05, "r2": 0.95},
+            held_out_metrics=None,
+            sample_count=2,
+            model_family="polynomial",
+            fitted_specification=cand.parameters,
+        )
+        obs = [
+            Observation(
+                observation_id="obs-err-1",
+                input_id="inp-1",
+                input_values={"x": 1.0},
+                output_values={"y": 3.0},
+                status=ObservationStatus.SUCCESS,
+                sequence_number=1,
+                is_held_out=False,
+            )
+        ]
+
+        with patch("app.domain.report_generator.collect_evidence", side_effect=RuntimeError("Residual stream auth_token=SECRET123 failed")):
+            report = generate_scientific_report(
+                run_id="run-ev-err",
+                run_name="Evidence Error Run",
+                domain="1d_polynomial",
+                execution_mode="local",
+                sampling_strategy="active_disagreement",
+                run_status="completed",
+                stop_reason=None,
+                created_at=None,
+                started_at=None,
+                completed_at=None,
+                budget_limits=None,
+                usage_data=None,
+                candidates=[cand],
+                evaluations_by_hypothesis={cand.hypothesis_id: eval_res},
+                observations=obs,
+            )
+
+        rep_hyp = report.ranked_hypotheses[0]
+        # Must record sanitized limitation
+        assert any("Evidence generation failed" in lim for lim in rep_hyp.uncertainty_and_limitations)
+        assert any("Evidence Generation Notice" in lim for lim in report.limitations)
+        # Verify secret was sanitized
+        for lim in report.limitations:
+            assert "SECRET123" not in lim
+
+
+class TestReportIdempotencyAndDiskArtifactResilience:
+    """Item 4: Historical report idempotency and database persistence."""
+
+    def test_missing_disk_artifact_uses_database_canonical_report(self, db_session):
+        """When disk artifact is deleted, report is reconstituted from database without replacing history."""
+        run = _populate_completed_run(db_session, "run-resilient-01")
+        model_1, rep_1 = generate_report_service(db_session, run.run_id)
+        initial_report_id = model_1.report_id
+        initial_timestamp = model_1.generated_at
+
+        # Verify artifact file exists on disk
+        artifact_path = os.path.join("reports", f"{run.run_id}_{initial_report_id}.json")
+        assert os.path.exists(artifact_path)
+        # Delete disk artifact to simulate missing/unreadable file
+        os.remove(artifact_path)
+        assert not os.path.exists(artifact_path)
+
+        # Call generate_report_service again - must NOT replace history!
+        model_2, rep_2 = generate_report_service(db_session, run.run_id)
+        assert model_2.report_id == initial_report_id
+        assert model_2.generated_at == initial_timestamp
+        assert rep_2.report_id == initial_report_id
+
+    def test_missing_disk_artifact_and_db_json_fails_explicitly(self, db_session):
+        """When neither disk artifact nor database payload is available, fail explicitly."""
+        run = _populate_completed_run(db_session, "run-corrupted-01")
+        # Save a corrupted report model with no JSON and non-existent artifact
+        corrupt_report = ReportModel(
+            report_id="rep-corrupt-01",
+            run_id=run.run_id,
+            status="generated",
+            ranked_candidates=[],
+            artifact_uri="reports/does_not_exist_9999.json",
+            report_json=None,
+        )
+        db_session.add(corrupt_report)
+        db_session.flush()
+
+        with pytest.raises(ReportNotAvailableError, match="cannot be loaded"):
+            generate_report_service(db_session, run.run_id)
+
+
+class TestReportArtifactPathSafety:
+    """Item 5: Path safety and path traversal rejection."""
+
+    def test_save_report_artifact_rejects_path_traversal(self):
+        """_save_report_artifact rejects attempts to traverse out of the report storage directory."""
+        with pytest.raises(ValueError, match="Path traversal detected|Invalid run_id"):
+            _save_report_artifact("../../etc/passwd", "rep-evil-1", "{}")
+
+        with pytest.raises(ValueError, match="Path traversal detected|Invalid run_id"):
+            _save_report_artifact("run-1/sub", "rep-evil-1", "{}")
+
+        with pytest.raises(ValueError, match="Path traversal detected|Invalid run_id"):
+            _save_report_artifact("run-1\\sub", "rep-evil-1", "{}")
+
+        with pytest.raises(ValueError, match="Path traversal detected|Invalid report_id"):
+            _save_report_artifact("run-safe-01", "../evil-rep", "{}")
+
+    def test_load_report_artifact_safely_rejects_traversal(self):
+        """_load_report_artifact returns None on path traversal inputs."""
+        assert _load_report_artifact("../../etc/passwd") is None
+        assert _load_report_artifact("reports/../../../etc/passwd") is None
+
