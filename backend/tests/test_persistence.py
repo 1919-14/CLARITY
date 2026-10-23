@@ -681,3 +681,129 @@ def test_list_observations_for_run_pagination_and_count(repo):
     training_page = repo.list_observations_for_run("run-paged-obs", only_training=True, limit=5, offset=5)
     assert len(training_page) == 3  # only 8 total training (items 6, 7, 8)
     assert all(not o.is_held_out for o in training_page)
+
+
+def test_alembic_migration_reports_report_json_incremental(tmp_path):
+    """Verify incremental migration adding report_json to reports table against an existing schema.
+
+    Tests that:
+    1. A database at prior head 'f7a8b9c0d1e2' has the reports table without report_json.
+    2. Existing records inserted prior to migration persist safely.
+    3. Upgrading to 'head' (b3c4d5e6f7a8) adds report_json without data loss.
+    4. ORM queries with ReportModel succeed on pre-existing rows (report_json is None).
+    5. New updates and inserts can store and retrieve JSON data in report_json.
+    6. Downgrading to 'f7a8b9c0d1e2' cleanly drops report_json while retaining rows.
+    """
+    import pathlib
+    import sqlite3
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from app.adapters.persistence.models import ReportModel
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent.parent
+    ini_path = repo_root / "alembic.ini"
+    migrations_dir = repo_root / "backend" / "migrations"
+
+    db_file = tmp_path / "incremental_migration.db"
+    db_url = f"sqlite:///{db_file}"
+
+    cfg = Config(str(ini_path))
+    cfg.set_main_option("script_location", str(migrations_dir))
+    cfg.set_main_option("sqlalchemy.url", db_url)
+
+    # 1. Upgrade up to prior revision f7a8b9c0d1e2 (before report_json)
+    command.upgrade(cfg, "f7a8b9c0d1e2")
+
+    # Verify report_json does NOT exist at f7a8b9c0d1e2
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(reports);")
+    columns_before = {row[1] for row in cursor.fetchall()}
+    assert "report_id" in columns_before
+    assert "run_id" in columns_before
+    assert "report_json" not in columns_before
+
+    # Insert a run and a report record directly into the existing schema
+    cursor.execute(
+        "INSERT INTO runs (run_id, name, domain, status, execution_mode, sampling_strategy, created_at) "
+        "VALUES ('run-mig-01', 'Migration Test Run', 'test_domain', 'active', 'autonomous', 'active_learning', '2026-10-24 00:00:00');"
+    )
+    cursor.execute(
+        "INSERT INTO reports (report_id, run_id, status, generated_at, ranked_candidates, stop_reason, limitations) "
+        "VALUES ('rep-mig-01', 'run-mig-01', 'generated', '2026-10-24 00:00:00', '[]', 'max_queries', 'None');"
+    )
+    conn.commit()
+    conn.close()
+
+    # 2. Upgrade to head (b3c4d5e6f7a8) which introduces report_json
+    command.upgrade(cfg, "head")
+
+    # Verify column now exists in reports
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(reports);")
+    columns_after = {row[1]: row for row in cursor.fetchall()}
+    assert "report_json" in columns_after
+    conn.close()
+
+    # 3. Test ORM access against the migrated database
+    engine = create_engine(db_url)
+    with Session(engine) as session:
+        # Pre-existing report must load successfully via ORM without column-missing errors
+        existing_report = session.get(ReportModel, "rep-mig-01")
+        assert existing_report is not None
+        assert existing_report.run_id == "run-mig-01"
+        assert existing_report.status == "generated"
+        assert existing_report.report_json is None
+
+        # Update existing report with report_json
+        canonical_payload = {
+            "summary": "Updated canonical report after migration",
+            "findings": ["Hypothesis A fits data"],
+        }
+        existing_report.report_json = canonical_payload
+        session.commit()
+
+        # Re-fetch and verify persistence
+        session.expire_all()
+        refetched = session.get(ReportModel, "rep-mig-01")
+        assert refetched.report_json == canonical_payload
+
+        # Insert a new report with report_json populated
+        new_report = ReportModel(
+            report_id="rep-mig-02",
+            run_id="run-mig-01",
+            status="generated",
+            ranked_candidates=[],
+            stop_reason="target_accuracy_reached",
+            report_json={"summary": "New report", "target_degree": 2},
+        )
+        session.add(new_report)
+        session.commit()
+
+        session.expire_all()
+        fetched_new = session.get(ReportModel, "rep-mig-02")
+        assert fetched_new is not None
+        assert fetched_new.report_json == {"summary": "New report", "target_degree": 2}
+
+    engine.dispose()
+
+    # 4. Downgrade back to f7a8b9c0d1e2
+    command.downgrade(cfg, "f7a8b9c0d1e2")
+
+    # Verify report_json is removed and existing row still preserved
+    conn = sqlite3.connect(str(db_file))
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(reports);")
+    columns_downgraded = {row[1] for row in cursor.fetchall()}
+    assert "report_json" not in columns_downgraded
+    assert "report_id" in columns_downgraded
+
+    cursor.execute("SELECT report_id, status FROM reports WHERE report_id = 'rep-mig-01';")
+    row = cursor.fetchone()
+    assert row is not None
+    assert row[0] == "rep-mig-01"
+    conn.close()
+
