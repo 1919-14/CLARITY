@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { formatCost, formatSeconds, formatLimit, loadBudget } from './budgetUtils';
 import './App.css';
 
 function App() {
@@ -90,20 +91,6 @@ function App() {
     setCheckTrigger((prev) => prev + 1);
   };
 
-  const formatCost = (value) =>
-    value === null || value === undefined ? 'Unavailable' : `$${Number(value).toFixed(4)}`;
-
-  const formatSeconds = (value) =>
-    value === null || value === undefined ? 'Not measurable' : `${Math.round(value)} s`;
-
-  const formatLimit = (entry) => {
-    if (!entry) return 'Unavailable';
-    if (entry.limit === null || entry.limit === undefined) {
-      return `${entry.used} used · no limit`;
-    }
-    return `${entry.used} / ${entry.limit}`;
-  };
-
   const handleLoadBudget = async (e) => {
     e.preventDefault();
     const requestedRunId = runId.trim();
@@ -113,28 +100,13 @@ function App() {
     setBudgetError(null);
     setBudget(null);
 
-    const normalizedUrl = activeUrl.replace(/\/+$/, '');
-    const endpoint = `${normalizedUrl}/api/v1/runs/${encodeURIComponent(requestedRunId)}/budget`;
-
-    try {
-      const response = await fetch(endpoint, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-      });
-      const json = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(json?.message || `HTTP Error ${response.status}: ${response.statusText}`);
-      }
-      if (!json || !json.budget) {
-        throw new Error('Unexpected budget response from the backend.');
-      }
-      setBudget(json.budget);
+    const result = await loadBudget(activeUrl, requestedRunId);
+    if (result.state === 'loaded') {
+      setBudget(result.budget);
       setBudgetState('loaded');
-    } catch (err) {
+    } else {
       setBudgetState('error');
-      setBudgetError(
-        err instanceof Error ? err.message : 'Unable to load the run budget.'
-      );
+      setBudgetError(result.error);
     }
   };
 
