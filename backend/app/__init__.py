@@ -54,12 +54,19 @@ def create_app(config_name=None):
     app.register_blueprint(runs_bp, url_prefix="/api")
 
     # Versioned /api/v1 routes
-    from .routes.v1 import health_v1_bp, runs_v1_bp, hypotheses_v1_bp, observations_v1_bp
+    from .routes.v1 import (
+        health_v1_bp,
+        runs_v1_bp,
+        hypotheses_v1_bp,
+        observations_v1_bp,
+        benchmarks_v1_bp,
+    )
 
     app.register_blueprint(health_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(runs_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(hypotheses_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(observations_v1_bp, url_prefix="/api/v1")
+    app.register_blueprint(benchmarks_v1_bp, url_prefix="/api/v1")
 
     # Error handlers returning consistent JSON payloads
     @app.errorhandler(404)

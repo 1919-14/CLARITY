@@ -4,8 +4,9 @@ Implements OracleInterface using standard mathematical functions while strictly
 keeping secret coefficients inside private attributes inaccessible to standard inspection.
 """
 
-from typing import Dict, Any, Optional
 import math
+import random
+from typing import Dict, Any, Optional
 from ...domain.contracts import (
     OracleInterface,
     ExperimentInput,
@@ -34,11 +35,14 @@ class PolynomialLocalOracle(OracleInterface):
         max_x: float = 10.0,
         coefficients: Optional[Dict[str, float]] = None,
         noise_std: float = 0.0,
+        seed: Optional[int] = None,
     ):
         self._domain = domain_name
         self._min_x = min_x
         self._max_x = max_x
         self._noise_std = noise_std
+        self._seed = seed
+        self._rng = random.Random(seed) if seed is not None else random.Random()
         # Hidden ground-truth rule (kept isolated)
         self.__coefficients = coefficients or {
             "w3": 0.5,
@@ -111,6 +115,8 @@ class PolynomialLocalOracle(OracleInterface):
         # Optional deterministic noise metadata representation
         noise_info = None
         if self._noise_std > 0.0:
+            noise_val = self._rng.gauss(0.0, self._noise_std)
+            y += noise_val
             noise_info = {"noise_std": self._noise_std, "distribution": "gaussian"}
 
         return Observation(
