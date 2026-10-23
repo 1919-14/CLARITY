@@ -7,6 +7,7 @@ Operates on the evaluator side of the trust boundary:
 - Guarantees zero leakage of evaluator secrets into discovery-facing objects.
 """
 
+import json
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from sqlalchemy.orm import Session
 
@@ -76,15 +77,30 @@ def _inspect_metadata_node(
                 )
         # Check if string contains serialized target coefficients or parameters
         if ground_truth.target_parameters:
-            import json
+            serialized_targets: List[str] = []
             try:
-                params_repr = json.dumps(ground_truth.target_parameters, sort_keys=True).replace(" ", "").lower()
-                if len(params_repr) > 5 and params_repr in node.replace(" ", "").lower():
+                serialized_targets.append(
+                    json.dumps(ground_truth.target_parameters, sort_keys=True).replace(" ", "").lower()
+                )
+            except (TypeError, ValueError):
+                pass
+
+            if isinstance(ground_truth.target_parameters, Mapping):
+                coeffs = ground_truth.target_parameters.get("coefficients")
+                if coeffs:
+                    try:
+                        serialized_targets.append(
+                            json.dumps(coeffs, sort_keys=True).replace(" ", "").lower()
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+            node_normalized = node.replace(" ", "").lower()
+            for s_target in serialized_targets:
+                if len(s_target) > 5 and s_target in node_normalized:
                     raise ValueError(
                         f"Unsafe metadata value at '{path}': contains secret target parameters."
                     )
-            except Exception:
-                pass
     elif isinstance(node, (int, float)) and not isinstance(node, bool):
         if ground_truth.secret_seed is not None and int(node) == int(ground_truth.secret_seed):
             raise ValueError(

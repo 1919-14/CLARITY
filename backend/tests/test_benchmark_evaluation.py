@@ -764,6 +764,51 @@ class TestTrustBoundaryIsolation:
                 custom_metadata={"deep": {"nested": {"oracle_internal_code": "SECRET"}}},
             )
 
+    def test_adversarial_metadata_rejected_with_serialized_target_parameters(self, db_session):
+        """P2 Regression: Serialized target-parameter object in normal metadata string must not be swallowed."""
+        repo = ClarityRepository(db_session)
+        now = datetime.now(timezone.utc)
+        run = RunModel(
+            run_id="run-adv-params-json",
+            name="Adversarial Params JSON Run",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        # Uses completely benign key "run_notes", with no forbidden key substring, no formula string, and no seed
+        serialized_params = json.dumps(LINEAR_BENCHMARK.ground_truth.target_parameters, sort_keys=True)
+        with pytest.raises(ValueError, match="secret target parameters"):
+            run_benchmark_evaluation(
+                session=db_session,
+                run_id="run-adv-params-json",
+                ground_truth=LINEAR_BENCHMARK.ground_truth,
+                custom_metadata={"run_notes": f"Recorded evaluation against parameters: {serialized_params}"},
+            )
+
+    def test_adversarial_metadata_rejected_with_serialized_target_coefficients(self, db_session):
+        """P2 Regression: Serialized target coefficients dictionary in normal metadata string must be rejected."""
+        repo = ClarityRepository(db_session)
+        now = datetime.now(timezone.utc)
+        run = RunModel(
+            run_id="run-adv-coeffs-json",
+            name="Adversarial Coeffs JSON Run",
+            domain="polynomial",
+            status="completed",
+            created_at=now,
+        )
+        repo.create_run(run)
+
+        serialized_coeffs = json.dumps(LINEAR_BENCHMARK.ground_truth.target_parameters["coefficients"], sort_keys=True)
+        with pytest.raises(ValueError, match="secret target parameters"):
+            run_benchmark_evaluation(
+                session=db_session,
+                run_id="run-adv-coeffs-json",
+                ground_truth=LINEAR_BENCHMARK.ground_truth,
+                custom_metadata={"summary_info": f"Candidate compared with {serialized_coeffs}"},
+            )
+
     def test_api_rejects_unsafe_metadata(self, client, app):
         """Requirement 5: API returns 400 and does not persist unsafe metadata."""
         db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
@@ -789,3 +834,15 @@ class TestTrustBoundaryIsolation:
         )
         assert res.status_code == 400
         assert "Unsafe metadata" in res.get_json()["message"]
+
+        # Also verify API rejects metadata containing serialized target parameters in benign field
+        serialized_params = json.dumps(LINEAR_BENCHMARK.ground_truth.target_parameters, sort_keys=True)
+        res2 = client.post(
+            "/api/v1/runs/run-api-unsafe-meta/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "metadata": {"description": f"Details: {serialized_params}"},
+            },
+        )
+        assert res2.status_code == 400
+        assert "secret target parameters" in res2.get_json()["message"]

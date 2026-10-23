@@ -574,7 +574,7 @@ class TestRunBenchmarks:
         assert "Field 'benchmark_case' is required" in res.get_json()["message"]
 
     def test_post_benchmark_rejects_unsafe_metadata(self, client):
-        """Requirement 5: API rejects metadata containing secret seed or forbidden keys."""
+        """Requirement 5: API rejects metadata containing secret seed, forbidden keys, or serialized parameters."""
         run = _make_run(client, "Unsafe Meta Run")
         res = client.post(
             f"/api/v1/runs/{run['run_id']}/benchmarks",
@@ -585,6 +585,17 @@ class TestRunBenchmarks:
         )
         assert res.status_code == 400
         assert "Unsafe metadata" in res.get_json()["message"]
+
+        # P2 Regression: Normal metadata field with serialized target parameters must be rejected, not swallowed
+        res2 = client.post(
+            f"/api/v1/runs/{run['run_id']}/benchmarks",
+            json={
+                "benchmark_case": "polynomial_linear_benchmark",
+                "metadata": {"notes": 'Target parameters: {"coefficients": {"c0": 1.0, "c1": 2.0}, "degree": 1}'},
+            },
+        )
+        assert res2.status_code == 400
+        assert "secret target parameters" in res2.get_json()["message"]
 
 
 # ---------------------------------------------------------------------------
