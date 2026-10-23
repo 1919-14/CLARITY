@@ -23,7 +23,7 @@ RunLifecycleManager. No business logic lives here.
 import uuid
 from typing import Optional
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
@@ -48,6 +48,10 @@ from ...services.hypothesis_service import (
     HypothesisBudgetExhaustedError,
     HypothesisNotFoundError,
     propose_hypothesis_service,
+)
+from ...services.report_service import (
+    export_report_service,
+    generate_report_service,
 )
 from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
@@ -544,6 +548,75 @@ def get_run_report(run_id: str):
         return error_response("An internal error occurred while retrieving the report.", 500)
 
     return jsonify({"report": serialized}), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/report", methods=["POST"])
+def generate_run_report_endpoint(run_id: str):
+    """POST /api/v1/runs/<run_id>/report — Generate or update a scientific report for the run."""
+    force_recompute = False
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        if isinstance(data, dict):
+            force_recompute = bool(data.get("force_recompute", False))
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            report_model, _ = generate_report_service(
+                session=session,
+                run_id=run_id,
+                force_recompute=force_recompute,
+            )
+            serialized = serialize_report(report_model)
+    except RunNotFoundError as exc:
+        return error_response(str(exc), 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("generate_run_report db error", exc)
+        return error_response("An internal error occurred while generating the report.", 500)
+
+    return jsonify({
+        "report": serialized,
+        "message": "Report generated successfully.",
+    }), 201
+
+
+@runs_v1_bp.route("/runs/<run_id>/report/export", methods=["GET"])
+def export_run_report_endpoint(run_id: str):
+    """GET /api/v1/runs/<run_id>/report/export — Export scientific report as JSON or Markdown."""
+    format_param = request.args.get("format", "").strip()
+    if not format_param:
+        accept_hdr = request.headers.get("Accept", "")
+        if "text/markdown" in accept_hdr:
+            format_param = "markdown"
+        else:
+            format_param = "json"
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            content, mime_type = export_report_service(
+                session=session,
+                run_id=run_id,
+                format_type=format_param,
+            )
+    except RunNotFoundError as exc:
+        return error_response(str(exc), 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("export_run_report db error", exc)
+        return error_response("An internal error occurred while exporting the report.", 500)
+
+    ext = "md" if "markdown" in mime_type else "json"
+    filename = f"report_{run_id}.{ext}"
+    return Response(
+        content,
+        mimetype=mime_type,
+        headers={"Content-Disposition": f"inline; filename={filename}"},
+    )
 
 
 @runs_v1_bp.route("/runs/<run_id>/benchmarks", methods=["GET"])
