@@ -10,6 +10,7 @@ from flask import jsonify
 from ...adapters.persistence.models import (
     AuditEventModel,
     BenchmarkResultModel,
+    ComputeTaskModel,
     EvaluationResultModel,
     HypothesisModel,
     HypothesisRevisionModel,
@@ -130,6 +131,8 @@ def serialize_hypothesis(
         "run_id": hyp.run_id,
         "model_family": hyp.model_family,
         "current_revision": hyp.current_revision,
+        "version": getattr(hyp, "version", 1) or 1,
+        "version_token": getattr(hyp, "version_token", None) or f"vt-{hyp.hypothesis_id}-1",
         "is_pinned": hyp.is_pinned,
         "is_excluded": hyp.is_excluded,
         "created_at": hyp.created_at.isoformat() if hyp.created_at else None,
@@ -137,6 +140,7 @@ def serialize_hypothesis(
         "latest_revision": serialize_revision(latest_rev) if latest_rev else None,
         "latest_evaluation": latest_eval,
     }
+
     if include_revisions:
         result["revisions"] = [serialize_revision(r) for r in revisions]
     return result
@@ -221,30 +225,40 @@ def serialize_usage(usage: Optional[UsageRecordModel]) -> Dict[str, Any]:
     }
 
 
+def serialize_audit_event(event: AuditEventModel) -> Dict[str, Any]:
+    """Serialize an immutable audit event."""
+    return {
+        "event_id": event.event_id,
+        "run_id": event.run_id,
+        "event_type": event.event_type,
+        "actor": event.actor,
+        "metadata": event.metadata_json or {},
+        "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+    }
+
+
+def serialize_task(task: ComputeTaskModel) -> Dict[str, Any]:
+    """Serialize a compute task record."""
+    return {
+        "task_id": task.task_id,
+        "run_id": task.run_id,
+        "candidate_id": task.candidate_id,
+        "execution_mode": task.execution_mode,
+        "provider_task_id": task.provider_task_id,
+        "status": task.status,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "duration_ms": task.duration_ms,
+        "error_metadata": sanitize_metadata(task.error_metadata) if task.error_metadata else None,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Safe structured logging (redacts DSN credentials, secrets, passwords)
 # ---------------------------------------------------------------------------
 
-import re
-
-_REDACTION_PATTERNS = [
-    # Redact URI credentials: ://user:password@ -> ://user:***@
-    (re.compile(r"://([^:@/\s]+):([^@/\s]+)@", re.IGNORECASE), r"://\1:***@"),
-    # Redact password/token/key in query strings: ?password=secret or &token=secret
-    (re.compile(r"([?&](?:password|token|api_key|secret)=)[^&\s]+", re.IGNORECASE), r"\1***"),
-    # Redact password / secret assignments with quotes or whitespace: password='xyz' or password="xyz"
-    (re.compile(r"""(password|passwd|secret|token|api_key|ground_truth)['"]?\s*[:=]\s*(?:'[^']*'|"[^"]*"|[^\s,;)]+)""", re.IGNORECASE), r"\1=***"),
-    # Redact parameters / DSN key-value pairs: pwd=..., secret=...
-    (re.compile(r"\b(pwd|password)\s*=\s*[^\s,)]+", re.IGNORECASE), r"\1=***"),
-]
-
-
-def sanitize_exception_text(text: str) -> str:
-    """Redact connection strings, credentials, and sensitive parameters from exception messages."""
-    sanitized = str(text)
-    for pattern, replacement in _REDACTION_PATTERNS:
-        sanitized = pattern.sub(replacement, sanitized)
-    return sanitized
+from ...domain.sanitization import sanitize_exception_text, sanitize_metadata
 
 
 def log_safe_error(context: str, exc: Exception, logger=None) -> None:
