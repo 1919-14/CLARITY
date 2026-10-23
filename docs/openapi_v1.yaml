@@ -1350,7 +1350,7 @@ components:
 
     HypothesisRevision:
       type: object
-      required: [revision_id, revision_number, formula, parameters, complexity, creation_source, created_at]
+      required: [revision_id, revision_number, formula, parameters, complexity, model_family, creation_source, created_at]
       properties:
         revision_id:
           type: string
@@ -1358,6 +1358,15 @@ components:
         revision_number:
           type: integer
           example: 1
+        model_family:
+          type: string
+          nullable: true
+          description: >-
+            Effective, validated model family this revision was created under.
+            This is the family evaluation replays; the parent hypothesis's
+            model_family is a current-state projection. Null only for revisions
+            written before the column existed (the migration backfills them).
+          example: polynomial
         formula:
           type: string
           example: y = 0.5x^2 - 1.0

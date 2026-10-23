@@ -129,6 +129,7 @@ Table: `hypothesis_revisions` (immutable).
 | `formula` | Validated expression exactly as recorded. |
 | `parameters` | Canonical parameter/coefficient mapping (family, degree, coefficients, variables). |
 | `complexity` | Recorded complexity at that revision. |
+| `model_family` | Effective, validated model family this revision was created under (`polynomial` today). This is the family evaluation replays; see §6. |
 | `creation_source` | `researcher`, `generator`, `refit`, `restoration`. |
 | `previous_revision_id` | Reference to the preceding revision, `null` for revision 1. |
 | `change_reason` | Optional explanation supplied by the researcher. |
@@ -152,6 +153,10 @@ Table: `hypothesis_revisions` (immutable).
   stored formula; `formula`-only edits derive canonical coefficients from the new
   expression instead of inheriting stale ones.
 - Validation happens **before** any write, so a rejected edit leaves no revision and no event.
+- The requested `model_family` is validated and stored on the revision in canonical form.
+  An edit that omits it inherits the family of the revision it extends (not the mutable
+  hypothesis field), so replaying an edit resolves the same family it did the first time.
+  `hypotheses.model_family` follows the newest revision as a current-state projection.
 - An edit that would not change the definition (same formula, parameters and complexity) is
   rejected with `422` rather than producing a meaningless revision.
 - Optimistic concurrency: pass `expected_revision` or `expected_version_token`; a mismatch
@@ -175,7 +180,7 @@ and do not change any stored evaluation.
 
 | Concept | Stored in | Changes when | Historical? |
 |---|---|---|---|
-| Scientific definition | `hypothesis_revisions` | A new edit is committed | Immutable; every revision retained |
+| Scientific definition | `hypothesis_revisions` (formula, parameters, complexity, `model_family`) | A new edit is committed | Immutable; every revision retained |
 | Evaluation snapshot | `evaluation_results` | Each evaluation/re-evaluation | Append-only; earlier rows never updated |
 | Lifecycle / presentation | `hypotheses.is_pinned`, `hypotheses.is_excluded`, `version` | Researcher flag toggle | Transitions recorded as audit events |
 
@@ -234,6 +239,23 @@ Properties:
 
 `dataset_version` and `sample_count` remain descriptive only. A count alone is never treated
 as dataset identity.
+
+### Model family provenance
+
+Evaluation builds its `HypothesisRepresentation` from the revision it is evaluating: the
+revision's own `formula`, `parameters`, `complexity` **and** `model_family`
+(`_execute_pipeline_for_revision`). `hypotheses.model_family` is a current-state/display
+projection and is never read as the evaluated family by the normal path. Only revisions
+written before the column existed fall back to the parent hypothesis value, which the
+migration backfills in canonical form from that same parent.
+
+Consequences:
+
+- A revision request that changes the family is recorded on the revision, so the evaluation
+  and the history record name the same family.
+- Editing the hypothesis later cannot retroactively change the family a past evaluation used.
+- The family is part of the revision request fingerprint, so reusing an idempotency key with
+  a different family is still a `409`, not a replay.
 
 ### Pending evaluations
 
@@ -443,6 +465,11 @@ oracle internals, or unvalidated provider metadata.
 10. **A lost write race rolls back the caller's transaction.** `revise_hypothesis_service`
     rolls back on a database conflict before raising, so compose it in its own transaction
     (as the API routes do) rather than inside a larger unit of work.
+11. **Revision families are stored canonically, not verbatim.** Revisions keep the validated
+    family (`polynomial`), so an alias such as `linear` or `1d_polynomial` is not preserved
+    as typed on the revision. `hypotheses.model_family` retains the submitted spelling until
+    the next revision. Distinct families are not yet registered, so today every supported
+    alias resolves to the same evaluable family.
 
 ---
 
@@ -465,6 +492,9 @@ oracle internals, or unvalidated provider metadata.
   committing together.
 - Idempotent replay, conflicting key reuse (including a model-family-only difference),
   canonical full-request comparison, and a validation failure not consuming the key.
+- Revision model-family provenance: the validated family is stored on the revision and its
+  audit event, the hypothesis row follows it, and evaluation uses the revision field even
+  when the parent projection has moved on.
 - Cancellation and run failure preserving revisions, evaluations and earlier events.
 - API contract: create revision, revision history, evaluation history, cursor pagination,
   filters, `404`/`400`/`409`/`422` behaviour.

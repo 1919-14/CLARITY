@@ -99,6 +99,8 @@ def serialize_revision(rev: HypothesisRevisionModel) -> Dict[str, Any]:
     return {
         "revision_id": rev.revision_id,
         "revision_number": rev.revision_number,
+        # Effective validated family recorded on the revision itself.
+        "model_family": getattr(rev, "model_family", None),
         "formula": rev.formula,
         "parameters": rev.parameters,
         "complexity": rev.complexity,

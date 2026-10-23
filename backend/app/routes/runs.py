@@ -86,6 +86,7 @@ def serialize_revision(rev: HypothesisRevisionModel) -> Dict[str, Any]:
     return {
         "revision_id": rev.revision_id,
         "revision_number": rev.revision_number,
+        "model_family": getattr(rev, "model_family", None),
         "formula": rev.formula,
         "parameters": rev.parameters,
         "complexity": rev.complexity,
@@ -474,6 +475,9 @@ def create_hypothesis_endpoint(run_id: str):
             formula=formula.strip(),
             parameters=parameters,
             complexity=complexity,
+            # This route does not canonicalise the family; record what it is
+            # actually evaluated with so the revision stays self-describing.
+            model_family=model_family.strip(),
             creation_source="researcher",
         )
         repo.create_hypothesis_with_initial_revision(hyp, rev)

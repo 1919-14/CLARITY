@@ -141,6 +141,12 @@ class HypothesisRevisionModel(Base):
     semantically relevant request field (formula, parameters, complexity, model
     family, creation source), so replaying a key with a different payload is
     detected even when formula/parameters/complexity happen to match.
+    ``model_family`` holds the effective, validated family this revision was
+    created under and is the source of truth when replaying an evaluation.
+    ``HypothesisModel.model_family`` is the current-state/display projection and
+    follows the newest revision. The column is nullable only for revisions
+    written before it existed; the migration backfills them from their parent
+    hypothesis.
     """
 
     __tablename__ = "hypothesis_revisions"
@@ -151,6 +157,7 @@ class HypothesisRevisionModel(Base):
     formula = Column(Text, nullable=False)
     parameters = Column(JSON, nullable=False)  # Weights/coefficients dictionary
     complexity = Column(Integer, nullable=False, default=1)
+    model_family = Column(String(64), nullable=True)  # Effective validated family for this revision
     creation_source = Column(String(64), nullable=False, default="generator")  # generator, researcher, refit, restoration
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 

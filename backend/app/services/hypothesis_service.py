@@ -88,6 +88,7 @@ def _revision_snapshot(revision: Optional[HypothesisRevisionModel]) -> Optional[
     return {
         "revision_id": revision.revision_id,
         "revision_number": revision.revision_number,
+        "model_family": getattr(revision, "model_family", None),
         "formula": revision.formula,
         "parameters": dict(revision.parameters or {}),
         "complexity": revision.complexity,
@@ -164,6 +165,9 @@ def propose_hypothesis_service(
         formula=formula.strip(),
         parameters=final_params,
         complexity=final_complexity,
+        # The validated family is the one evaluations can actually replay; the
+        # hypothesis row keeps the researcher's submitted spelling for display.
+        model_family=validated.model_family if validated else model_family.strip(),
         creation_source=creation_source,
         previous_revision_id=None,
         change_reason=reason,
@@ -349,8 +353,13 @@ def revise_hypothesis_service(
     Guarantees:
     -----------
     * The previous revision is never modified: its row keeps the exact formula,
-      parameters and complexity it was created with, and the new revision links
-      to it through ``previous_revision_id``.
+      parameters, complexity and model family it was created with, and the new
+      revision links to it through ``previous_revision_id``.
+    * The requested model family is validated and stored on the new revision in
+      canonical form, so an evaluation can be replayed against the family the
+      revision was actually created under rather than the hypothesis's current
+      field. The hypothesis row follows the newest revision as a current-state
+      projection.
     * Validation happens before anything is written, so a rejected edit creates
       neither a revision nor an audit event.
     * Concurrency is guarded by the caller's ``expected_revision`` /
@@ -377,7 +386,11 @@ def revise_hypothesis_service(
 
     target_formula = (formula if formula is not None else base.formula) or ""
     target_formula = target_formula.strip()
-    target_family = (model_family or hyp.model_family or "").strip()
+    # An edit inherits the family of the revision it extends, because the family
+    # is part of the revision definition. Falling back to the hypothesis row is
+    # only needed for revisions written before the family was recorded there.
+    inherited_family = getattr(base, "model_family", None) or hyp.model_family or ""
+    target_family = (model_family or inherited_family or "").strip()
 
     # A formula edit derives its own canonical coefficients; inheriting the
     # previous revision's parameters would contradict the new expression.
@@ -421,6 +434,10 @@ def revise_hypothesis_service(
             else base.complexity
         )
     )
+    # The family a revision is created under is part of its scientific record,
+    # so it is stored on the revision (in validated/canonical form) rather than
+    # being read back from the mutable hypothesis row later.
+    effective_family = validated.model_family if validated else target_family
 
     # Every semantically relevant field of the request is fingerprinted, not just
     # formula/parameters/complexity: replaying a key with a different model
@@ -481,6 +498,7 @@ def revise_hypothesis_service(
         formula=target_formula,
         parameters=final_parameters,
         complexity=final_complexity,
+        model_family=effective_family,
         creation_source=creation_source,
         previous_revision_id=base.revision_id,
         change_reason=sanitize_reason_text(reason),
@@ -493,6 +511,9 @@ def revise_hypothesis_service(
     try:
         session.add(new_revision)
         hyp.current_revision = new_revision.revision_number
+        # Keep the hypothesis row as an accurate projection of the revision it
+        # now points at; the revision remains the historical source of truth.
+        hyp.model_family = effective_family
         hyp.version = (getattr(hyp, "version", 1) or 1) + 1
         hyp.version_token = f"vt-{uuid.uuid4().hex[:12]}"
         hyp.updated_at = datetime.now(timezone.utc)
@@ -533,6 +554,7 @@ def revise_hypothesis_service(
                 "revision_number": new_revision.revision_number,
                 "previous_revision_id": base.revision_id,
                 "previous_revision_number": base.revision_number,
+                "model_family": effective_family,
                 "creation_source": creation_source,
             },
             before_json=_revision_snapshot(base),
@@ -683,7 +705,11 @@ def _execute_pipeline_for_revision(
         )
 
     params = dict(latest_rev.parameters or {})
-    model_family = hyp.model_family
+    # The revision is the source of truth for what is being evaluated: the
+    # parent hypothesis field is a current-state projection that a later
+    # revision (or a stale row) may have moved on from. Only revisions written
+    # before the column existed fall back to the parent value.
+    model_family = getattr(latest_rev, "model_family", None) or hyp.model_family
     if model_family in ("linear", "1d_linear") or ("a" in params and "b" in params and "coefficients" not in params):
         model_family = POLYNOMIAL_FAMILY_ID
         params = {
@@ -749,6 +775,7 @@ def _execute_pipeline_for_revision(
                 "revision_number": latest_rev.revision_number,
                 "evaluation_id": eval_model.evaluation_id,
                 "status": eval_status,
+                "model_family": candidate_repr.model_family,
                 "sample_count": result.sample_count,
                 "dataset_version": len(training_ids),
                 "dataset_snapshot_id": dataset_snapshot_id,

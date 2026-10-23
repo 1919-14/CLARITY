@@ -37,6 +37,7 @@ from app.domain.history_contracts import (
     decode_history_cursor,
     encode_history_cursor,
 )
+from app.domain.evaluation import EvaluationPipeline
 from app.services.audit_service import (
     AuditCorrectionTargetNotFound,
     correct_audit_event_service,
@@ -181,6 +182,36 @@ class TestRevisionPreservation:
         assert event.after_json["formula"] == "y = 3*x^2 + 2"
         assert event.reason == "quadratic fit explains the residual"
         assert event.revision_id == revised.revision_id
+
+    def test_revision_records_the_validated_model_family(self, session):
+        """The family a revision is created under is part of its scientific record."""
+        run = _new_run(session)
+        hyp = propose_hypothesis_service(session, run.run_id, "linear", "y = 2*x + 1")
+        repo = ClarityRepository(session)
+
+        initial = repo.list_hypothesis_revisions(hyp.hypothesis_id)[0]
+        # The revision records the family an evaluation can actually replay ...
+        assert initial.model_family == "polynomial"
+        # ... while the hypothesis row keeps the researcher-facing projection.
+        assert hyp.model_family == "linear"
+
+        revised = revise_hypothesis_service(
+            session,
+            hyp.hypothesis_id,
+            formula="y = 3*x^2 + 2",
+            model_family="1d_polynomial",
+        )
+        assert revised.model_family == "polynomial"
+        # The parent row follows the newest revision instead of leading it.
+        assert repo.get_hypothesis(hyp.hypothesis_id).model_family == "polynomial"
+        assert repo.list_hypothesis_revisions(hyp.hypothesis_id)[0].model_family == "polynomial"
+
+        revise_events = [
+            e for e in repo.list_audit_events_for_run(run.run_id)
+            if e.event_type == AUDIT_HYPOTHESIS_REVISED
+        ]
+        assert revise_events[0].metadata_json["model_family"] == "polynomial"
+        assert revise_events[0].after_json["model_family"] == "polynomial"
 
     def test_invalid_edit_creates_no_revision_and_no_event(self, session):
         run = _new_run(session)
@@ -373,6 +404,41 @@ class TestEvaluationProvenance:
         assert completed.status == "completed"
         assert completed.metrics  # real, non-empty metrics
         assert completed.evaluation_id != evaluation.evaluation_id
+
+    def test_evaluation_uses_the_family_recorded_on_the_revision(self, session, monkeypatch):
+        """Regression: a revision's family, not the mutable parent field, drives evaluation."""
+        run = _new_run(session)
+        _add_observations(session, run.run_id, count=3)
+        hyp = propose_hypothesis_service(session, run.run_id, "linear", "y = 3*x^2 + 2")
+        repo = ClarityRepository(session)
+
+        revised = revise_hypothesis_service(
+            session,
+            hyp.hypothesis_id,
+            formula="y = 3*x^2 + 2.5",
+            model_family="1d_polynomial",
+        )
+        assert revised.model_family == "polynomial"
+
+        # Simulate the current-state projection lagging behind the revision it
+        # points at; the evaluation must not pick this value up.
+        repo.get_hypothesis(hyp.hypothesis_id).model_family = "legacy_unregistered"
+        session.flush()
+
+        seen = {}
+        original_evaluate = EvaluationPipeline.evaluate
+
+        def _capture(self, request, observations, dataset_id=None):
+            seen["model_family"] = request.hypothesis.model_family
+            return original_evaluate(self, request, observations, dataset_id=dataset_id)
+
+        monkeypatch.setattr(EvaluationPipeline, "evaluate", _capture)
+
+        evaluation, _ = reevaluate_hypothesis_service(session, hyp.hypothesis_id)
+
+        assert evaluation.status == "completed"
+        assert evaluation.revision_id == revised.revision_id
+        assert seen["model_family"] == revised.model_family == "polynomial"
 
     def test_editing_does_not_rewrite_earlier_evaluations(self, session):
         run = _new_run(session)
@@ -1020,6 +1086,7 @@ class TestHistoryAPI:
         assert response.status_code == 201, response.get_json()
         body = response.get_json()
         assert body["revision"]["revision_number"] == 2
+        assert body["revision"]["model_family"] == "polynomial"
         assert body["revision"]["change_reason"] == "quadratic mechanism"
         assert body["current_revision"] == 2
 
@@ -1029,6 +1096,7 @@ class TestHistoryAPI:
         assert [r["revision_number"] for r in revisions] == [1, 2]
         assert revisions[1]["previous_revision_id"] == revisions[0]["revision_id"]
         assert revisions[0]["formula"] == "y = 2*x + 1"
+        assert revisions[1]["model_family"] == "polynomial"
         assert revisions[1]["created_at"].endswith("+00:00")
 
     def test_edit_api_rejects_stale_revision_with_409(self, client):
