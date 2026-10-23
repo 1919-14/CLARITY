@@ -54,6 +54,7 @@ from ...services.run_service import (
     RunConflictError,
     create_run_service,
 )
+from ...services.benchmark_service import trigger_benchmark_service
 from .shared import (
     error_response,
     log_safe_error,
@@ -567,6 +568,59 @@ def get_run_benchmarks(run_id: str):
         "benchmarks": serialized,
         "count": len(serialized),
     }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/benchmarks", methods=["POST"])
+def trigger_run_benchmark(run_id: str):
+    """POST /api/v1/runs/<run_id>/benchmarks — Execute a ground-truth benchmark evaluation."""
+    payload = request.get_json(silent=True) or {}
+    benchmark_case = payload.get("benchmark_case")
+    target_label = payload.get("target_label")
+    target_formula = payload.get("target_formula")
+    target_parameters = payload.get("target_parameters")
+    domain = payload.get("domain", "polynomial")
+    benchmark_name = payload.get("benchmark_name")
+    baseline_type = payload.get("baseline_type", "random_sampling")
+    expected_baseline_queries = payload.get("expected_baseline_queries")
+    custom_metadata = payload.get("metadata")
+    tolerance = float(payload.get("tolerance", 0.05))
+
+    if not benchmark_case and not target_label:
+        return error_response(
+            "Either 'benchmark_case' or 'target_label' must be provided in request body.",
+            400,
+        )
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            result = trigger_benchmark_service(
+                session=session,
+                run_id=run_id,
+                benchmark_case=benchmark_case,
+                target_label=target_label,
+                target_formula=target_formula,
+                target_parameters=target_parameters,
+                domain=domain,
+                benchmark_name=benchmark_name,
+                baseline_type=baseline_type,
+                expected_baseline_queries=expected_baseline_queries,
+                custom_metadata=custom_metadata,
+                tolerance=tolerance,
+            )
+            serialized = serialize_benchmark(result)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("trigger_run_benchmark error", exc)
+        return error_response("An internal error occurred while executing benchmark evaluation.", 500)
+
+    return jsonify({"benchmark": serialized}), 201
 
 
 @runs_v1_bp.route("/runs/<run_id>/observations", methods=["GET"])
