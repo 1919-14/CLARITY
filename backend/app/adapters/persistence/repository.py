@@ -19,6 +19,8 @@ from .models import (
     AuditEventModel,
     BenchmarkResultModel,
     ReportModel,
+    RunBudgetUsageModel,
+    BudgetReservationModel,
 )
 
 
@@ -231,6 +233,52 @@ class ClarityRepository:
             .limit(1)
         )
         return self.session.scalars(stmt).first()
+
+    # ------------------------------------------------------------------
+    # Per-run budget counters and reservations (Issue #14)
+    # ------------------------------------------------------------------
+
+    def get_budget_usage(self, run_id: str) -> Optional[RunBudgetUsageModel]:
+        return self.session.get(RunBudgetUsageModel, run_id)
+
+    def create_budget_usage(self, usage: RunBudgetUsageModel) -> RunBudgetUsageModel:
+        self.session.add(usage)
+        self.session.flush()
+        return usage
+
+    def get_budget_reservation(
+        self,
+        run_id: str,
+        resource: str,
+        operation_id: str,
+    ) -> Optional[BudgetReservationModel]:
+        stmt = select(BudgetReservationModel).where(
+            BudgetReservationModel.run_id == run_id,
+            BudgetReservationModel.resource == resource,
+            BudgetReservationModel.operation_id == operation_id,
+        )
+        return self.session.scalars(stmt).first()
+
+    def add_budget_reservation(
+        self, reservation: BudgetReservationModel
+    ) -> BudgetReservationModel:
+        self.session.add(reservation)
+        self.session.flush()
+        return reservation
+
+    def list_budget_reservations(
+        self,
+        run_id: str,
+        resource: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> List[BudgetReservationModel]:
+        stmt = select(BudgetReservationModel).where(BudgetReservationModel.run_id == run_id)
+        if resource is not None:
+            stmt = stmt.where(BudgetReservationModel.resource == resource)
+        if state is not None:
+            stmt = stmt.where(BudgetReservationModel.state == state)
+        stmt = stmt.order_by(BudgetReservationModel.created_at)
+        return list(self.session.scalars(stmt).all())
 
     # =========================================================================
     # Benchmark & Report Operations

@@ -19,6 +19,7 @@ from ...adapters.persistence.models import (
     UsageRecordModel,
 )
 from ...adapters.persistence.repository import ClarityRepository
+from ...services.budget_service import resolve_budget_config
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,9 @@ def serialize_run(run: RunModel) -> Dict[str, Any]:
         "max_evaluations": run.max_evaluations,
         "max_runtime_seconds": run.max_runtime_seconds,
         "spend_ceiling_usd": run.spend_ceiling_usd,
+        "max_concurrent_remote_tasks": run.max_concurrent_remote_tasks,
+        "max_generated_hypotheses": run.max_generated_hypotheses,
+        "budget": resolve_budget_config(run).to_dict(),
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,

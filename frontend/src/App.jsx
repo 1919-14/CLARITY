@@ -11,6 +11,12 @@ function App() {
   const [errorDetails, setErrorDetails] = useState(null);
   const [latency, setLatency] = useState(null);
 
+  // Issue #14 — per-run budget status (limits vs. actual usage, cost states).
+  const [runId, setRunId] = useState('');
+  const [budgetState, setBudgetState] = useState('idle'); // 'idle' | 'loading' | 'loaded' | 'error'
+  const [budget, setBudget] = useState(null);
+  const [budgetError, setBudgetError] = useState(null);
+
   useEffect(() => {
     let isCurrent = true;
 
@@ -82,6 +88,54 @@ function App() {
     setErrorDetails(null);
     setData(null);
     setCheckTrigger((prev) => prev + 1);
+  };
+
+  const formatCost = (value) =>
+    value === null || value === undefined ? 'Unavailable' : `$${Number(value).toFixed(4)}`;
+
+  const formatSeconds = (value) =>
+    value === null || value === undefined ? 'Not measurable' : `${Math.round(value)} s`;
+
+  const formatLimit = (entry) => {
+    if (!entry) return 'Unavailable';
+    if (entry.limit === null || entry.limit === undefined) {
+      return `${entry.used} used · no limit`;
+    }
+    return `${entry.used} / ${entry.limit}`;
+  };
+
+  const handleLoadBudget = async (e) => {
+    e.preventDefault();
+    const requestedRunId = runId.trim();
+    if (!requestedRunId) return;
+
+    setBudgetState('loading');
+    setBudgetError(null);
+    setBudget(null);
+
+    const normalizedUrl = activeUrl.replace(/\/+$/, '');
+    const endpoint = `${normalizedUrl}/api/v1/runs/${encodeURIComponent(requestedRunId)}/budget`;
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(json?.message || `HTTP Error ${response.status}: ${response.statusText}`);
+      }
+      if (!json || !json.budget) {
+        throw new Error('Unexpected budget response from the backend.');
+      }
+      setBudget(json.budget);
+      setBudgetState('loaded');
+    } catch (err) {
+      setBudgetState('error');
+      setBudgetError(
+        err instanceof Error ? err.message : 'Unable to load the run budget.'
+      );
+    }
   };
 
   return (
@@ -191,6 +245,134 @@ function App() {
               >
                 Retry Connection
               </button>
+            </div>
+          )}
+        </section>
+
+        {/* Per-run Budget Card (Issue #14) */}
+        <section className="glass-card" aria-labelledby="budget-card-title">
+          <div className="card-header">
+            <h2 id="budget-card-title" className="card-title">
+              Run Budget
+            </h2>
+            {budgetState === 'loaded' && budget && (
+              <div className={`status-pill ${budget.is_exhausted ? 'error' : 'healthy'}`}>
+                <span className="dot-indicator"></span>
+                {budget.is_exhausted ? budget.stop_reason || 'Exhausted' : 'Within budget'}
+              </div>
+            )}
+          </div>
+
+          <div className="section-subtitle implemented">
+            <span>&bull;</span> Application-enforced limits. Unavailable cost data is shown as
+            &quot;Unavailable&quot;, never as zero.
+          </div>
+
+          <form onSubmit={handleLoadBudget} className="api-config-row">
+            <label htmlFor="run-id-input">Run ID</label>
+            <div className="api-input-group">
+              <input
+                id="run-id-input"
+                type="text"
+                className="api-input"
+                value={runId}
+                onChange={(e) => setRunId(e.target.value)}
+                placeholder="run-abc123"
+              />
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={budgetState === 'loading' || !runId.trim()}
+              >
+                {budgetState === 'loading' ? 'Loading...' : 'Load budget'}
+              </button>
+            </div>
+          </form>
+
+          {budgetState === 'error' && (
+            <div className="error-banner" role="alert">
+              <div className="error-title">Budget unavailable</div>
+              <div className="error-desc">{budgetError}</div>
+            </div>
+          )}
+
+          {budgetState === 'loaded' && budget && (
+            <div className="result-box">
+              {budget.is_exhausted && (
+                <div className="error-banner" role="status" style={{ marginBottom: '0.9rem' }}>
+                  <div className="error-title">Stopped: {budget.stop_reason}</div>
+                  <div className="error-desc">
+                    Resource exhaustion is not a scientific discovery. Completed observations and
+                    evaluations are preserved.
+                  </div>
+                </div>
+              )}
+
+              <div className="meta-grid">
+                <div className="meta-item">
+                  <span className="meta-label">Oracle queries used / limit</span>
+                  <span className="meta-value">{formatLimit(budget.usage.oracle_queries)}</span>
+                  <span className="meta-label">
+                    remaining {budget.usage.oracle_queries.remaining ?? 'n/a'}
+                  </span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Evaluations used / limit</span>
+                  <span className="meta-value">{formatLimit(budget.usage.candidate_evaluations)}</span>
+                  <span className="meta-label">
+                    remaining {budget.usage.candidate_evaluations.remaining ?? 'n/a'}
+                  </span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Hypotheses generated / limit</span>
+                  <span className="meta-value">{formatLimit(budget.usage.generated_hypotheses)}</span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Remote concurrency</span>
+                  <span className="meta-value">
+                    {budget.usage.active_remote_tasks} / {budget.usage.max_concurrent_remote_tasks}
+                  </span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Elapsed</span>
+                  <span className="meta-value">{formatSeconds(budget.runtime.elapsed_seconds)}</span>
+                  <span className="meta-label">
+                    remaining {formatSeconds(budget.runtime.remaining_seconds)}
+                  </span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Estimated cost</span>
+                  <span className="meta-value">{formatCost(budget.cost.estimated_cost_usd)}</span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Accruing cost</span>
+                  <span className="meta-value">{formatCost(budget.cost.accruing_cost_usd)}</span>
+                </div>
+                <div className="meta-item">
+                  <span className="meta-label">Settled cost</span>
+                  <span className="meta-value">{formatCost(budget.cost.settled_cost_usd)}</span>
+                  <span className="meta-label">state {budget.cost.data_state}</span>
+                </div>
+              </div>
+
+              <div className="meta-item" style={{ marginTop: '0.75rem' }}>
+                <span className="meta-label">Cost enforcement</span>
+                <span className="meta-value" style={{ fontSize: '0.8rem' }}>
+                  {budget.cost.enforcement} · provider hard cap supported:{' '}
+                  {budget.cost.provider_hard_cap_supported ? 'yes' : 'no'}
+                </span>
+              </div>
+
+              {budget.limitations && budget.limitations.length > 0 && (
+                <div className="meta-item" style={{ marginTop: '0.75rem' }}>
+                  <span className="meta-label">Limitations</span>
+                  <ul style={{ paddingLeft: '1.25rem', marginTop: '0.25rem', fontSize: '0.8rem' }}>
+                    {budget.limitations.map((limitation) => (
+                      <li key={limitation}>{limitation}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           )}
         </section>

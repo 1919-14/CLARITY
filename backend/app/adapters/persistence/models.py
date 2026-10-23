@@ -8,6 +8,7 @@ Persists:
 - Hypothesis Evaluations (metrics, sample counts, held-out validation, exact revision & dataset reference)
 - Compute Tasks (Nodus task tracking, execution status, timings, errors)
 - Usage & Budgets (queries executed, evaluations scheduled, cost states, budget exhaustion)
+- Per-run budget usage counters and resource reservations (Issue #14)
 - Audit Events (researcher actions: pin, exclude, restore, re-evaluate)
 - Benchmark Results (Hit@1/3/5, MRR, held-out errors, baseline comparison)
 - Reports (top candidate rankings, summary artifact references)
@@ -50,11 +51,16 @@ class RunModel(Base):
     sampling_strategy = Column(String(64), nullable=False, default="active_disagreement")
     stop_reason = Column(String(255), nullable=True)
     
-    # Configured run-level limits
+    # Configured run-level limits. Legacy names are retained for API
+    # compatibility; ``budget_config_json`` is the canonical validated snapshot.
     max_queries = Column(Integer, nullable=True)
     max_evaluations = Column(Integer, nullable=True)
     max_runtime_seconds = Column(Integer, nullable=True)
     spend_ceiling_usd = Column(Float, nullable=True)
+    max_concurrent_remote_tasks = Column(Integer, nullable=True)
+    max_generated_hypotheses = Column(Integer, nullable=True)
+    budget_config_json = Column(JSON, nullable=True)
+    deadline_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=True)
@@ -66,6 +72,15 @@ class RunModel(Base):
     experiments = relationship("CandidateExperimentModel", back_populates="run", passive_deletes=True)
     tasks = relationship("ComputeTaskModel", back_populates="run", passive_deletes=True)
     usage_records = relationship("UsageRecordModel", back_populates="run", passive_deletes=True)
+    budget_usage = relationship(
+        "RunBudgetUsageModel",
+        back_populates="run",
+        uselist=False,
+        passive_deletes=True,
+    )
+    budget_reservations = relationship(
+        "BudgetReservationModel", back_populates="run", passive_deletes=True
+    )
     audit_events = relationship("AuditEventModel", back_populates="run", passive_deletes=True)
     reports = relationship("ReportModel", back_populates="run", passive_deletes=True)
     benchmark_results = relationship("BenchmarkResultModel", back_populates="run", passive_deletes=True)
@@ -248,6 +263,100 @@ class UsageRecordModel(Base):
 
     __table_args__ = (
         Index("idx_usage_run_recorded", "run_id", "recorded_at"),
+    )
+
+
+class RunBudgetUsageModel(Base):
+    """Authoritative per-run budget counters (Issue #14).
+
+    One row per run. Admission is a single conditional ``UPDATE`` against these
+    counters, so the invariant ``admitted <= configured limit`` holds across
+    concurrent processes, not only inside one Python process.
+
+    ``*_reserved`` counts admitted work. A reservation that is provably never
+    dispatched is released (the counter decreases and ``*_released``
+    increments); work whose outcome is ambiguous stays reserved and is charged
+    conservatively.
+    """
+
+    __tablename__ = "run_budget_usage"
+
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="CASCADE"), primary_key=True)
+
+    queries_reserved = Column(Integer, nullable=False, default=0)
+    queries_completed = Column(Integer, nullable=False, default=0)
+    queries_failed = Column(Integer, nullable=False, default=0)
+    queries_released = Column(Integer, nullable=False, default=0)
+
+    evaluations_reserved = Column(Integer, nullable=False, default=0)
+    evaluations_completed = Column(Integer, nullable=False, default=0)
+    evaluations_failed = Column(Integer, nullable=False, default=0)
+    evaluations_released = Column(Integer, nullable=False, default=0)
+
+    hypotheses_generated = Column(Integer, nullable=False, default=0)
+    hypotheses_released = Column(Integer, nullable=False, default=0)
+
+    active_remote_tasks = Column(Integer, nullable=False, default=0)
+
+    # Explicit cost separation. NULL means unavailable/not yet known; it is
+    # never coerced to 0.0.
+    estimated_cost_usd = Column(Float, nullable=True)
+    accruing_cost_usd = Column(Float, nullable=True)
+    settled_cost_usd = Column(Float, nullable=True)
+    cost_data_state = Column(String(32), nullable=False, default="not_started")
+
+    is_exhausted = Column(Boolean, nullable=False, default=False)
+    stop_reason = Column(String(64), nullable=True)
+    exhausted_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+    run = relationship("RunModel", back_populates="budget_usage")
+
+    __table_args__ = (
+        Index("idx_budget_usage_exhausted", "is_exhausted"),
+    )
+
+
+class BudgetReservationModel(Base):
+    """Durable admission ledger for one logical resource operation.
+
+    ``operation_id`` makes reservation idempotent: duplicate worker delivery of
+    the same logical operation cannot consume capacity twice. A unique
+    constraint on ``(run_id, resource, operation_id)`` is the idempotency key.
+
+    States:
+      reserved  — admitted, outcome not yet recorded
+      committed — outcome recorded (completed or failed)
+      released  — provably never dispatched; capacity returned
+      ambiguous — dispatched but the outcome is unknown; capacity stays charged
+    """
+
+    __tablename__ = "budget_reservations"
+
+    reservation_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False)
+    resource = Column(String(32), nullable=False)  # oracle_query, candidate_evaluation, remote_task, hypothesis
+    operation_id = Column(String(128), nullable=False)
+    state = Column(String(16), nullable=False, default="reserved")
+    quantity = Column(Integer, nullable=False, default=1)
+    details_json = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    run = relationship("RunModel", back_populates="budget_reservations")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "resource",
+            "operation_id",
+            name="uq_budget_reservation_operation",
+        ),
+        Index("idx_budget_reservation_run_state", "run_id", "resource", "state"),
     )
 
 

@@ -4,16 +4,20 @@ Endpoints:
   POST   /api/v1/runs                      Create a new discovery run
   GET    /api/v1/runs                      List runs with pagination and status filter
   GET    /api/v1/runs/<run_id>             Retrieve a specific discovery run
+  GET    /api/v1/runs/<run_id>/status      Live lifecycle progress snapshot
   GET    /api/v1/runs/<run_id>/metrics     Usage, budget, and cost metrics
+  GET    /api/v1/runs/<run_id>/budget      Per-run budget status contract
   GET    /api/v1/runs/<run_id>/report      Scientific summary report
   GET    /api/v1/runs/<run_id>/benchmarks  Benchmark comparison results
   GET    /api/v1/runs/<run_id>/observations Observations with pagination
   GET    /api/v1/runs/<run_id>/hypotheses  Hypotheses for a run
   POST   /api/v1/runs/<run_id>/hypotheses  Propose a researcher hypothesis
-  POST   /api/v1/runs/<run_id>/cancel      Cancel an active run
+  POST   /api/v1/runs/<run_id>/start       Start execution of a queued run
+  POST   /api/v1/runs/<run_id>/cancel      Cancel an active or queued run
 
 Route handlers are intentionally thin. Persistence operations are
-delegated to ClarityRepository; no business logic lives here.
+delegated to ClarityRepository; lifecycle transitions are delegated to
+RunLifecycleManager. No business logic lives here.
 """
 
 import uuid
@@ -23,16 +27,33 @@ from flask import Blueprint, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
+from ...domain.budget_contracts import (
+    BudgetValidationError,
+    RunBudgetConfig,
+)
+from ...domain.run_lifecycle import (
+    DuplicateExecutionError,
+    InvalidStateTransitionError,
+    RunLifecycleManager,
+    RunLifecycleState,
+    RunNotFoundError,
+    default_lifecycle_manager,
+)
+from ...services.budget_service import (
+    get_budget_status,
+    persist_exhaustion,
+)
 from ...services.hypothesis_service import (
+    HypothesisAlreadyAdmittedError,
+    HypothesisBudgetExhaustedError,
     HypothesisConflictError,
     HypothesisNotFoundError,
     HypothesisValidationError,
     propose_hypothesis_service,
 )
+from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
     RunConflictError,
-    RunNotFoundError,
-    cancel_run_service,
     create_run_service,
 )
 from .shared import (
@@ -50,9 +71,21 @@ runs_v1_bp = Blueprint("runs_v1", __name__)
 
 # Valid values enforced at this boundary
 _VALID_EXECUTION_MODES = {"local", "nodus_remote", "mock"}
-_VALID_RUN_STATUSES = {"pending", "running", "completed", "cancelled", "failed", "budget_exhausted"}
+_VALID_RUN_STATUSES = {
+    "pending", "queued", "running", "cancelling",
+    "completed", "cancelled", "failed",
+    "budget_exhausted", "stopped_by_budget",
+}
 _MAX_PAGE_SIZE = 200
 _DEFAULT_PAGE_SIZE = 50
+
+
+def _lifecycle_manager() -> RunLifecycleManager:
+    """Return the application-scoped lifecycle manager.
+
+    Allows tests to substitute a custom instance via Flask app config.
+    """
+    return current_app.config.get("LIFECYCLE_MANAGER", default_lifecycle_manager)
 
 
 # ---------------------------------------------------------------------------
@@ -114,30 +147,54 @@ def create_run():
     if not isinstance(sampling_strategy, str) or not sampling_strategy.strip():
         return error_response("Field 'sampling_strategy' must be a non-empty string.", 400)
 
-    # --- Numeric limit validation ---
-    def _int_limit(field: str) -> Optional[int]:
-        val = data.get(field)
-        if val is None:
-            return None
-        if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
-            raise ValueError(f"Field '{field}' must be a positive integer.")
-        return val
+    # --- Budget validation ---
+    # Canonical nested ``budget`` object, or the legacy flat v1 field names.
+    # Both forms are accepted, but mixing them is rejected as ambiguous.
+    budget_payload = data.get("budget")
+    if budget_payload is not None and not isinstance(budget_payload, dict):
+        return error_response("Field 'budget' must be a JSON object.", 400)
 
-    def _float_limit(field: str) -> Optional[float]:
-        val = data.get(field)
-        if val is None:
-            return None
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
-            raise ValueError(f"Field '{field}' must be a non-negative number.")
-        return float(val)
+    legacy_payload = {}
+    for field in (
+        "max_queries",
+        "max_evaluations",
+        "max_runtime_seconds",
+        "spend_ceiling_usd",
+        "max_concurrent_remote_tasks",
+        "max_generated_hypotheses",
+    ):
+        if field in data and data[field] is not None:
+            legacy_payload[field] = data[field]
+
+    if budget_payload is not None and legacy_payload:
+        return error_response(
+            "Provide the budget either as a 'budget' object or as legacy flat limit fields, "
+            "not both.",
+            400,
+            error="Bad Request",
+            details=[
+                {
+                    "field": "budget",
+                    "code": "CONFLICTING_SETTING",
+                    "message": "Conflicting budget payloads were supplied.",
+                }
+            ],
+        )
 
     try:
-        max_queries = _int_limit("max_queries")
-        max_evaluations = _int_limit("max_evaluations")
-        max_runtime_seconds = _int_limit("max_runtime_seconds")
-        spend_ceiling_usd = _float_limit("spend_ceiling_usd")
-    except ValueError as exc:
-        return error_response(str(exc), 400)
+        if budget_payload is not None:
+            budget_config = RunBudgetConfig.from_mapping(budget_payload)
+        else:
+            budget_config = RunBudgetConfig.from_mapping(
+                legacy_payload, allow_legacy_aliases=True
+            )
+    except BudgetValidationError as exc:
+        return error_response(
+            exc.message,
+            400,
+            error="Bad Request",
+            details=exc.details,
+        )
 
     # --- Optional caller-provided run_id ---
     run_id = data.get("run_id")
@@ -157,12 +214,28 @@ def create_run():
                 domain=domain.strip(),
                 execution_mode=execution_mode,
                 sampling_strategy=sampling_strategy.strip(),
-                max_queries=max_queries,
-                max_evaluations=max_evaluations,
-                max_runtime_seconds=max_runtime_seconds,
-                spend_ceiling_usd=spend_ceiling_usd,
                 run_id=run_id,
+                budget=budget_config,
             )
+
+            # Register the newly persisted run with the lifecycle manager. The
+            # manager also normalizes the persisted status to QUEUED. Registration
+            # is compensated on failure so a half-initialized run cannot linger in
+            # the in-memory registry after the session rolls back.
+            mgr = _lifecycle_manager()
+            try:
+                mgr.initialize_run(
+                    run_id=run_id,
+                    name=name.strip(),
+                    max_queries=run.max_queries,
+                    max_evaluations=run.max_evaluations,
+                    domain=domain.strip(),
+                    session=session,
+                )
+            except Exception:
+                mgr.deregister_run(run_id)
+                raise
+
             serialized = serialize_run(run)
     except RunConflictError as exc:
         return error_response(str(exc), 409)
@@ -230,11 +303,33 @@ def get_run(run_id: str):
     return jsonify({"run": serialized}), 200
 
 
+@runs_v1_bp.route("/runs/<run_id>/status", methods=["GET"])
+def get_run_status(run_id: str):
+    """GET /api/v1/runs/<run_id>/status — Live lifecycle progress snapshot.
+
+    Returns real counters (queries used, evaluations completed, elapsed time).
+    Never fabricates percentage completion when total work is unknown.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            # Hydrate from DB if not in memory (e.g. after restart)
+            progress = _lifecycle_manager().get_progress(run_id, session=session)
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_status error", exc)
+        return error_response("An internal error occurred while retrieving run status.", 500)
+
+    return jsonify({"status": progress.to_dict()}), 200
+
+
 @runs_v1_bp.route("/runs/<run_id>/cancel", methods=["POST"])
 def cancel_run(run_id: str):
     """POST /api/v1/runs/<run_id>/cancel — Cancel a pending or running discovery run.
 
-    Returns 409 if the run is already in a terminal state.
+    Delegates state validation to RunLifecycleManager so that only
+    valid state transitions are allowed. Returns 409 for terminal runs.
     """
     reason = "Cancelled by researcher"
     if request.is_json:
@@ -247,21 +342,114 @@ def cancel_run(run_id: str):
     db = _get_db()
     try:
         with db.session_scope() as session:
-            run = cancel_run_service(
-                session=session,
-                run_id=run_id,
-                stop_reason=reason,
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            # Lifecycle manager enforces terminal-state guard and state machine
+            progress = _lifecycle_manager().request_cancellation(
+                run_id, reason=reason, session=session
             )
+
+            # Reload serialized view after lifecycle manager updated the model
+            run = repo.get_run(run_id)
             serialized = serialize_run(run)
-    except RunNotFoundError as exc:
-        return error_response(str(exc), 404)
-    except RunConflictError as exc:
-        return error_response(str(exc), 409)
+    except InvalidStateTransitionError:
+        return error_response(
+            f"Run '{run_id}' is already in a terminal state and cannot be cancelled.",
+            409,
+        )
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("cancel_run db error", exc)
         return error_response("An internal error occurred while cancelling the run.", 500)
 
-    return jsonify({"run": serialized, "message": "Run cancelled successfully."}), 200
+    if progress.status == RunLifecycleState.CANCELLING:
+        return jsonify({
+            "run": serialized,
+            "status": progress.to_dict(),
+            "message": "Run cancellation requested. Shutdown of in-flight work is in progress.",
+        }), 202
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "message": "Run cancelled successfully.",
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/start", methods=["POST"])
+def start_run(run_id: str):
+    """POST /api/v1/runs/<run_id>/start — Start execution of a queued discovery run.
+
+    Transitions the run to RUNNING and, when a ``RUN_ENGINE_FACTORY`` is
+    configured, executes it through ``execute_persisted_run`` so the persisted
+    per-run budget is always attached. Without a configured factory the run
+    stays RUNNING with no work dispatched; this endpoint never starts unbudgeted
+    execution. Returns 409 if already running or terminal, and 503 when the run
+    cannot be composed with its persisted budget.
+    """
+    db = _get_db()
+    engine_factory = current_app.config.get("RUN_ENGINE_FACTORY")
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            progress = _lifecycle_manager().start_run(run_id, session=session)
+            run = repo.get_run(run_id)
+            serialized = serialize_run(run)
+    except (DuplicateExecutionError, InvalidStateTransitionError) as exc:
+        return error_response(str(exc), 409)
+    except RunNotFoundError:
+        return error_response(f"Run '{run_id}' not found.", 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("start_run db error", exc)
+        return error_response("An internal error occurred while starting the run.", 500)
+
+    execution: Optional[dict] = None
+    if callable(engine_factory):
+        try:
+            result = execute_persisted_run(
+                run_id,
+                db,
+                engine_factory,
+                orchestrator=current_app.config.get("RUN_ORCHESTRATOR"),
+            )
+            execution = {
+                "dispatched": True,
+                "status": getattr(result, "status", None).value
+                if getattr(result, "status", None) is not None
+                else None,
+            }
+        except RunBudgetUnavailable as exc:
+            # Fail closed: report the run cannot execute budgeted work rather
+            # than letting it proceed unbudgeted.
+            return error_response(str(exc), 503, error="Service Unavailable")
+        except Exception as exc:  # noqa: BLE001
+            log_safe_error("start_run execution error", exc)
+            return error_response(
+                "The run was started but its execution failed.", 500
+            )
+
+    if execution is None:
+        execution = {
+            "dispatched": False,
+            "reason": "no_engine_factory_configured",
+        }
+
+    return jsonify({
+        "run": serialized,
+        "status": progress.to_dict(),
+        "execution": execution,
+        "message": "Run execution started successfully."
+        if execution.get("dispatched")
+        else "Run marked running; no execution provider is configured.",
+    }), 200
 
 
 @runs_v1_bp.route("/runs/<run_id>/metrics", methods=["GET"])
@@ -289,14 +477,43 @@ def get_run_metrics(run_id: str):
                     "max_evaluations": run.max_evaluations,
                     "max_runtime_seconds": run.max_runtime_seconds,
                     "spend_ceiling_usd": run.spend_ceiling_usd,
+                    "max_concurrent_remote_tasks": run.max_concurrent_remote_tasks,
+                    "max_generated_hypotheses": run.max_generated_hypotheses,
                 },
                 "usage": serialize_usage(latest_usage),
+                "budget": get_budget_status(session, run_id).to_dict(),
             }
     except Exception as exc:  # noqa: BLE001
         log_safe_error("get_run_metrics db error", exc)
         return error_response("An internal error occurred while retrieving metrics.", 500)
 
     return jsonify(payload), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/budget", methods=["GET"])
+def get_run_budget(run_id: str):
+    """GET /api/v1/runs/<run_id>/budget — Per-run budget status contract.
+
+    Returns configured limits, admitted/remaining capacity, concurrency,
+    runtime, cost states, and the structured exhaustion reason. Unavailable
+    monetary data is null, never zero.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+            status = get_budget_status(session, run_id)
+            payload = status.to_dict()
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_budget db error", exc)
+        return error_response(
+            "An internal error occurred while retrieving the run budget.", 500
+        )
+
+    return jsonify({"run_id": run_id, "budget": payload}), 200
 
 
 @runs_v1_bp.route("/runs/<run_id>/report", methods=["GET"])
@@ -487,6 +704,27 @@ def create_run_hypothesis(run_id: str):
                 hypothesis_id=hypothesis_id,
             )
             serialized = serialize_hypothesis(hyp, repo)
+    except HypothesisBudgetExhaustedError as exc:
+        # The failed transaction was rolled back; record the terminal decision
+        # in its own transaction so it survives the error response.
+        try:
+            with db.session_scope() as session:
+                persist_exhaustion(session, run_id, exc.reason, details=exc.to_dict())
+        except Exception as persist_exc:  # noqa: BLE001
+            log_safe_error("persist hypothesis budget exhaustion error", persist_exc)
+        return error_response(
+            "The run's hypothesis generation limit has been reached.",
+            409,
+            error="Conflict",
+            details=exc.to_dict(),
+        )
+    except HypothesisAlreadyAdmittedError as exc:
+        return error_response(
+            "This hypothesis was already admitted against the run's budget.",
+            409,
+            error="Conflict",
+            details=exc.to_dict(),
+        )
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
     except HypothesisConflictError as exc:

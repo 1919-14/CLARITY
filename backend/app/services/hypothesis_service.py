@@ -18,6 +18,7 @@ from ..adapters.persistence.models import (
     ObservationModel,
 )
 from ..adapters.persistence.repository import ClarityRepository
+from ..domain.budget_contracts import BudgetAdmissionDenied, BudgetReservationReplay
 from ..domain.contracts import (
     EvaluationRequest,
     EvaluationResult,
@@ -29,6 +30,7 @@ from ..domain.contracts import (
 from ..domain.evaluation import EvaluationPipeline
 from ..domain.expression_validator import validate_hypothesis_expression
 from ..domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
+from .budget_service import complete_hypothesis_generation, reserve_hypotheses
 
 
 class HypothesisServiceError(Exception):
@@ -45,6 +47,29 @@ class HypothesisValidationError(HypothesisServiceError):
 
 class HypothesisConflictError(HypothesisServiceError):
     """Raised on concurrent edit conflict or duplicate identifier."""
+
+
+class HypothesisAlreadyAdmittedError(HypothesisServiceError):
+    """Raised when a hypothesis id replays an already-admitted generation slot."""
+
+    def __init__(self, replay: BudgetReservationReplay):
+        self.replay = replay
+        super().__init__(str(replay))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.replay.to_dict()
+
+
+class HypothesisBudgetExhaustedError(HypothesisServiceError):
+    """Raised when the run's hypothesis-generation limit has been reached."""
+
+    def __init__(self, denial: BudgetAdmissionDenied):
+        self.denial = denial
+        self.reason = denial.reason
+        super().__init__(denial.message)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.denial.to_dict()
 
 
 def propose_hypothesis_service(
@@ -83,6 +108,21 @@ def propose_hypothesis_service(
     final_complexity = complexity if (complexity and complexity >= 1) else (validated.complexity if validated else 1)
     final_params = dict(parameters) if parameters else (validated.parameters if validated else {})
 
+    # New candidate hypotheses are admitted against the run's persisted
+    # generation budget before anything is written.
+    budget_reservation = None
+    try:
+        budget_reservation, _created = reserve_hypotheses(
+            session, run_id, 1, f"hypothesis:{hyp_id}"
+        )
+    except BudgetAdmissionDenied as exc:
+        raise HypothesisBudgetExhaustedError(exc) from None
+    except BudgetReservationReplay as exc:
+        # The slot was already admitted for this hypothesis id; the hypothesis
+        # row it belongs to either exists or was rolled back. Never write a
+        # second one under the replayed accounting.
+        raise HypothesisAlreadyAdmittedError(exc) from None
+
     hypothesis = HypothesisModel(
         hypothesis_id=hyp_id,
         run_id=run_id,
@@ -100,6 +140,8 @@ def propose_hypothesis_service(
         complexity=final_complexity,
         creation_source=creation_source,
     )
+    # The reservation lives in this same transaction: if the insert fails, the
+    # enclosing rollback also returns the hypothesis-generation capacity.
     repo.create_hypothesis_with_initial_revision(hypothesis, initial_rev)
 
     audit = AuditEventModel(
@@ -116,6 +158,8 @@ def propose_hypothesis_service(
         },
     )
     repo.record_audit_event(audit)
+    if budget_reservation is not None:
+        complete_hypothesis_generation(session, budget_reservation, True)
     session.flush()
     return hypothesis
 

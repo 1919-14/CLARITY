@@ -225,9 +225,17 @@
         "is_budget_exhausted": false,
         "exhaustion_reason": null,
         "recorded_at": "2026-10-21T16:10:00+00:00"
+      },
+      "budget": {
+        "schema_version": "1.0",
+        "limits": {"max_oracle_queries": 20, "max_candidate_evaluations": 60},
+        "usage": {"oracle_queries": {"used": 12, "remaining": 8}},
+        "is_exhausted": false,
+        "stop_reason": null
       }
     }
     ```
+  - In v1, `budget` is the complete Issue #14 summary. See [budget-manager.md](budget-manager.md) for the full schema; unavailable monetary values are `null`, never `0`.
 
 ---
 
@@ -316,7 +324,8 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
 | `GET` | `/api/v1/runs` | List runs (pagination: `limit`, `offset`, `status`) | 200, 400, 500 |
 | `GET` | `/api/v1/runs/{run_id}` | Retrieve run metadata and lifecycle state | 200, 404, 500 |
 | `POST` | `/api/v1/runs/{run_id}/cancel` | Cancel an active or pending run | 200, 404, 409, 500 |
-| `GET` | `/api/v1/runs/{run_id}/metrics` | Usage counters, budget limits, and tiered costs | 200, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/metrics` | Usage counters, budget limits, tiered costs, and the full budget summary | 200, 404, 500 |
+| `GET` | `/api/v1/runs/{run_id}/budget` | Per-run budget: limits, remaining capacity, runtime, costs, exhaustion | 200, 404, 500 |
 | `GET` | `/api/v1/runs/{run_id}/report` | Final scientific summary report (or pending state) | 200, 404, 500 |
 | `GET` | `/api/v1/runs/{run_id}/benchmarks` | Ground-truth benchmark evaluations | 200, 404, 500 |
 | `GET` | `/api/v1/runs/{run_id}/observations` | List observations (`only_training`, `limit`, `offset`) | 200, 400, 404, 500 |
@@ -463,3 +472,102 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
     }
     ```
 
+### 3.4 Per-Run Budget Contract (`GET /api/v1/runs/{run_id}/budget`)
+
+Every run has an explicit, validated budget (Issue #14). `POST /api/v1/runs`
+accepts either a canonical nested `budget` object or the legacy flat limit
+fields; supplying both is rejected as conflicting. Zero always means "no work of
+this kind", never unlimited; an omitted optional limit uses its documented
+default, and `null` optionally disables the hypothesis or spend limit.
+
+Request (create):
+
+```json
+{
+  "name": "Budgeted run",
+  "execution_mode": "nodus_remote",
+  "budget": {
+    "max_oracle_queries": 25,
+    "max_candidate_evaluations": 300,
+    "max_concurrent_remote_tasks": 2,
+    "max_runtime_seconds": 900,
+    "max_generated_hypotheses": 40,
+    "max_compute_spend_usd": 1.5
+  }
+}
+```
+
+Response (200 OK) — abbreviated; the full field list is documented in
+[budget-manager.md](budget-manager.md):
+
+```json
+{
+  "run_id": "run-01",
+  "budget": {
+    "run_id": "run-01",
+    "schema_version": "1.0",
+    "execution_mode": "nodus_remote",
+    "status": "running",
+    "limits": {
+      "max_oracle_queries": 25,
+      "max_candidate_evaluations": 300,
+      "max_concurrent_remote_tasks": 2,
+      "max_runtime_seconds": 900,
+      "max_generated_hypotheses": 40,
+      "max_compute_spend_usd": 1.5
+    },
+    "usage": {
+      "oracle_queries": {
+        "limit": 25, "used": 3, "remaining": 22,
+        "exhausted": false, "enforcement": "application", "disabled": false
+      },
+      "candidate_evaluations": {
+        "limit": 300, "used": 12, "remaining": 288,
+        "exhausted": false, "enforcement": "application", "disabled": false
+      },
+      "generated_hypotheses": {
+        "limit": 40, "used": 8, "remaining": 32,
+        "exhausted": false, "enforcement": "application", "disabled": false
+      },
+      "query_outcomes": {"attempted": 3, "completed": 3, "failed": 0, "released": 0},
+      "evaluation_outcomes": {"attempted": 12, "completed": 12, "failed": 0, "released": 0},
+      "active_remote_tasks": 0,
+      "max_concurrent_remote_tasks": 2
+    },
+    "runtime": {
+      "started_at": "2026-10-23T10:00:00+00:00",
+      "deadline_at": "2026-10-23T10:15:00+00:00",
+      "elapsed_seconds": 42.0,
+      "remaining_seconds": 858.0
+    },
+    "cost": {
+      "estimated_cost_usd": 0.03,
+      "accruing_cost_usd": null,
+      "settled_cost_usd": null,
+      "data_state": "estimated_only",
+      "enforcement": "application_estimate",
+      "provider_hard_cap_supported": false
+    },
+    "is_exhausted": false,
+    "stop_reason": null,
+    "raw_stop_reason": null,
+    "zero_semantics": {"max_oracle_queries": "Zero permits no oracle query; ..."},
+    "limitations": ["nodus-compute 1.0.27 exposes no verified per-run spending cap. ..."]
+  }
+}
+```
+
+Error behaviour:
+
+* Invalid or conflicting budget on create → `400` with a `details` array of
+  `{field, code, message}` entries.
+* Unknown run → `404`.
+* Exhausted hypothesis generation on `POST /runs/{id}/hypotheses` → `409` with
+  `details.reason = "HYPOTHESIS_LIMIT_REACHED"`; the run becomes
+  `budget_exhausted` and completed results are preserved.
+
+Stop reasons: `QUERY_BUDGET_EXHAUSTED`, `EVALUATION_LIMIT_REACHED`,
+`HYPOTHESIS_LIMIT_REACHED`, `COMPUTE_BUDGET_EXHAUSTED`, `TIME_LIMIT_EXCEEDED`,
+`CONCURRENCY_LIMIT_REACHED` (backpressure only), `CANCELLED`, `FAILED`.
+Terminal resource reasons transition the run to `budget_exhausted`; a
+resource-stopped run is not reported as a scientific discovery.

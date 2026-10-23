@@ -35,8 +35,16 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .budget_contracts import (
+    BudgetAdmissionDenied,
+    BudgetReservationReplay,
+    BudgetResource,
+    BudgetStopReason,
+    BudgetValidationError,
+    RunBudgetPort,
+)
 from .candidate_generator import CandidateGenerationError, CandidateGenerator
 from .contracts import (
     EvaluationRequest,
@@ -56,6 +64,7 @@ from .contracts import (
 from .discovery_contracts import (
     DISCOVERY_ENGINE_VERSION,
     ERROR_CANDIDATE_GENERATION_FAILURE,
+    ERROR_DUPLICATE_BUDGET_RESERVATION,
     ERROR_DUPLICATE_OBSERVATION_ID,
     ERROR_DUPLICATE_OBSERVATION_INPUT,
     ERROR_DUPLICATE_QUERY,
@@ -136,6 +145,10 @@ class _BudgetExhausted(Exception):
     """Internal signal that no oracle invocation is permitted."""
 
 
+class _CancelledException(Exception):
+    """Internal signal that execution was cancelled."""
+
+
 class DiscoveryEngine:
     """Coordinates one bounded discovery run over existing components."""
 
@@ -154,6 +167,8 @@ class DiscoveryEngine:
         registry: Optional[ModelFamilyRegistry] = None,
         scientist: Optional[LLMScientist] = None,
         run_id: Optional[str] = None,
+        budget: Optional[RunBudgetPort] = None,
+        cancellation_token: Optional[Callable[[], bool]] = None,
     ):
         if not callable(getattr(oracle, "validate_input", None)) or not callable(
             getattr(oracle, "query", None)
@@ -220,6 +235,21 @@ class DiscoveryEngine:
         self._scientist_history: List[ScientistRoundRecord] = []
         self._pending_suggested_inputs: List[float] = []
 
+        # Optional per-run budget manager (Issue #14). It is an admission port,
+        # not a scientific component: the engine still owns its local counters,
+        # and the persisted budget is authoritative across processes.
+        if budget is not None and not isinstance(budget, RunBudgetPort):
+            raise DiscoveryRunError(
+                make_structured_error(
+                    ERROR_INVALID_DISCOVERY_CONFIG,
+                    "budget must implement the RunBudgetPort contract.",
+                    received_type=type(budget).__name__,
+                )
+            )
+        self._budget = budget
+        self._budget_stop_reason: Optional[BudgetStopReason] = None
+        self._evaluation_sequence = 0
+
         self._run_id = run_id or generate_id("run")
         self._dataset_id = self._config.dataset_id or self._run_id
 
@@ -265,6 +295,10 @@ class DiscoveryEngine:
         self._started_at = utc_now_iso()
         self._finished_at = self._started_at
 
+        # Cancellation.
+        self._cancellation_token: Optional[Callable[[], bool]] = cancellation_token
+        self._cancellation_requested: bool = False
+
     # ------------------------------------------------------------------
     # Read-only inspection
     # ------------------------------------------------------------------
@@ -302,11 +336,52 @@ class DiscoveryEngine:
     def query_accounting(self) -> QueryAccounting:
         return self._accounting()
 
+    @property
+    def budget(self) -> Optional[RunBudgetPort]:
+        """The persisted budget port this engine was composed with, if any.
+
+        Exposed so a composition boundary can verify that the authoritative
+        budget it resolved is the one actually attached to the engine instead
+        of trusting the factory to have passed it through.
+        """
+        return self._budget
+
+    # ------------------------------------------------------------------
+    # Cancellation controls
+    # ------------------------------------------------------------------
+
+    def set_cancellation_token(self, token: Optional[Callable[[], bool]]) -> None:
+        """Register a cancellation token callback that returns True if cancelled."""
+        self._cancellation_token = token
+
+    def request_cancellation(self) -> None:
+        """Signal the discovery engine to stop scheduling new work and shut down."""
+        self._cancellation_requested = True
+
+    def cancel(self) -> None:
+        """Alias for request_cancellation."""
+        self.request_cancellation()
+
+    def is_cancelled(self) -> bool:
+        """Check whether cancellation was signaled via explicit request or token."""
+        if self._cancellation_requested:
+            return True
+        if self._cancellation_token is not None:
+            try:
+                return bool(self._cancellation_token())
+            except Exception:
+                return False
+        return False
+
     # ------------------------------------------------------------------
     # Public lifecycle
     # ------------------------------------------------------------------
 
-    def run(self, initial_observations: Sequence[Observation] = ()) -> DiscoveryRunResult:
+    def run(
+        self,
+        initial_observations: Sequence[Observation] = (),
+        cancellation_token: Optional[Callable[[], bool]] = None,
+    ) -> DiscoveryRunResult:
         """Execute one bounded discovery run and return its result snapshot.
 
         ``initial_observations`` must be permitted observations already
@@ -316,6 +391,9 @@ class DiscoveryEngine:
         invalid initial observations or candidate generation failure) is
         reported inside the returned result as FAILED, before any oracle call.
         """
+        if cancellation_token is not None:
+            self._cancellation_token = cancellation_token
+
         with self._lifecycle_lock:
             if self._started:
                 raise DiscoveryRunError(
@@ -328,6 +406,12 @@ class DiscoveryEngine:
             self._started = True
             self._started_at = utc_now_iso()
 
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
+            )
+
         try:
             self._initialize_candidates()
             self._ingest_initial_observations(initial_observations)
@@ -337,13 +421,30 @@ class DiscoveryEngine:
                 DiscoveryLifecycleStatus.FAILED,
                 DiscoveryTerminationReason.UNRECOVERABLE_ERROR,
             )
+        except _BudgetExhausted:
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+            )
+
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
+            )
 
         self._status = DiscoveryLifecycleStatus.RUNNING
 
         # Initial evaluation/ranking pass. A failure here is terminal but still
         # returns the valid initial observations and hypotheses.
         if self._observations:
-            if not self._refresh_evaluation_and_ranking():
+            initial_refresh = self._refresh_or_exhaust()
+            if initial_refresh is None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
+            if not initial_refresh:
                 return self._finalize(
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
@@ -360,7 +461,13 @@ class DiscoveryEngine:
         # evaluated and ranked by the existing pipeline before iteration 1.
         if self._run_scientist_round(iteration=None):
             if self._observations:
-                if not self._refresh_evaluation_and_ranking():
+                scientist_refresh = self._refresh_or_exhaust()
+                if scientist_refresh is None:
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                        DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                    )
+                if not scientist_refresh:
                     return self._finalize(
                         DiscoveryLifecycleStatus.FAILED,
                         DiscoveryTerminationReason.COMPONENT_FAILURE,
@@ -370,6 +477,18 @@ class DiscoveryEngine:
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
                 )
+
+        if self._budget_stop_reason is not None:
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+            )
+
+        if self.is_cancelled():
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                DiscoveryTerminationReason.CANCELLED,
+            )
 
         return self._run_iterations()
 
@@ -413,8 +532,14 @@ class DiscoveryEngine:
             raise DiscoveryRunError(error)
 
         self._observations[observation.observation_id] = self._frozen_observation(observation)
-        refresh_ok = self._refresh_evaluation_and_ranking()
+        refresh_value = self._refresh_or_exhaust()
+        refresh_ok = bool(refresh_value)
         self._append_ingestion_record(observation, refresh_ok)
+        if refresh_value is None:
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+            )
         if not refresh_ok:
             return self._finalize(
                 DiscoveryLifecycleStatus.FAILED,
@@ -472,9 +597,15 @@ class DiscoveryEngine:
         for observation in validated:
             self._observations[observation.observation_id] = self._frozen_observation(observation)
 
-        refresh_ok = self._refresh_evaluation_and_ranking()
+        refresh_value = self._refresh_or_exhaust()
+        refresh_ok = bool(refresh_value)
         for observation in validated:
             self._append_ingestion_record(observation, refresh_ok)
+        if refresh_value is None:
+            return self._finalize(
+                DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+            )
         if not refresh_ok:
             return self._finalize(
                 DiscoveryLifecycleStatus.FAILED,
@@ -533,6 +664,8 @@ class DiscoveryEngine:
                     "Candidate generation returned no candidates.",
                 )
             )
+        if not self._reserve_hypothesis_capacity(len(candidates), "initial"):
+            raise _BudgetExhausted()
         self._candidates = list(candidates)
         self._candidate_by_id = {candidate.hypothesis_id: candidate for candidate in candidates}
 
@@ -562,12 +695,26 @@ class DiscoveryEngine:
 
     def _run_iterations(self) -> DiscoveryRunResult:
         while True:
+            if self._budget_stop_reason is not None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
+            if self.is_cancelled():
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
+                )
             criterion = self._satisfied_stopping_criterion()
             if criterion is not None:
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_STOPPING_CRITERION, criterion
                 )
             if self._attempted_queries >= self._config.max_query_budget:
+                self._notify_budget_exhausted(
+                    BudgetStopReason.QUERY_BUDGET_EXHAUSTED,
+                    BudgetResource.ORACLE_QUERY,
+                )
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
                     DiscoveryTerminationReason.BUDGET_EXHAUSTED,
@@ -583,6 +730,11 @@ class DiscoveryEngine:
 
             try:
                 execution = self._execute_one_experiment(iteration)
+            except _CancelledException:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
+                )
             except _BudgetExhausted:
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
@@ -595,6 +747,11 @@ class DiscoveryEngine:
                     DiscoveryTerminationReason.COMPONENT_FAILURE,
                 )
             except Exception as exc:  # noqa: BLE001 - never leak a raw crash
+                if self.is_cancelled():
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                        DiscoveryTerminationReason.CANCELLED,
+                    )
                 self._errors.append(
                     make_structured_error(
                         ERROR_UNEXPECTED_DISCOVERY_ERROR,
@@ -606,6 +763,12 @@ class DiscoveryEngine:
                 return self._finalize(
                     DiscoveryLifecycleStatus.FAILED,
                     DiscoveryTerminationReason.UNRECOVERABLE_ERROR,
+                )
+
+            if self.is_cancelled():
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_CANCELLED,
+                    DiscoveryTerminationReason.CANCELLED,
                 )
 
             if execution is None:
@@ -621,8 +784,10 @@ class DiscoveryEngine:
 
             iteration_warnings: List[StructuredError] = []
             refresh_ok = True
+            refresh_value: Optional[bool] = True
             if execution.outcome == ExperimentExecutionOutcome.INVOKED_SUCCESS:
-                refresh_ok = self._refresh_evaluation_and_ranking()
+                refresh_value = self._refresh_or_exhaust()
+                refresh_ok = bool(refresh_value)
                 if not refresh_ok:
                     iteration_warnings.append(
                         make_structured_error(
@@ -651,6 +816,11 @@ class DiscoveryEngine:
             )
             self._iteration_history.append(record)
 
+            if refresh_value is None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
             if not refresh_ok:
                 return self._finalize(
                     DiscoveryLifecycleStatus.FAILED,
@@ -663,11 +833,23 @@ class DiscoveryEngine:
                 execution.outcome == ExperimentExecutionOutcome.INVOKED_SUCCESS
                 and self._run_scientist_round(iteration=iteration)
             ):
-                if not self._refresh_evaluation_and_ranking():
+                scientist_refresh = self._refresh_or_exhaust()
+                if scientist_refresh is None:
+                    return self._finalize(
+                        DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                        DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                    )
+                if not scientist_refresh:
                     return self._finalize(
                         DiscoveryLifecycleStatus.FAILED,
                         DiscoveryTerminationReason.COMPONENT_FAILURE,
                     )
+
+            if self._budget_stop_reason is not None:
+                return self._finalize(
+                    DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
+                    DiscoveryTerminationReason.BUDGET_EXHAUSTED,
+                )
 
             # Stopping precedence order:
             # 1. Configured stopping criterion satisfied
@@ -679,6 +861,10 @@ class DiscoveryEngine:
 
             # 2. Query budget exhausted (takes precedence over consecutive failures)
             if self._attempted_queries >= self._config.max_query_budget:
+                self._notify_budget_exhausted(
+                    BudgetStopReason.QUERY_BUDGET_EXHAUSTED,
+                    BudgetResource.ORACLE_QUERY,
+                )
                 return self._finalize(
                     DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED,
                     DiscoveryTerminationReason.BUDGET_EXHAUSTED,
@@ -704,6 +890,9 @@ class DiscoveryEngine:
         remains. Raises ``_ComponentFailure`` for contract violations and
         ``_BudgetExhausted`` if the budget disappeared mid-iteration.
         """
+        if self.is_cancelled():
+            raise _CancelledException()
+
         batch = self._generate_experiment_batch()
         if batch is None:
             return None
@@ -723,6 +912,8 @@ class DiscoveryEngine:
             self._config.max_experiment_candidates_per_iteration,
         )
         for _ in range(limit):
+            if self.is_cancelled():
+                raise _CancelledException()
             remaining = [
                 candidate
                 for candidate in batch.candidates
@@ -823,7 +1014,13 @@ class DiscoveryEngine:
                 )
                 continue
 
+            if self.is_cancelled():
+                raise _CancelledException()
             if self._attempted_queries >= self._config.max_query_budget:
+                self._notify_budget_exhausted(
+                    BudgetStopReason.QUERY_BUDGET_EXHAUSTED,
+                    BudgetResource.ORACLE_QUERY,
+                )
                 raise _BudgetExhausted()
             return self._invoke_oracle(selected, iteration, selection_diagnostics)
 
@@ -832,6 +1029,41 @@ class DiscoveryEngine:
     def _max_supported_polynomial_degree(self) -> int:
         """Highest degree the run's candidate configuration supports."""
         return max(0, int(self._config.hypothesis_config.max_degree))
+
+    def _notify_budget_exhausted(
+        self, reason: BudgetStopReason, resource: Optional[BudgetResource] = None
+    ) -> None:
+        """Let the persisted budget record a stop found by local counters."""
+        if self._budget is None:
+            return
+        try:
+            self._budget.mark_exhausted(reason, resource)
+        except BudgetValidationError as exc:  # pragma: no cover - defensive
+            self._warnings.append(
+                make_structured_error(
+                    ERROR_UNEXPECTED_DISCOVERY_ERROR,
+                    "The budget manager rejected the recorded exhaustion reason.",
+                    detail=str(exc),
+                )
+            )
+
+    def _reserve_hypothesis_capacity(self, count: int, operation_id: str) -> bool:
+        """Reserve persisted hypothesis-generation capacity, if a budget exists.
+
+        Returns False when the configured hypothesis limit is exhausted. No
+        candidate is added in that case, and the caller stops the run before
+        scheduling any further work.
+        """
+        if self._budget is None or count <= 0:
+            return True
+        try:
+            self._budget.reserve_hypotheses(
+                count, f"{self._run_id}:hypotheses:{operation_id}"
+            )
+        except BudgetAdmissionDenied as exc:
+            self._budget_stop_reason = exc.reason
+            return False
+        return True
 
     def _run_scientist_round(self, iteration: Optional[int]) -> bool:
         """Run one optional LLM proposal round; return True when candidates were added.
@@ -849,7 +1081,7 @@ class DiscoveryEngine:
         experiment generator; they cannot call the oracle directly.
         """
         scientist = self._scientist
-        if scientist is None:
+        if scientist is None or self.is_cancelled():
             return False
         if not bool(getattr(scientist, "can_propose", True)):
             return False
@@ -920,6 +1152,7 @@ class DiscoveryEngine:
             )
 
         added = 0
+        new_hypotheses: List[HypothesisRepresentation] = []
         existing_ids = set(self._candidate_by_id)
         existing_keys = {
             key
@@ -979,6 +1212,18 @@ class DiscoveryEngine:
                 continue
             existing_keys.add(canonical_key)
             existing_ids.add(hypothesis.hypothesis_id)
+            new_hypotheses.append(hypothesis)
+
+        if new_hypotheses and not self._reserve_hypothesis_capacity(
+            len(new_hypotheses),
+            f"scientist:{iteration if iteration is not None else 'initial'}",
+        ):
+            # The configured hypothesis limit is exhausted. Existing candidates
+            # are preserved; none of the new proposals are adopted, and the
+            # caller stops scheduling further work.
+            return False
+
+        for hypothesis in new_hypotheses:
             self._candidates.append(hypothesis)
             self._candidate_by_id[hypothesis.hypothesis_id] = hypothesis
             added += 1
@@ -1131,17 +1376,70 @@ class DiscoveryEngine:
         """
         last_error: Optional[StructuredError] = None
         for attempt_index in range(self._config.max_query_retries + 1):
+            if self.is_cancelled():
+                raise _CancelledException()
+            if self._budget is not None:
+                # Persisted lifecycle, runtime, and cost gates are checked
+                # before any query capacity is reserved.
+                try:
+                    self._budget.ensure_work_allowed(
+                        f"{self._run_id}:query-check:{iteration}:{attempt_index}"
+                    )
+                except BudgetAdmissionDenied:
+                    raise _BudgetExhausted() from None
+
             with self._query_lock:
+                if self.is_cancelled():
+                    raise _CancelledException()
                 if self._attempted_queries >= self._config.max_query_budget:
                     if last_error is None:
                         raise _BudgetExhausted()
                     break
                 self._attempted_queries += 1
                 self._in_flight_queries = 1
+                attempt_number = self._attempted_queries
+
+            budget_reservation: Optional[str] = None
+            if self._budget is not None:
+                # Every invocation attempt, including a retry, must be admitted
+                # against the persisted run budget before it can reach the
+                # oracle. A denial rolls the local attempt counter back so the
+                # engine never claims a query that was not sent.
+                try:
+                    budget_reservation = self._budget.reserve_oracle_query(
+                        f"{self._run_id}:query:{attempt_number}"
+                    )
+                except BudgetReservationReplay as replay:
+                    # This exact attempt was already admitted earlier. Replaying
+                    # it would send a second billable query without consuming a
+                    # second slot, so it is refused rather than treated as a
+                    # fresh admission.
+                    with self._query_lock:
+                        self._attempted_queries -= 1
+                        self._in_flight_queries = 0
+                    raise _ComponentFailure(
+                        make_structured_error(
+                            ERROR_DUPLICATE_BUDGET_RESERVATION,
+                            "The oracle query reservation was replayed; the query was "
+                            "not sent a second time.",
+                            replay=replay.to_dict(),
+                        )
+                    ) from None
+                except BudgetAdmissionDenied:
+                    with self._query_lock:
+                        self._attempted_queries -= 1
+                        self._in_flight_queries = 0
+                    if last_error is None:
+                        raise _BudgetExhausted() from None
+                    break
 
             try:
                 observation = self._oracle.query(selected.input_data)
             except Exception as exc:  # noqa: BLE001 - oracle boundary
+                if budget_reservation is not None:
+                    self._budget.record_oracle_query_outcome(
+                        budget_reservation, "failed"
+                    )
                 with self._query_lock:
                     self._failed_queries += 1
                     self._in_flight_queries = 0
@@ -1187,6 +1485,10 @@ class DiscoveryEngine:
 
             validation_error = self._validate_oracle_response(observation, selected.input_data)
             if validation_error is not None:
+                if budget_reservation is not None:
+                    self._budget.record_oracle_query_outcome(
+                        budget_reservation, "failed"
+                    )
                 with self._query_lock:
                     self._failed_queries += 1
                     self._in_flight_queries = 0
@@ -1200,6 +1502,10 @@ class DiscoveryEngine:
                     selection_diagnostics=selection_diagnostics,
                 )
 
+            if budget_reservation is not None:
+                self._budget.record_oracle_query_outcome(
+                    budget_reservation, "completed"
+                )
             with self._query_lock:
                 self._successful_queries += 1
                 self._in_flight_queries = 0
@@ -1632,6 +1938,17 @@ class DiscoveryEngine:
     def _observation_ids(self) -> List[str]:
         return list(self._observations.keys())
 
+    def _refresh_or_exhaust(self) -> Optional[bool]:
+        """Refresh evaluation/ranking, or ``None`` when the budget denied it.
+
+        ``None`` is distinct from ``False``: a denial is a resource stop, not a
+        component failure, so it must finalize as ``TERMINATED_BUDGET_EXHAUSTED``.
+        """
+        try:
+            return self._refresh_evaluation_and_ranking()
+        except _BudgetExhausted:
+            return None
+
     def _refresh_evaluation_and_ranking(self) -> bool:
         """Recompute evaluation and ranking; commit both only on full success."""
         if not self._candidates:
@@ -1647,11 +1964,45 @@ class DiscoveryEngine:
             )
             for candidate in self._candidates
         ]
+
+        self._evaluation_sequence += 1
+        evaluation_reservation: Optional[str] = None
+        if self._budget is not None:
+            # Candidate evaluations are admitted against the persisted run
+            # budget before any fitting work starts.
+            try:
+                evaluation_reservation = self._budget.reserve_candidate_evaluations(
+                    len(requests),
+                    f"{self._run_id}:evaluations:{self._evaluation_sequence}",
+                )
+            except BudgetReservationReplay as replay:
+                # The same evaluation batch was already admitted. Re-running it
+                # would double the provider work without consuming capacity, so
+                # the refresh is reported as a component failure instead.
+                self._ranking_is_fresh = False
+                self._errors.append(
+                    make_structured_error(
+                        ERROR_DUPLICATE_BUDGET_RESERVATION,
+                        "The candidate evaluation reservation was replayed; the batch "
+                        "was not evaluated a second time.",
+                        replay=replay.to_dict(),
+                    )
+                )
+                return False
+            except BudgetAdmissionDenied:
+                raise _BudgetExhausted() from None
+
         try:
             results = self._evaluation_pipeline.evaluate_many(
                 requests, dict(self._observations), dataset_id=self._dataset_id
             )
+        except _BudgetExhausted:
+            raise
         except Exception as exc:  # noqa: BLE001 - component boundary
+            if evaluation_reservation is not None:
+                self._budget.complete_candidate_evaluation(
+                    evaluation_reservation, False
+                )
             self._ranking_is_fresh = False
             self._errors.append(
                 make_structured_error(
@@ -1662,6 +2013,9 @@ class DiscoveryEngine:
                 )
             )
             return False
+
+        if evaluation_reservation is not None:
+            self._budget.complete_candidate_evaluation(evaluation_reservation, True)
 
         if not isinstance(results, list) or len(results) != len(requests):
             self._ranking_is_fresh = False

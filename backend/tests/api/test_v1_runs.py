@@ -52,7 +52,7 @@ class TestCreateRun:
         assert "run" in data
         run = data["run"]
         assert run["name"] == "Minimal Run"
-        assert run["status"] == "pending"
+        assert run["status"] in {"pending", "queued"}  # 'queued' is the canonical lifecycle state
         assert run["run_id"].startswith("run-")
         assert run["created_at"] is not None
 
@@ -133,6 +133,22 @@ class TestCreateRun:
         assert "status_code" in data
         assert data["status_code"] == 400
 
+    def test_create_run_atomic_rollback_on_registration_failure(self, client, app):
+        """When lifecycle manager initialization fails, DB row is rolled back and no orphan persists."""
+        from unittest.mock import patch
+        from app.domain.run_lifecycle import DuplicateExecutionError
+
+        mgr = app.config["LIFECYCLE_MANAGER"]
+        run_id = "run-fail-init-test"
+
+        with patch.object(mgr, "initialize_run", side_effect=DuplicateExecutionError("Simulated registration error")):
+            res = client.post("/api/v1/runs", json={"name": "Atomic Fail", "run_id": run_id})
+            assert res.status_code == 500
+
+        # Verify no orphan row exists in DB
+        get_res = client.get(f"/api/v1/runs/{run_id}")
+        assert get_res.status_code == 404
+        assert run_id not in mgr._progress_registry
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/runs — listing
@@ -231,6 +247,48 @@ class TestGetRun:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/runs/<run_id>/status — lifecycle progress snapshot
+# ---------------------------------------------------------------------------
+
+class TestRunStatus:
+    def test_returns_status_for_created_run(self, client):
+        """GET /status returns 200 with a progress snapshot for a created run."""
+        run = _make_run(client, "Status Run")
+        res = client.get(f"/api/v1/runs/{run['run_id']}/status")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert "status" in data
+        progress = data["status"]
+        assert progress["run_id"] == run["run_id"]
+        assert progress["status"] in {"queued", "pending"}
+
+    def test_status_has_required_keys(self, client):
+        """Progress snapshot contains all documented fields."""
+        run = _make_run(client, "Key Check Run")
+        res = client.get(f"/api/v1/runs/{run['run_id']}/status")
+        progress = res.get_json()["status"]
+        for key in ("run_id", "status", "phase", "queries_used", "queries_remaining",
+                    "evaluations_completed", "elapsed_seconds", "started_at",
+                    "completed_at", "current_activity", "stop_reason",
+                    "failure_details", "last_updated_at"):
+            assert key in progress, f"Missing key: {key}"
+
+    def test_status_has_no_fabricated_percentage(self, client):
+        """Progress snapshot must not contain a percentage/percent key."""
+        run = _make_run(client, "No Percent Run")
+        res = client.get(f"/api/v1/runs/{run['run_id']}/status")
+        progress = res.get_json()["status"]
+        for key in progress:
+            assert "percent" not in key.lower()
+
+    def test_status_unknown_run_returns_404(self, client):
+        """Unknown run_id returns 404."""
+        res = client.get("/api/v1/runs/run-ghost/status")
+        assert res.status_code == 404
+
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/runs/<run_id>/cancel
 # ---------------------------------------------------------------------------
 
@@ -266,13 +324,29 @@ class TestCancelRun:
         res = client.post("/api/v1/runs/run-ghost/cancel")
         assert res.status_code == 404
 
+    def test_cancel_running_run_returns_202_cancelling(self, client):
+        """Cancelling an active running run transitions to 'cancelling' and returns 202 Accepted."""
+        run = _make_run(client, "Active Running")
+        # Start run first
+        start_res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert start_res.status_code == 200
+        assert start_res.get_json()["run"]["status"] == "running"
+
+        # Request cancellation
+        cancel_res = client.post(f"/api/v1/runs/{run['run_id']}/cancel")
+        assert cancel_res.status_code == 202
+        data = cancel_res.get_json()
+        assert data["run"]["status"] == "cancelling"
+        assert data["status"]["status"] == "cancelling"
+        assert "in progress" in data["message"].lower()
+
     def test_cancel_records_actual_prior_status_in_audit_event(self, client, app):
         """Audit event records the true previous status (not 'cancelled') in metadata_json."""
         from app.adapters.persistence.database import get_db_manager
         from app.adapters.persistence.repository import ClarityRepository
 
         run = _make_run(client, "Audit Status Check")
-        # Initial run status is "pending"
+        # Initial run status is "queued" / "pending"
         res = client.post(
             f"/api/v1/runs/{run['run_id']}/cancel",
             json={"reason": "User stop"},
@@ -286,8 +360,36 @@ class TestCancelRun:
             events = repo.list_audit_events_for_run(run["run_id"])
             cancel_events = [e for e in events if e.event_type == "RUN_CANCELLED"]
             assert len(cancel_events) == 1
-            assert cancel_events[0].metadata_json["previous_status"] == "pending"
-            assert cancel_events[0].metadata_json["stop_reason"] == "User stop"
+            meta = cancel_events[0].metadata_json
+            assert meta.get("previous_status") in {"pending", "queued"}
+            assert meta.get("stop_reason") == "User stop"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/runs/<run_id>/start
+# ---------------------------------------------------------------------------
+
+class TestStartRun:
+    def test_start_queued_run_returns_200(self, client):
+        """Starting a queued run returns 200 with status running."""
+        run = _make_run(client, "Start Test")
+        res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["run"]["status"] == "running"
+        assert data["status"]["status"] == "running"
+
+    def test_start_already_running_returns_409(self, client):
+        """Starting an already active run returns 409 Conflict."""
+        run = _make_run(client, "Already Running")
+        client.post(f"/api/v1/runs/{run['run_id']}/start")
+        res = client.post(f"/api/v1/runs/{run['run_id']}/start")
+        assert res.status_code == 409
+
+    def test_start_unknown_run_returns_404(self, client):
+        """Starting an unknown run returns 404."""
+        res = client.post("/api/v1/runs/run-ghost/start")
+        assert res.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +643,6 @@ class TestRunObservations:
         assert any("count(" in stmt.lower() for stmt in obs_sqls), f"Missing count query in: {obs_sqls}"
         paged_sqls = [stmt for stmt in obs_sqls if "limit" in stmt.lower() and "offset" in stmt.lower()]
         assert len(paged_sqls) >= 1, f"Expected bounded SQL with LIMIT and OFFSET, found: {obs_sqls}"
-
-
     def test_no_oracle_internals_in_observations(self, client, app):
         """Observation response never contains oracle formula or hidden ground truth."""
         run = _make_run(client, "Secret Check")
