@@ -34,7 +34,8 @@ from ..domain.history_contracts import (
     ACTOR_RESEARCHER,
     AUDIT_HYPOTHESIS_REVISED,
     REVISION_SOURCE_RESEARCHER,
-    compute_dataset_snapshot_id,
+    build_dataset_snapshot,
+    compute_revision_request_fingerprint,
 )
 from ..domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
 from ..domain.sanitization import sanitize_reason_text
@@ -304,6 +305,29 @@ def update_hypothesis_flags_service(
     return hyp
 
 
+def _revision_matches_request(
+    revision: HypothesisRevisionModel,
+    request_fingerprint: str,
+    formula: str,
+    parameters: Optional[Mapping[str, Any]],
+    complexity: Optional[int],
+) -> bool:
+    """Return True when a committed revision already represents this request.
+
+    Revisions written with a canonical ``request_fingerprint`` are compared on
+    that fingerprint, which covers model family and creation source too. Legacy
+    rows without one fall back to the definition fields.
+    """
+    stored = getattr(revision, "request_fingerprint", None)
+    if stored:
+        return stored == request_fingerprint
+    return (
+        revision.formula == formula
+        and dict(revision.parameters or {}) == dict(parameters or {})
+        and revision.complexity == complexity
+    )
+
+
 def revise_hypothesis_service(
     session: Session,
     hypothesis_id: str,
@@ -398,14 +422,27 @@ def revise_hypothesis_service(
         )
     )
 
+    # Every semantically relevant field of the request is fingerprinted, not just
+    # formula/parameters/complexity: replaying a key with a different model
+    # family (or creation source) is a conflicting request, not a replay.
+    request_fingerprint = compute_revision_request_fingerprint(
+        formula=target_formula,
+        parameters=final_parameters,
+        complexity=final_complexity,
+        model_family=target_family,
+        creation_source=creation_source,
+    )
+
     # 2. Idempotent replay of an already-committed request.
     if request_key:
         replay = repo.get_revision_by_request_key(hypothesis_id, request_key)
         if replay is not None:
-            if (
-                replay.formula != target_formula
-                or dict(replay.parameters or {}) != dict(final_parameters or {})
-                or replay.complexity != final_complexity
+            if not _revision_matches_request(
+                replay,
+                request_fingerprint=request_fingerprint,
+                formula=target_formula,
+                parameters=final_parameters,
+                complexity=final_complexity,
             ):
                 raise HypothesisConflictError(
                     f"Request key '{request_key}' was already used for a different revision "
@@ -450,6 +487,7 @@ def revise_hypothesis_service(
         actor=actor,
         actor_id=actor_id,
         request_key=request_key or None,
+        request_fingerprint=request_fingerprint,
     )
 
     try:
@@ -466,7 +504,13 @@ def revise_hypothesis_service(
         session.rollback()
         if request_key:
             replay = repo.get_revision_by_request_key(hypothesis_id, request_key)
-            if replay is not None and replay.formula == target_formula:
+            if replay is not None and _revision_matches_request(
+                replay,
+                request_fingerprint=request_fingerprint,
+                formula=target_formula,
+                parameters=final_parameters,
+                complexity=final_complexity,
+            ):
                 return replay
         raise HypothesisConflictError(
             f"Hypothesis '{hypothesis_id}' was modified concurrently; no revision was written."
@@ -608,15 +652,18 @@ def _execute_pipeline_for_revision(
     """Execute domain EvaluationPipeline on a hypothesis revision and update eval_model.
 
     The evaluation record is stamped with the exact scientific inputs it used: the
-    hypothesis revision that was evaluated and a deterministic snapshot identifier
-    of the ordered training observation IDs. Together they keep historical
-    evaluations traceable after the hypothesis is edited or new observations
-    arrive.
+    hypothesis revision that was evaluated, plus a content-addressed snapshot of
+    the observations supplied to the pipeline and the manifest it was computed
+    from. Because the fingerprint covers observation content and not just ids, a
+    changed input/output/status/partition changes the snapshot too, and the stored
+    manifest keeps the evaluated data reconstructable after the hypothesis is
+    edited or new observations arrive.
     """
     obs_models = repo.list_observations_for_run(hyp.run_id)
     training_ids = [o.observation_id for o in obs_models if not o.is_held_out]
     held_out_ids = [o.observation_id for o in obs_models if o.is_held_out]
-    dataset_snapshot_id = compute_dataset_snapshot_id(hyp.run_id, training_ids)
+    dataset_snapshot = build_dataset_snapshot(hyp.run_id, obs_models)
+    dataset_snapshot_id = dataset_snapshot.snapshot_id
 
     obs_domain: Dict[str, Observation] = {}
     for o in obs_models:
@@ -679,6 +726,7 @@ def _execute_pipeline_for_revision(
     eval_model.sample_count = result.sample_count
     eval_model.dataset_version = len(training_ids)
     eval_model.dataset_snapshot_id = dataset_snapshot_id
+    eval_model.dataset_snapshot = dataset_snapshot.manifest
     # A failed evaluation keeps whatever the pipeline actually produced (often an
     # empty mapping). Missing metrics are never fabricated into zeros.
     eval_model.metrics = result.metrics or {}
@@ -704,6 +752,9 @@ def _execute_pipeline_for_revision(
                 "sample_count": result.sample_count,
                 "dataset_version": len(training_ids),
                 "dataset_snapshot_id": dataset_snapshot_id,
+                "dataset_observation_count": dataset_snapshot.manifest[
+                    "observation_count"
+                ],
             },
             before_json=None,
             after_json={

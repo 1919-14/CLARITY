@@ -22,7 +22,8 @@ There is **no second audit pipeline**: history is a read model over `audit_event
    researcher preferences. They are audited with before/after values, but they never
    create a revision, never alter metrics, and never change rankings.
 4. **Every evaluation names its inputs.** An evaluation records both the `revision_id`
-   it evaluated and a `dataset_snapshot_id` fingerprint of the exact observation set.
+   it evaluated and a `dataset_snapshot_id` fingerprint of the *content* of the exact
+   observations used, plus the canonical manifest it was computed from.
 5. **Failed work stays distinguishable from successful work.** A failed evaluation keeps
    its `failed` status and error message; missing metrics stay empty rather than being
    converted to zeros.
@@ -133,6 +134,7 @@ Table: `hypothesis_revisions` (immutable).
 | `change_reason` | Optional explanation supplied by the researcher. |
 | `actor` / `actor_id` | Who produced the revision. |
 | `request_key` | Client idempotency key, unique per hypothesis. |
+| `request_fingerprint` | Canonical fingerprint (`req-…`) of formula, parameters, complexity, model family and creation source of the request that created the revision. |
 | `created_at` | UTC creation timestamp. |
 
 ### Numbering and integrity
@@ -156,6 +158,10 @@ Table: `hypothesis_revisions` (immutable).
   returns `409`.
 - A lost database race (duplicate revision number or request key) rolls the transaction back
   and returns `409`; no partial revision survives.
+- A replayed idempotency key is compared on `request_fingerprint`, not only on
+  formula/parameters/complexity: the same formula with a different `model_family` is a
+  conflicting request (`409`), not a replay. `reason`, `actor` and `actor_id` are metadata
+  and may differ on a retry.
 
 ### Lifecycle actions do not create revisions
 
@@ -188,7 +194,8 @@ Table: `evaluation_results`.
 | `revision_id` | The exact hypothesis revision evaluated (foreign key, `ON DELETE RESTRICT`). |
 | `run_id` | Owning run; cross-run evaluation is rejected by the repository. |
 | `status` | `pending`, `completed`, `failed`. |
-| `dataset_snapshot_id` | Deterministic fingerprint of the exact training observation set used. |
+| `dataset_snapshot_id` | Content-addressed fingerprint of the exact observations supplied to the pipeline. |
+| `dataset_snapshot` | Canonical manifest the fingerprint was computed from (observation ids, inputs, outputs, status, partition, sequence). JSON column; not exposed by the API. |
 | `dataset_version` | Number of training observations at evaluation time (retained for compatibility). |
 | `sample_count` | Number of samples actually used by the pipeline. |
 | `metrics` / `held_out_metrics` | Structured metrics; `{}` / `null` when unavailable. |
@@ -197,29 +204,41 @@ Table: `evaluation_results`.
 
 ### `dataset_snapshot_id`
 
-Computed by `app.domain.history_contracts.compute_dataset_snapshot_id(run_id, ids)`:
+Computed by `app.domain.history_contracts.build_dataset_snapshot(run_id, observations)`
+(exposed as `compute_dataset_snapshot_id`):
 
 ```
-dset-<first 32 hex chars of sha256(json({run_id, observations: sorted(unique(ids))}))>
+dset-<first 32 hex chars of sha256(json({schema_version, run_id,
+       observations: [canonical observation records sorted by observation_id]}))>
 ```
+
+Each canonical record contains `observation_id`, `input_id`, `input_values`,
+`output_values`, `status`, `sequence_number` and `is_held_out`. Bare observation ids are
+rejected: a hash of identifiers cannot notice that the evaluated data changed.
 
 Properties:
 
-- **Identity, not count.** Two different observation sets of the same size produce
-  different ids; earlier versions relying on `dataset_version` (a count) could not tell them
-  apart.
-- **Set-stable.** Reordering the same observation ids yields the same id.
+- **Content, not count or identity alone.** Two observation sets of the same size produce
+  different ids, and changing any scientific field of an observation while keeping its id
+  also changes the id.
+- **Reconstructable.** The same canonical manifest is persisted in
+  `evaluation_results.dataset_snapshot`, so the exact inputs behind a snapshot id can be
+  re-read and re-fingerprinted later instead of being inferred.
+- **Set-stable.** Reordering the same observations yields the same id; duplicate ids with
+  identical content collapse, while two different records sharing an id raise an error
+  (`ValueError`) rather than hashing an ambiguous dataset.
 - **Run-scoped.** Ids from another run cannot collide.
-- **A fingerprint, not a signature.** It proves set equality against the same inputs; it is
-  not a tamper-proof commitment.
+- **A fingerprint, not a signature.** It proves content equality against the same inputs; it
+  is not a tamper-proof commitment, and observation rows themselves are not made immutable
+  by this column.
 
 `dataset_version` and `sample_count` remain descriptive only. A count alone is never treated
 as dataset identity.
 
 ### Pending evaluations
 
-An enqueued evaluation is written with `status = "pending"` and
-`dataset_snapshot_id = null`: it has not consumed any inputs yet. The worker that
+An enqueued evaluation is written with `status = "pending"`,
+`dataset_snapshot_id = null` and `dataset_snapshot = null`: it has not consumed any inputs yet. The worker that
 consumes it (`consume_pending_evaluation`) stamps the revision and the snapshot at
 execution time, so provenance always reflects the inputs actually used rather than the
 inputs that existed when the request was queued.
@@ -228,7 +247,7 @@ inputs that existed when the request was queued.
 
 A failed evaluation keeps `status = "failed"`, its `error_message`, and the empty metrics the
 pipeline produced. It remains distinguishable from a successful evaluation whose MAE is
-legitimately 0.0, and it keeps its own `dataset_snapshot_id` so the attempted inputs are
+legitimately 0.0, and it keeps its own `dataset_snapshot_id` and manifest so the attempted inputs are
 still traceable.
 
 ### Re-evaluation
@@ -267,7 +286,7 @@ transaction.
 
 | Operation | Mechanism | Behaviour on replay |
 |---|---|---|
-| Hypothesis edit (`POST /hypotheses/{id}/revisions`) | `Idempotency-Key` header or `idempotency_key` body field, stored in `hypothesis_revisions.request_key` with `UNIQUE (hypothesis_id, request_key)` | Same payload → the committed revision is returned with `200` and `idempotent_replay: true`; different payload → `409` |
+| Hypothesis edit (`POST /hypotheses/{id}/revisions`) | `Idempotency-Key` header or `idempotency_key` body field, stored in `hypothesis_revisions.request_key` with `UNIQUE (hypothesis_id, request_key)`; payload compared through `hypothesis_revisions.request_fingerprint` | Same payload → the committed revision is returned with `200` and `idempotent_replay: true`; different payload (including a different `model_family`) → `409` |
 | Hypothesis creation (`POST /runs/{id}/hypotheses`) | Caller-supplied `hypothesis_id` plus the Issue #14 budget reservation's `operation_id` | Duplicate id → `409`; replayed admission → `409` "already admitted" |
 | Run creation (`POST /runs`) | Caller-supplied `run_id` with primary-key uniqueness | Duplicate id → `409` |
 | Audit event append | Caller-supplied `event_id` with content comparison | Identical content → existing event returned; conflicting content → `409` |
@@ -416,8 +435,10 @@ oracle internals, or unvalidated provider metadata.
    that.
 7. **No outbox.** Events are written inside the same database transaction. Any future external
    delivery must add an outbox rather than a second, non-transactional write.
-8. **Snapshot ids are fingerprints**, not proofs: they establish set equality for the same
-   run and inputs, not authorship or tamper resistance.
+8. **Snapshot ids are fingerprints**, not proofs: they establish content equality for the
+   same run and inputs, not authorship or tamper resistance. Observation rows remain
+   mutable at the ORM layer; the content-addressed snapshot is what makes a mutation
+   visible instead of silent.
 9. **Offset pagination is unstable under concurrent appends** by design; use `cursor`.
 10. **A lost write race rolls back the caller's transaction.** `revise_hypothesis_service`
     rolls back on a database conflict before raising, so compose it in its own transaction
@@ -432,8 +453,9 @@ oracle internals, or unvalidated provider metadata.
 - Initial revision creation; edit appends while preserving the previous definition; invalid
   and no-op edits write nothing; stale expected revision; duplicate revision number rejection.
 - Revision and dataset-snapshot references on evaluations; snapshot stability and change;
-  append-only evaluation history; failed-evaluation fidelity; edits not rewriting earlier
-  evaluations.
+  snapshot change when observation *content* changes under an unchanged id; reconstructable
+  manifests; rejection of id-only snapshot input; append-only evaluation history;
+  failed-evaluation fidelity; edits not rewriting earlier evaluations.
 - Pin/unpin/exclude/restore events with before/after and no scientific change.
 - Stable event ids, aware UTC timestamps, actor identity, sanitized payloads, append-only
   enforcement, correction linkage, duplicate-id conflict.
@@ -441,7 +463,8 @@ oracle internals, or unvalidated provider metadata.
   missing resources, malformed cursors.
 - Transaction rollback when the audit write fails; safe retry afterwards; revision and event
   committing together.
-- Idempotent replay, conflicting key reuse, and a validation failure not consuming the key.
+- Idempotent replay, conflicting key reuse (including a model-family-only difference),
+  canonical full-request comparison, and a validation failure not consuming the key.
 - Cancellation and run failure preserving revisions, evaluations and earlier events.
 - API contract: create revision, revision history, evaluation history, cursor pagination,
   filters, `404`/`400`/`409`/`422` behaviour.

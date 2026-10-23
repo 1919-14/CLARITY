@@ -19,8 +19,9 @@ import base64
 import binascii
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Actor categories
@@ -71,31 +72,162 @@ class InvalidHistoryCursorError(ValueError):
 # ---------------------------------------------------------------------------
 
 DATASET_SNAPSHOT_PREFIX = "dset-"
+DATASET_SNAPSHOT_SCHEMA_VERSION = 1
+REVISION_REQUEST_FINGERPRINT_PREFIX = "req-"
 
 
-def compute_dataset_snapshot_id(run_id: str, observation_ids: Sequence[str]) -> str:
-    """Return a stable identifier for the exact observation set used.
+def _canonical_value(value: Any, field: str) -> Any:
+    """Normalize a stored value into a deterministic JSON-compatible form."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_value(item, field)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item, field) for item in value]
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and isinstance(enum_value, (bool, int, float, str)):
+        return enum_value
+    raise TypeError(
+        f"Observation field {field!r} contains a value that cannot be canonicalized: "
+        f"{type(value).__name__}."
+    )
 
-    The identifier is a truncated SHA-256 over the run ID plus the sorted,
-    de-duplicated observation IDs. It is derived from identity, not from a
-    count: two different observation sets of the same size produce different
-    snapshots, and the same set always produces the same value, so a historical
-    evaluation keeps identifying its original dataset even after new
-    observations arrive.
 
-    The digest is an identity fingerprint, not a cryptographic signature or a
-    tamper-proof commitment; it proves set equality against the same inputs.
+def _observation_field(observation: Any, name: str, default: Any = None) -> Any:
+    if isinstance(observation, Mapping):
+        return observation.get(name, default)
+    return getattr(observation, name, default)
+
+
+def canonical_observation_record(observation: Any) -> Dict[str, Any]:
+    """Return the canonical scientific content of one observation.
+
+    The record deliberately covers the fields that determine what was evaluated
+    (inputs, outputs, status, partition and sequence), not just the identifier.
+    Two observations with the same ID but different content therefore produce
+    different records and different dataset snapshot ids.
+    """
+    if isinstance(observation, str):
+        raise ValueError(
+            "A dataset snapshot requires observation content, not a bare observation id. "
+            "Pass the observation records that were evaluated."
+        )
+    observation_id = _observation_field(observation, "observation_id")
+    if not isinstance(observation_id, str) or not observation_id:
+        raise ValueError("Each observation in a dataset snapshot needs a non-empty id.")
+
+    status = _observation_field(observation, "status")
+    if status is not None and not isinstance(status, str):
+        status = getattr(status, "value", status)
+
+    sequence_number = _observation_field(observation, "sequence_number")
+    if isinstance(sequence_number, bool) or not isinstance(sequence_number, (int, type(None))):
+        raise TypeError(
+            f"Observation {observation_id!r} has a non-integer sequence_number "
+            f"({type(sequence_number).__name__})."
+        )
+
+    return {
+        "observation_id": observation_id,
+        "input_id": _canonical_value(_observation_field(observation, "input_id"), "input_id"),
+        "input_values": _canonical_value(
+            _observation_field(observation, "input_values"), "input_values"
+        ),
+        "output_values": _canonical_value(
+            _observation_field(observation, "output_values"), "output_values"
+        ),
+        "status": status,
+        "sequence_number": sequence_number,
+        "is_held_out": bool(_observation_field(observation, "is_held_out", False)),
+    }
+
+
+@dataclass(frozen=True)
+class DatasetSnapshot:
+    """Content-addressed identity plus a reconstructable manifest of the data used."""
+
+    snapshot_id: str
+    manifest: Dict[str, Any]
+
+
+def build_dataset_snapshot(run_id: str, observations: Iterable[Any]) -> DatasetSnapshot:
+    """Fingerprint the canonical content of the exact observations an evaluation used.
+
+    Unlike a hash of observation *ids*, this changes when any scientific field of
+    an observation changes while its id stays the same. ``manifest`` carries the
+    canonical records, so the evaluated inputs can be reconstructed and re-checked
+    after the fact; it is persisted alongside the evaluation.
     """
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id is required to compute a dataset snapshot id.")
-    ordered = sorted({oid for oid in observation_ids if isinstance(oid, str)})
-    payload = json.dumps(
-        {"run_id": run_id, "observations": ordered},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-    return f"{DATASET_SNAPSHOT_PREFIX}{digest}"
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for observation in observations:
+        record = canonical_observation_record(observation)
+        existing = by_id.get(record["observation_id"])
+        if existing is not None and existing != record:
+            raise ValueError(
+                f"Two different observations share observation id "
+                f"{record['observation_id']!r}; the evaluated data is ambiguous."
+            )
+        by_id[record["observation_id"]] = record
+
+    ordered = [by_id[observation_id] for observation_id in sorted(by_id)]
+    payload = {
+        "schema_version": DATASET_SNAPSHOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "observations": ordered,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+    snapshot_id = f"{DATASET_SNAPSHOT_PREFIX}{digest}"
+    manifest = dict(payload)
+    manifest["snapshot_id"] = snapshot_id
+    manifest["observation_count"] = len(ordered)
+    return DatasetSnapshot(snapshot_id=snapshot_id, manifest=manifest)
+
+
+def compute_dataset_snapshot_id(run_id: str, observations: Iterable[Any]) -> str:
+    """Return the content-addressed snapshot id for the observations used.
+
+    The digest covers the run ID plus the canonical scientific content of every
+    observation, not merely its identifier: changing ``input_values``,
+    ``output_values``, ``status``, ``is_held_out`` or ``sequence_number`` while
+    keeping the id changes the snapshot. Ordering and duplicate ids are
+    normalized, so the same content always yields the same id.
+
+    The digest is an identity fingerprint, not a cryptographic signature or a
+    tamper-proof commitment.
+    """
+    return build_dataset_snapshot(run_id, observations).snapshot_id
+
+
+def compute_revision_request_fingerprint(
+    formula: str,
+    parameters: Optional[Mapping[str, Any]],
+    complexity: Optional[int],
+    model_family: Optional[str],
+    creation_source: Optional[str],
+) -> str:
+    """Fingerprint every semantically relevant field of a revision request.
+
+    Idempotency replay compares this canonical value, so reusing a request key
+    with the same formula/parameters/complexity but a different model family is
+    a conflict rather than a silent replay of the earlier revision.
+    """
+    payload = {
+        "formula": formula,
+        "parameters": _canonical_value(parameters, "parameters"),
+        "complexity": complexity,
+        "model_family": model_family,
+        "creation_source": creation_source,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+    return f"{REVISION_REQUEST_FINGERPRINT_PREFIX}{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +286,15 @@ __all__ = [
     "AUDIT_HYPOTHESIS_REVISED",
     "AppendOnlyViolationError",
     "DATASET_SNAPSHOT_PREFIX",
+    "DATASET_SNAPSHOT_SCHEMA_VERSION",
+    "DatasetSnapshot",
     "InvalidHistoryCursorError",
+    "REVISION_REQUEST_FINGERPRINT_PREFIX",
     "REVISION_SOURCE_RESEARCHER",
+    "build_dataset_snapshot",
+    "canonical_observation_record",
     "compute_dataset_snapshot_id",
+    "compute_revision_request_fingerprint",
     "decode_history_cursor",
     "encode_history_cursor",
 ]

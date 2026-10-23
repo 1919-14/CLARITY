@@ -264,8 +264,64 @@ class TestEvaluationProvenance:
         assert evaluation.dataset_version == 4
         assert evaluation.dataset_snapshot_id.startswith("dset-")
 
-        train_ids = [o.observation_id for o in repo.list_observations_for_run(run.run_id)]
-        assert evaluation.dataset_snapshot_id == compute_dataset_snapshot_id(run.run_id, train_ids)
+        observations = repo.list_observations_for_run(run.run_id)
+        assert evaluation.dataset_snapshot_id == compute_dataset_snapshot_id(
+            run.run_id, observations
+        )
+        assert evaluation.dataset_snapshot["snapshot_id"] == evaluation.dataset_snapshot_id
+        assert evaluation.dataset_snapshot["observation_count"] == 4
+
+    def test_snapshot_requires_observation_content_not_bare_ids(self):
+        """A hash of identifiers alone cannot detect changed evaluated inputs."""
+        with pytest.raises(ValueError):
+            compute_dataset_snapshot_id("run-1", ["obs-1", "obs-2"])
+
+    def test_changed_observation_content_changes_the_snapshot_without_changing_ids(self, session):
+        """Regression: same observation IDs, different scientific content."""
+        run = _new_run(session)
+        _add_observations(session, run.run_id, count=3)
+        hyp = propose_hypothesis_service(session, run.run_id, "linear", "y = 3*x^2 + 2")
+        repo = ClarityRepository(session)
+        observations = repo.list_observations_for_run(run.run_id)
+        observation_ids = [o.observation_id for o in observations]
+
+        first, _ = reevaluate_hypothesis_service(session, hyp.hypothesis_id)
+        first_snapshot = first.dataset_snapshot_id
+        first_manifest = dict(first.dataset_snapshot)
+        changed = observations[0]
+        original_inputs = dict(changed.input_values)
+        original_outputs = dict(changed.output_values)
+
+        # Keep the identifier, change the evaluated content.
+        changed.input_values = {"x": 42.0}
+        changed.output_values = {"y": 999.0}
+        session.flush()
+
+        second, _ = reevaluate_hypothesis_service(session, hyp.hypothesis_id)
+
+        # Identifiers are unchanged, so an id-only fingerprint would be stable.
+        assert [o.observation_id for o in repo.list_observations_for_run(run.run_id)] == observation_ids
+        assert second.dataset_snapshot_id != first_snapshot
+        assert second.dataset_snapshot_id == second.dataset_snapshot["snapshot_id"]
+        second_record = next(
+            record
+            for record in second.dataset_snapshot["observations"]
+            if record["observation_id"] == changed.observation_id
+        )
+        assert second_record["input_values"] == {"x": 42.0}
+        assert second_record["output_values"] == {"y": 999.0}
+
+        # The earlier evaluation keeps the manifest of what it actually used.
+        original = repo.list_evaluations_for_revision(first.revision_id, order="asc")[0]
+        assert original.dataset_snapshot_id == first_snapshot
+        assert original.dataset_snapshot == first_manifest
+        original_record = next(
+            record
+            for record in original.dataset_snapshot["observations"]
+            if record["observation_id"] == changed.observation_id
+        )
+        assert original_record["input_values"] == original_inputs
+        assert original_record["output_values"] == original_outputs
 
     def test_new_observations_change_the_snapshot_without_rewriting_history(self, session):
         run = _new_run(session)
@@ -786,6 +842,52 @@ class TestIdempotency:
         assert repo.count_audit_events_for_run(
             run.run_id, event_type=AUDIT_HYPOTHESIS_REVISED
         ) == 1
+
+    def test_reused_key_with_different_model_family_is_rejected(self, session):
+        """Formula/parameters/complexity match, only the family differs."""
+        run = _new_run(session)
+        hyp = propose_hypothesis_service(session, run.run_id, "linear", "y = 2*x + 1")
+        first = revise_hypothesis_service(
+            session,
+            hyp.hypothesis_id,
+            formula="y = 2*x + 6",
+            model_family="linear",
+            request_key="key-family",
+        )
+        assert first.request_fingerprint.startswith("req-")
+
+        with pytest.raises(HypothesisConflictError):
+            revise_hypothesis_service(
+                session,
+                hyp.hypothesis_id,
+                formula="y = 2*x + 6",
+                model_family="polynomial",
+                request_key="key-family",
+            )
+        assert len(ClarityRepository(session).list_hypothesis_revisions(hyp.hypothesis_id)) == 2
+
+    def test_replay_matches_the_full_canonical_request(self, session):
+        run = _new_run(session)
+        hyp = propose_hypothesis_service(session, run.run_id, "linear", "y = 2*x + 1")
+        first = revise_hypothesis_service(
+            session,
+            hyp.hypothesis_id,
+            formula="y = 2*x + 6",
+            model_family="linear",
+            parameters={"coefficients": {"c0": 6.0, "c1": 2.0}, "family": "polynomial", "degree": 1, "coefficient_order": "ascending"},
+            complexity=2,
+            request_key="key-canonical",
+        )
+        replay = revise_hypothesis_service(
+            session,
+            hyp.hypothesis_id,
+            formula="y = 2*x + 6",
+            model_family="linear",
+            parameters={"coefficient_order": "ascending", "degree": 1, "family": "polynomial", "coefficients": {"c1": 2.0, "c0": 6.0}},
+            complexity=2,
+            request_key="key-canonical",
+        )
+        assert replay.revision_id == first.revision_id
 
     def test_reused_key_with_different_payload_is_rejected(self, session):
         run = _new_run(session)

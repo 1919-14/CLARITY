@@ -1031,7 +1031,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Stale expected revision, reused idempotency key, or lost race
+          description: >-
+            Stale expected revision, reused idempotency key with a different payload
+            (including a different model family), or lost race
           content:
             application/json:
               schema:
@@ -1417,7 +1419,11 @@ components:
         dataset_snapshot_id:
           type: string
           nullable: true
-          description: Deterministic fingerprint of the exact observation set used.
+          description: >-
+            Content-addressed fingerprint of the exact observations used: inputs,
+            outputs, status, partition and sequence are all covered, so changing an
+            observation's content while keeping its id changes this value. The
+            canonical manifest behind the fingerprint is stored with the evaluation.
           example: dset-73628f529cdfa53b665b26175672cd10
         metrics:
           type: object

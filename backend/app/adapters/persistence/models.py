@@ -137,7 +137,10 @@ class HypothesisRevisionModel(Base):
     ``request_key`` carries the client-supplied idempotency key for a revision
     request; the unique constraint on ``(hypothesis_id, request_key)`` makes a
     replayed edit return the already-committed revision instead of writing a
-    duplicate.
+    duplicate. ``request_fingerprint`` is the canonical fingerprint of every
+    semantically relevant request field (formula, parameters, complexity, model
+    family, creation source), so replaying a key with a different payload is
+    detected even when formula/parameters/complexity happen to match.
     """
 
     __tablename__ = "hypothesis_revisions"
@@ -164,6 +167,7 @@ class HypothesisRevisionModel(Base):
     actor = Column(String(64), nullable=True)  # researcher, automated_agent, system
     actor_id = Column(String(128), nullable=True)
     request_key = Column(String(128), nullable=True)
+    request_fingerprint = Column(String(96), nullable=True)
 
     hypothesis = relationship("HypothesisModel", back_populates="revisions")
     evaluations = relationship(
@@ -243,8 +247,10 @@ class EvaluationResultModel(Base):
     # change independently while the count stays equal.
     dataset_version = Column(Integer, nullable=False, default=0)
     # Exact immutable scientific input (Issue #17): deterministic fingerprint of
-    # the ordered observation IDs that were used for this evaluation.
+    # the canonical content of the observations that were used for this
+    # evaluation, plus the manifest those inputs were fingerprinted from.
     dataset_snapshot_id = Column(String(96), nullable=True)
+    dataset_snapshot = Column(JSON, nullable=True)
     
     # Structured predictive metrics
     metrics = Column(JSON, nullable=False)  # {"mae": 0.045, "rmse": 0.052, ...}
