@@ -12,69 +12,9 @@
  *  - Large dataset label rendering doesn't throw
  */
 
-import { describe, it, before } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-
-// ============================================================================
-// Inline implementations of the pure functions from App.jsx.
-// Tested in isolation — no React, no DOM, no bundler needed.
-// ============================================================================
-
-/** Mirrors App.jsx formatCost */
-const formatCost = (value) =>
-  value === null || value === undefined ? 'Unavailable' : `$${Number(value).toFixed(4)}`;
-
-/** Mirrors App.jsx formatSeconds */
-const formatSeconds = (value) =>
-  value === null || value === undefined ? 'Not measurable' : `${Math.round(value)} s`;
-
-/** Mirrors App.jsx formatLimit */
-const formatLimit = (entry) => {
-  if (!entry) return 'Unavailable';
-  if (entry.limit === null || entry.limit === undefined) {
-    return `${entry.used} used · no limit`;
-  }
-  return `${entry.used} / ${entry.limit}`;
-};
-
-// ============================================================================
-// Minimal mock of the handleLoadBudget fetch logic, extracted for unit testing.
-// The real App component does exactly this; we verify the logic without React.
-// ============================================================================
-
-/**
- * Simulates the fetch + error-handling logic from App.jsx handleLoadBudget.
- * Returns { state: 'loaded'|'error', budget?, error? }
- */
-async function loadBudget(runId, fetchFn) {
-  const trimmed = (runId || '').trim();
-  if (!trimmed) {
-    return { state: 'error', error: 'Run ID must not be empty.' };
-  }
-
-  let state = 'loading';
-  let budget = null;
-  let error = null;
-
-  try {
-    const response = await fetchFn(`/api/v1/runs/${encodeURIComponent(trimmed)}/budget`);
-    const json = await response.json().catch(() => null);
-
-    if (!response.ok) {
-      throw new Error(json?.message || `HTTP Error ${response.status}: ${response.statusText}`);
-    }
-    if (!json || !json.budget) {
-      throw new Error('Unexpected budget response from the backend.');
-    }
-    budget = json.budget;
-    state = 'loaded';
-  } catch (err) {
-    state = 'error';
-    error = err instanceof Error ? err.message : 'Unable to load the run budget.';
-  }
-
-  return { state, budget, error };
-}
+import { formatCost, formatSeconds, formatLimit, loadBudget } from './budgetUtils.js';
 
 // ============================================================================
 // 1. formatCost — null/undefined/zero/extreme

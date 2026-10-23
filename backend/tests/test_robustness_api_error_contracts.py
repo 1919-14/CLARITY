@@ -279,15 +279,39 @@ class TestNoLeakageInErrorResponses:
         assert res.status_code == 409
         self._assert_no_internal_leak(res)
 
-    def test_simulated_500_no_traceback_in_testing_mode(self, client, app):
-        """A route that raises unexpectedly must return clean JSON 500 with no Python traceback."""
-        from app.routes.v1.runs import runs_v1_bp
-
-        # Inject an unhandled exception into a route
+    def test_simulated_500_no_traceback_in_testing_mode(self, client):
+        """A route that encounters an internal exception must return clean JSON 500 with no traceback/SQL."""
+        # Inject an internal repository exception into GET /api/v1/runs
         with patch("app.routes.v1.runs.ClarityRepository") as mock_repo_cls:
             mock_repo_cls.side_effect = RuntimeError("Internal DB corruption")
             res = client.get("/api/v1/runs")
-            # The app must not blow up completely or expose internals
-            assert res.status_code in {500, 200}  # 200 possible if mock bypassed
-            if res.status_code == 500:
-                self._assert_no_internal_leak(res)
+            # Must strictly assert 500 error contract — failure injection cannot be bypassed
+            assert res.status_code == 500, f"Expected 500 Internal Server Error, got {res.status_code}"
+            data = res.get_json()
+            assert data is not None, "500 response must be a valid JSON object"
+            assert data["status_code"] == 500
+            assert data["error"] == "Internal Server Error"
+            assert "message" in data and len(data["message"]) > 0
+            assert "traceback" not in data
+            self._assert_no_internal_leak(res)
+
+    def test_global_500_error_handler_contract(self, app):
+        """Global 500 handler returns consistent JSON error contract with no internals."""
+        test_client = app.test_client()
+        original_testing = app.config.get("TESTING", True)
+        app.config["TESTING"] = False
+        try:
+            @app.route("/api/v1/test-force-unhandled-500")
+            def _force_error():
+                raise RuntimeError("Unhandled server explosion")
+
+            res = test_client.get("/api/v1/test-force-unhandled-500")
+            assert res.status_code == 500, f"Expected 500, got {res.status_code}"
+            data = res.get_json()
+            assert data is not None, "Global 500 handler must return JSON"
+            assert data["status_code"] == 500
+            assert data["error"] == "Internal Server Error"
+            assert data["message"] == "An unexpected server error occurred."
+            self._assert_no_internal_leak(res)
+        finally:
+            app.config["TESTING"] = original_testing
