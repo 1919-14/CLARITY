@@ -28,6 +28,7 @@ from app.domain.usage_contracts import (
     AUDIT_RUN_FAILED,
     AUDIT_TASK_COMPLETED,
     AUDIT_TASK_SUBMITTED,
+    AuditEventConflictError,
 )
 from app.services.audit_service import (
     list_audit_events_service,
@@ -153,8 +154,8 @@ class TestAuditEventsLogging:
 
 
 class TestIdempotencyAndAppendOnly:
-    def test_duplicate_event_id_does_not_duplicate(self, db_session):
-        """Submitting an event with the same event_id is idempotent and appends nothing."""
+    def test_duplicate_event_id_with_identical_content_is_idempotent(self, db_session):
+        """Submitting an event with the same event_id and identical content returns the existing row."""
         run = _create_run(db_session)
         fixed_id = "evt-fixed-id-12345"
 
@@ -170,14 +171,59 @@ class TestIdempotencyAndAppendOnly:
             run_id=run.run_id,
             event_type=AUDIT_TASK_COMPLETED,
             event_id=fixed_id,
-            metadata={"attempt": 2},
+            metadata={"attempt": 1},
         )
 
         assert e1.event_id == e2.event_id
         repo = ClarityRepository(db_session)
         events = [e for e in repo.list_audit_events_for_run(run.run_id) if e.event_id == fixed_id]
         assert len(events) == 1
-        assert events[0].metadata_json["attempt"] == 1  # original preserved
+        assert events[0].metadata_json["attempt"] == 1
+
+    def test_conflicting_event_id_payload_is_rejected(self, db_session):
+        """Reusing an event_id with conflicting metadata payload raises AuditEventConflictError."""
+        run = _create_run(db_session)
+        fixed_id = "evt-conflict-payload"
+
+        record_audit_event_service(
+            session=db_session,
+            run_id=run.run_id,
+            event_type=AUDIT_TASK_COMPLETED,
+            event_id=fixed_id,
+            metadata={"attempt": 1},
+        )
+
+        with pytest.raises(AuditEventConflictError, match="metadata payload mismatch"):
+            record_audit_event_service(
+                session=db_session,
+                run_id=run.run_id,
+                event_type=AUDIT_TASK_COMPLETED,
+                event_id=fixed_id,
+                metadata={"attempt": 2},
+            )
+
+    def test_cross_run_event_id_reuse_is_rejected(self, db_session):
+        """Reusing an event_id belonging to another run raises AuditEventConflictError."""
+        run1 = _create_run(db_session, name="Run 1")
+        run2 = _create_run(db_session, name="Run 2")
+        fixed_id = "evt-cross-run-shared"
+
+        record_audit_event_service(
+            session=db_session,
+            run_id=run1.run_id,
+            event_type=AUDIT_TASK_COMPLETED,
+            event_id=fixed_id,
+            metadata={"metric": 0.95},
+        )
+
+        with pytest.raises(AuditEventConflictError, match="run_id mismatch"):
+            record_audit_event_service(
+                session=db_session,
+                run_id=run2.run_id,
+                event_type=AUDIT_TASK_COMPLETED,
+                event_id=fixed_id,
+                metadata={"metric": 0.95},
+            )
 
 
 class TestSensitiveDataRedaction:
@@ -278,3 +324,32 @@ class TestAuditApiEndpoints:
         assert event["actor"] == "dr_smith"
         assert event["metadata"]["note"] == "Promising linear candidate"
         assert event["metadata"]["password"] == "***REDACTED***"
+
+    def test_post_audit_event_conflict_returns_409(self, client):
+        """POST /api/v1/runs/<run_id>/audit-events returns 409 on cross-run or conflicting reuse."""
+        r1 = client.post("/api/v1/runs", json={"name": "Run Conflict 1"}).get_json()["run"]["run_id"]
+        r2 = client.post("/api/v1/runs", json={"name": "Run Conflict 2"}).get_json()["run"]["run_id"]
+
+        # Create event in run 1
+        res1 = client.post(
+            f"/api/v1/runs/{r1}/audit-events",
+            json={"event_id": "evt-api-fixed-1", "event_type": "NOTE", "metadata": {"x": 1}},
+        )
+        assert res1.status_code == 201
+
+        # Attempt to reuse the same event_id in run 2 (cross-run conflict)
+        res_cross = client.post(
+            f"/api/v1/runs/{r2}/audit-events",
+            json={"event_id": "evt-api-fixed-1", "event_type": "NOTE", "metadata": {"x": 1}},
+        )
+        assert res_cross.status_code == 409
+        assert "run_id mismatch" in res_cross.get_json()["message"]
+
+        # Attempt to reuse with conflicting payload in run 1
+        res_conflict_payload = client.post(
+            f"/api/v1/runs/{r1}/audit-events",
+            json={"event_id": "evt-api-fixed-1", "event_type": "NOTE", "metadata": {"x": 999}},
+        )
+        assert res_conflict_payload.status_code == 409
+        assert "metadata payload mismatch" in res_conflict_payload.get_json()["message"]
+

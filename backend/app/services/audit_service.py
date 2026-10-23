@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from ..adapters.persistence.models import AuditEventModel
 from ..adapters.persistence.repository import ClarityRepository
 from ..domain.sanitization import sanitize_exception_text, sanitize_metadata
+from ..domain.usage_contracts import AuditEventConflictError
 
 
 def record_audit_event_service(
@@ -32,17 +33,38 @@ def record_audit_event_service(
 ) -> AuditEventModel:
     """Append a structured, sanitized audit event for a run.
 
-    Idempotent: if an event with event_id already exists, it is returned without duplicate creation.
+    Idempotent: if an event with event_id already exists and has identical content,
+    it is returned. If existing content conflicts across runs, types, actors, or payloads,
+    an AuditEventConflictError is raised to preserve append-only immutability.
     """
     repo = ClarityRepository(session)
     eid = event_id or f"evt-{uuid.uuid4().hex[:12]}"
 
-    existing = repo.get_audit_event(eid)
-    if existing:
-        return existing
-
     sanitized_meta = sanitize_metadata(dict(metadata or {}))
     event_time = timestamp or datetime.now(timezone.utc)
+
+    existing = repo.get_audit_event(eid)
+    if existing:
+        conflicts = []
+        if existing.run_id != run_id:
+            conflicts.append(f"run_id mismatch ('{existing.run_id}' != '{run_id}')")
+        if existing.event_type != event_type:
+            conflicts.append(f"event_type mismatch ('{existing.event_type}' != '{event_type}')")
+        if existing.actor != actor:
+            conflicts.append(f"actor mismatch ('{existing.actor}' != '{actor}')")
+        if (existing.metadata_json or {}) != (sanitized_meta or {}):
+            conflicts.append("metadata payload mismatch")
+        if timestamp is not None and existing.timestamp is not None:
+            t_exist = existing.timestamp.replace(tzinfo=timezone.utc) if existing.timestamp.tzinfo is None else existing.timestamp
+            t_req = event_time.replace(tzinfo=timezone.utc) if event_time.tzinfo is None else event_time
+            if abs((t_exist - t_req).total_seconds()) > 0.001:
+                conflicts.append(f"timestamp mismatch ('{t_exist.isoformat()}' != '{t_req.isoformat()}')")
+
+        if conflicts:
+            raise AuditEventConflictError(
+                f"Conflicting audit event reuse for event_id '{eid}': {', '.join(conflicts)}."
+            )
+        return existing
 
     event = AuditEventModel(
         event_id=eid,

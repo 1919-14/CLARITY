@@ -145,7 +145,8 @@ class RunUsageSummary:
     estimated_cost: CostEstimateDetail
     accruing_cost: CostEstimateDetail
     settled_cost: CostEstimateDetail
-    reconciliation_status: str  # "reconciled" or "discrepancy"
+    reconciliation_status: str  # "reconciled" or "discrepancy_detected"
+    reconciliation_discrepancies: List[str] = field(default_factory=list)
     is_budget_exhausted: bool = False
     exhaustion_reason: Optional[str] = None
     recorded_at: Optional[datetime] = None
@@ -174,6 +175,11 @@ class RunUsageSummary:
                 "estimated": self.estimated_cost.to_dict(),
                 "accruing": self.accruing_cost.to_dict(),
                 "settled": self.settled_cost.to_dict(),
+            },
+            "reconciliation": {
+                "is_reconciled": self.reconciliation_status == "reconciled",
+                "status": self.reconciliation_status,
+                "discrepancies": list(self.reconciliation_discrepancies),
             },
             "reconciliation_status": self.reconciliation_status,
             "is_budget_exhausted": self.is_budget_exhausted,
@@ -238,3 +244,12 @@ class AuditEventRecord:
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
             "metadata": dict(self.metadata),
         }
+
+
+class AuditEventConflictError(ValueError):
+    """Raised when an audit event with an existing event_id has conflicting fields (cross-run or conflicting payload)."""
+
+
+class TaskRunConflictError(ValueError):
+    """Raised when a task ID belongs to another run or is reassigned across runs."""
+

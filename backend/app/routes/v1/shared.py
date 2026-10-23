@@ -246,7 +246,7 @@ def serialize_task(task: ComputeTaskModel) -> Dict[str, Any]:
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
         "duration_ms": task.duration_ms,
-        "error_metadata": task.error_metadata,
+        "error_metadata": sanitize_metadata(task.error_metadata) if task.error_metadata else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
     }
 
@@ -255,7 +255,7 @@ def serialize_task(task: ComputeTaskModel) -> Dict[str, Any]:
 # Safe structured logging (redacts DSN credentials, secrets, passwords)
 # ---------------------------------------------------------------------------
 
-from ...domain.sanitization import sanitize_exception_text
+from ...domain.sanitization import sanitize_exception_text, sanitize_metadata
 
 
 def log_safe_error(context: str, exc: Exception, logger=None) -> None:

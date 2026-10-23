@@ -53,6 +53,10 @@ from ...services.audit_service import (
     list_audit_events_service,
     record_audit_event_service,
 )
+from ...domain.usage_contracts import (
+    AuditEventConflictError,
+    TaskRunConflictError,
+)
 from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
     RunConflictError,
@@ -902,6 +906,12 @@ def record_run_audit_event(run_id: str):
     if not isinstance(metadata, dict):
         return error_response("Field 'metadata' must be a JSON object when provided.", 400)
 
+    event_id = data.get("event_id")
+    if event_id is not None:
+        if not isinstance(event_id, str) or not event_id.strip():
+            return error_response("Field 'event_id' must be a non-empty string when provided.", 400)
+        event_id = event_id.strip()
+
     db = _get_db()
     try:
         with db.session_scope() as session:
@@ -916,8 +926,11 @@ def record_run_audit_event(run_id: str):
                 event_type=event_type.strip(),
                 actor=actor.strip(),
                 metadata=metadata,
+                event_id=event_id,
             )
             serialized = serialize_audit_event(event)
+    except AuditEventConflictError as exc:
+        return error_response(str(exc), 409)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("record_run_audit_event db error", exc)
         return error_response("An internal error occurred while recording audit event.", 500)

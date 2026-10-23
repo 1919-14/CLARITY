@@ -26,11 +26,15 @@ from app.domain.usage_contracts import (
     ComputeExecutionMode,
     ComputeTaskStatus,
     CostState,
+    TaskRunConflictError,
 )
 from app.services.run_service import create_run_service
 from app.services.usage_service import (
+    DEFAULT_EVALUATION_COST_USD,
     DEFAULT_ORACLE_QUERY_COST_USD,
     DEFAULT_REMOTE_TASK_HOURLY_RATE_USD,
+    DEFAULT_REMOTE_TASK_MINUTE_RATE_USD,
+    calculate_cost_estimate,
     derive_run_usage_summary,
     reconcile_run_usage,
     record_task_usage_service,
@@ -141,8 +145,62 @@ class TestTaskUsageRecording:
         )
         assert t_canc.status == "cancelled"
 
+    def test_task_metadata_and_error_payload_sanitization(self, db_session):
+        """Credentials and secrets in error_metadata and task_metadata are scrubbed prior to persistence."""
+        run = _create_run(db_session)
+        sensitive_error = {
+            "password": "secret_password_123",
+            "token": "bearer xyz789",
+            "dsn": "postgresql://usr:secret_pwd@cluster:5432/db",
+            "error_msg": "Failed connection",
+        }
+        sensitive_task_meta = {
+            "api_key": "sk-live-secret-nodus",
+            "auth_header": "Basic dXNlcjpwYXNz",
+            "cluster": "gpu-prod",
+        }
+
+        task = record_task_usage_service(
+            session=db_session,
+            run_id=run.run_id,
+            task_id="task-secret-sanitize",
+            status="failed",
+            error_metadata=sensitive_error,
+            task_metadata=sensitive_task_meta,
+        )
+
+        meta = task.error_metadata
+        assert meta["password"] == "***REDACTED***"
+        assert meta["token"] == "***REDACTED***"
+        assert "secret_pwd" not in meta["dsn"]
+        assert meta["error_msg"] == "Failed connection"
+        assert meta["task_metadata"]["api_key"] == "***REDACTED***"
+        assert meta["task_metadata"]["auth_header"] == "***REDACTED***"
+        assert meta["task_metadata"]["cluster"] == "gpu-prod"
+
 
 class TestIdempotencyAndDoubleCounting:
+    def test_cross_run_task_id_reuse_is_rejected(self, db_session):
+        """Attempting to update an existing task under a different run_id raises TaskRunConflictError."""
+        run1 = _create_run(db_session, name="Run Task 1")
+        run2 = _create_run(db_session, name="Run Task 2")
+        task_id = "task-isolated-123"
+
+        record_task_usage_service(
+            session=db_session,
+            run_id=run1.run_id,
+            task_id=task_id,
+            status="pending",
+        )
+
+        with pytest.raises(TaskRunConflictError, match="already belongs to run"):
+            record_task_usage_service(
+                session=db_session,
+                run_id=run2.run_id,
+                task_id=task_id,
+                status="running",
+            )
+
     def test_duplicate_task_event_does_not_double_count(self, db_session):
         """Reprocessing the same task event updates state without creating duplicate rows."""
         run = _create_run(db_session)
@@ -228,9 +286,70 @@ class TestRunUsageDerivationAndReconciliation:
         assert recon["task_count"] == 3
         assert recon["tasks_completed"] == 2
         assert recon["total_duration_ms"] == 8000
+        assert recon["is_reconciled"] is True
+        assert recon["discrepancies"] == []
+
+    def test_reconciliation_multi_dimensional_checks_and_discrepancies(self, db_session):
+        """Reconciliation compares wall-clock duration, observation counts, and tasks completed."""
+        run = _create_run(db_session, mode="local")
+        t0 = datetime.now(timezone.utc)
+        run.started_at = t0
+        run.completed_at = t0 + timedelta(seconds=2)  # 2,000 ms wall clock
+        db_session.flush()
+
+        # Task duration sum = 5,000 ms (> 2,000 ms wall clock)
+        record_task_usage_service(
+            db_session, run.run_id, "task-long-1", execution_mode="local", status="completed", duration_ms=5000
+        )
+
+        recon = reconcile_run_usage(db_session, run.run_id)
+        assert recon["is_reconciled"] is False
+        assert recon["reconciliation_status"] == "discrepancy_detected"
+        assert len(recon["discrepancies"]) >= 1
+        assert any("exceeds run wall-clock duration" in d for d in recon["discrepancies"])
+
+        # Also check summary dictionary reflects reconciliation details
+        summary = derive_run_usage_summary(db_session, run.run_id)
+        assert summary.reconciliation_status == "discrepancy_detected"
+        summary_dict = summary.to_dict()
+        assert summary_dict["reconciliation"]["is_reconciled"] is False
+        assert len(summary_dict["reconciliation"]["discrepancies"]) >= 1
 
 
 class TestCostClassificationAndHonesty:
+    def test_cost_estimate_arithmetic_pins_rate_to_docs(self, db_session):
+        """Pricing arithmetic strictly matches documented rate ($0.05/min = $3.00/hr, $0.01/query, $0.005/eval)."""
+        assert DEFAULT_REMOTE_TASK_MINUTE_RATE_USD == 0.05
+        assert DEFAULT_REMOTE_TASK_HOURLY_RATE_USD == 3.00
+        assert DEFAULT_ORACLE_QUERY_COST_USD == 0.01
+        assert DEFAULT_EVALUATION_COST_USD == 0.005
+
+        # 1 minute remote task: exactly $0.05
+        est_1min = calculate_cost_estimate(
+            local_tasks=0,
+            remote_tasks=1,
+            remote_duration_ms=60000,
+            queries_count=0,
+            evaluations_count=0,
+        )
+        assert est_1min.amount_usd == 0.05
+        assert est_1min.pricing_assumptions["remote_task_minute_rate_usd"] == 0.05
+        assert est_1min.pricing_assumptions["remote_task_hourly_rate_usd"] == 3.00
+
+        # 1 hour remote task + 10 queries + 20 evaluations:
+        # compute = 60 * $0.05 = $3.00
+        # queries = 10 * $0.01 = $0.10
+        # evals   = 20 * $0.005 = $0.10
+        # total   = $3.20
+        est_full = calculate_cost_estimate(
+            local_tasks=3,
+            remote_tasks=1,
+            remote_duration_ms=3600000,
+            queries_count=10,
+            evaluations_count=20,
+        )
+        assert est_full.amount_usd == 3.20
+
     def test_cost_classification_states(self, db_session):
         """Distinguish estimated, accruing, settled, and unavailable cost states."""
         run = _create_run(db_session)
@@ -329,3 +448,29 @@ class TestUsageApiEndpoints:
         assert res_filter.status_code == 200
         assert res_filter.get_json()["count"] == 1
         assert res_filter.get_json()["tasks"][0]["task_id"] == "api-task-1"
+
+    def test_tasks_api_sanitizes_credentials_in_error_metadata(self, client, app):
+        """GET /api/v1/runs/<run_id>/tasks returns scrubbed error_metadata with no secrets."""
+        res_run = client.post("/api/v1/runs", json={"name": "API Secret Tasks Run"})
+        run_id = res_run.get_json()["run"]["run_id"]
+
+        db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+        db = get_db_manager(db_uri)
+        with db.session_scope() as session:
+            record_task_usage_service(
+                session,
+                run_id,
+                "api-task-secrets",
+                execution_mode="nodus_remote",
+                status="failed",
+                error_metadata={"password": "leak_me_not", "token": "bearer 12345"},
+                task_metadata={"api_key": "sk-secret-key-999"},
+            )
+
+        res = client.get(f"/api/v1/runs/{run_id}/tasks")
+        assert res.status_code == 200
+        task_data = res.get_json()["tasks"][0]
+        meta = task_data["error_metadata"]
+        assert meta["password"] == "***REDACTED***"
+        assert meta["token"] == "***REDACTED***"
+        assert meta["task_metadata"]["api_key"] == "***REDACTED***"

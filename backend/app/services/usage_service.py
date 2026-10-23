@@ -29,6 +29,7 @@ from ..adapters.persistence.models import (
     UsageRecordModel,
 )
 from ..adapters.persistence.repository import ClarityRepository
+from ..domain.sanitization import sanitize_metadata
 from ..domain.usage_contracts import (
     AUDIT_TASK_CANCELLED,
     AUDIT_TASK_COMPLETED,
@@ -42,12 +43,15 @@ from ..domain.usage_contracts import (
     CostEstimateDetail,
     CostState,
     RunUsageSummary,
+    TaskRunConflictError,
     TaskUsageRecord,
 )
 from .audit_service import record_audit_event_service
 
 # Documented pricing assumptions for application estimates (Issue #15)
-DEFAULT_REMOTE_TASK_HOURLY_RATE_USD = 0.50
+# Rate: $0.05 / task minute ($3.00 / compute hour)
+DEFAULT_REMOTE_TASK_MINUTE_RATE_USD = 0.05
+DEFAULT_REMOTE_TASK_HOURLY_RATE_USD = 3.00
 DEFAULT_LOCAL_TASK_HOURLY_RATE_USD = 0.00
 DEFAULT_ORACLE_QUERY_COST_USD = 0.01
 DEFAULT_EVALUATION_COST_USD = 0.005
@@ -76,12 +80,17 @@ def record_task_usage_service(
     """
     repo = ClarityRepository(session)
     existing = repo.get_compute_task(task_id)
+    if existing and existing.run_id != run_id:
+        raise TaskRunConflictError(
+            f"Task '{task_id}' already belongs to run '{existing.run_id}' and cannot be reassigned to run '{run_id}'."
+        )
 
-    combined_metadata = dict(error_metadata or {})
+    sanitized_error = sanitize_metadata(dict(error_metadata)) if error_metadata else {}
+    combined_metadata = dict(sanitized_error)
     if experiment_id:
         combined_metadata["experiment_id"] = experiment_id
     if task_metadata:
-        combined_metadata["task_metadata"] = dict(task_metadata)
+        combined_metadata["task_metadata"] = sanitize_metadata(dict(task_metadata))
 
     # Compute duration if start/complete timestamps are present
     calc_duration = duration_ms
@@ -129,7 +138,7 @@ def record_task_usage_service(
             if provider_task_id:
                 audit_meta["provider_task_id"] = provider_task_id
             if error_metadata:
-                audit_meta["error_metadata"] = dict(error_metadata)
+                audit_meta["error_metadata"] = sanitize_metadata(dict(error_metadata))
             record_audit_event_service(
                 session=session,
                 run_id=run_id,
@@ -149,9 +158,17 @@ def calculate_cost_estimate(
     queries_count: int,
     evaluations_count: int,
 ) -> CostEstimateDetail:
-    """Calculate application-side estimated compute cost based on documented pricing assumptions."""
-    remote_hours = remote_duration_ms / (1000.0 * 3600.0)
-    remote_compute_cost = remote_hours * DEFAULT_REMOTE_TASK_HOURLY_RATE_USD
+    """Calculate application-side estimated compute cost based on documented pricing assumptions.
+
+    Documented Rates (Issue #15):
+    - Sequential Local Execution: $0.00 / hour
+    - Nodus Remote Execution: $0.05 / task minute ($3.00 / compute hour)
+    - Oracle Query: $0.01 / query
+    - Candidate Evaluation: $0.005 / evaluation
+    """
+    remote_minutes = remote_duration_ms / (1000.0 * 60.0)
+    remote_hours = remote_minutes / 60.0
+    remote_compute_cost = remote_minutes * DEFAULT_REMOTE_TASK_MINUTE_RATE_USD
     queries_cost = queries_count * DEFAULT_ORACLE_QUERY_COST_USD
     evaluations_cost = evaluations_count * DEFAULT_EVALUATION_COST_USD
 
@@ -163,15 +180,89 @@ def calculate_cost_estimate(
         currency="USD",
         calculation_method="application_documented_rates",
         pricing_assumptions={
+            "remote_task_minute_rate_usd": DEFAULT_REMOTE_TASK_MINUTE_RATE_USD,
             "remote_task_hourly_rate_usd": DEFAULT_REMOTE_TASK_HOURLY_RATE_USD,
             "local_task_hourly_rate_usd": DEFAULT_LOCAL_TASK_HOURLY_RATE_USD,
             "oracle_query_cost_usd": DEFAULT_ORACLE_QUERY_COST_USD,
             "candidate_evaluation_cost_usd": DEFAULT_EVALUATION_COST_USD,
+            "remote_execution_minutes": round(remote_minutes, 4),
             "remote_execution_hours": round(remote_hours, 4),
         },
         source="application_estimate",
         is_provider_reported=False,
     )
+
+
+def _evaluate_run_discrepancies(
+    run: RunModel,
+    task_metrics: Dict[str, Any],
+    queries_count: int,
+    evals_completed: int,
+    recorded_observations_count: int,
+) -> Tuple[List[str], Optional[int]]:
+    """Evaluate discrepancy dimensions across tasks, usage counters, observations, and run wall-clock duration."""
+    discrepancies: List[str] = []
+
+    tasks_total = task_metrics["tasks_total"]
+    tasks_completed = task_metrics["tasks_completed"]
+
+    # 1. Tasks completed vs evaluations completed
+    if tasks_total > 0 and evals_completed > 0 and tasks_completed < evals_completed:
+        discrepancies.append(
+            f"Completed tasks count ({tasks_completed}) is less than recorded completed evaluations ({evals_completed})."
+        )
+
+    # 2. Candidate evaluation tasks vs evaluations completed
+    eval_tasks_completed = task_metrics.get("evaluation_tasks_completed", 0)
+    eval_tasks_count = task_metrics.get("evaluation_tasks_count", 0)
+    if eval_tasks_count > 0 and evals_completed > 0 and eval_tasks_completed < evals_completed:
+        discrepancies.append(
+            f"Candidate evaluation tasks completed ({eval_tasks_completed}) is less than recorded completed evaluations ({evals_completed})."
+        )
+
+    # 3. Sum of terminal/retried tasks vs total tasks
+    terminal_sum = (
+        task_metrics["tasks_completed"]
+        + task_metrics["tasks_failed"]
+        + task_metrics["tasks_timed_out"]
+        + task_metrics["tasks_cancelled"]
+        + task_metrics["tasks_retried"]
+    )
+    if terminal_sum > tasks_total:
+        discrepancies.append(
+            f"Sum of terminal/retried tasks ({terminal_sum}) exceeds total recorded tasks ({tasks_total})."
+        )
+
+    # 4. Task duration vs run wall-clock duration
+    run_wall_clock_ms = None
+    if run.started_at and run.completed_at:
+        t_start = run.started_at.replace(tzinfo=timezone.utc) if run.started_at.tzinfo is None else run.started_at
+        t_comp = run.completed_at.replace(tzinfo=timezone.utc) if run.completed_at.tzinfo is None else run.completed_at
+        diff_ms = int((t_comp - t_start).total_seconds() * 1000)
+        if diff_ms >= 0:
+            run_wall_clock_ms = diff_ms
+            # In sequential local mode, total execution duration cannot exceed run duration (plus 1000ms grace for clock precision)
+            if run.execution_mode in ("local", "mock"):
+                if task_metrics["total_execution_duration_ms"] > run_wall_clock_ms + 1000:
+                    discrepancies.append(
+                        f"Total sequential task duration ({task_metrics['total_execution_duration_ms']}ms) "
+                        f"exceeds run wall-clock duration ({run_wall_clock_ms}ms)."
+                    )
+            # In remote mode, tasks can run concurrently, but no individual task duration can exceed run duration
+            elif run.execution_mode == "nodus_remote":
+                if task_metrics["max_task_duration_ms"] > run_wall_clock_ms + 1000:
+                    discrepancies.append(
+                        f"Maximum individual remote task duration ({task_metrics['max_task_duration_ms']}ms) "
+                        f"exceeds run wall-clock duration ({run_wall_clock_ms}ms)."
+                    )
+
+    # 5. Oracle queries executed vs recorded observations in database
+    if recorded_observations_count > 0 and queries_count != recorded_observations_count:
+        discrepancies.append(
+            f"Usage queries executed ({queries_count}) does not match recorded observations count ({recorded_observations_count})."
+        )
+
+    return discrepancies, run_wall_clock_ms
 
 
 def derive_run_usage_summary(
@@ -184,24 +275,13 @@ def derive_run_usage_summary(
     if not run:
         raise ValueError(f"Run '{run_id}' not found.")
 
-    tasks = repo.list_compute_tasks_for_run(run_id)
-    tasks_total = len(tasks)
-    tasks_submitted = len([t for t in tasks if t.status in ("pending", "running", "completed", "failed", "timed_out", "cancelled", "retrying")])
-    tasks_completed = len([t for t in tasks if t.status == "completed"])
-    tasks_failed = len([t for t in tasks if t.status == "failed"])
-    tasks_timed_out = len([t for t in tasks if t.status == "timed_out"])
-    tasks_cancelled = len([t for t in tasks if t.status == "cancelled"])
-    tasks_retried = len([t for t in tasks if t.status == "retrying"])
-
-    local_tasks = len([t for t in tasks if t.execution_mode in ("local", "mock")])
-    remote_tasks = len([t for t in tasks if t.execution_mode == "nodus_remote"])
-
-    total_duration_ms = sum((t.duration_ms or 0) for t in tasks)
-    remote_duration_ms = sum((t.duration_ms or 0) for t in tasks if t.execution_mode == "nodus_remote")
+    # Aggregate compute task metrics using SQL aggregate queries
+    task_metrics = repo.get_task_metrics_for_run(run_id)
 
     # Fetch latest usage record if present
     latest_usage = repo.get_latest_usage_for_run(run_id)
     budget_usage = repo.get_budget_usage(run_id)
+    recorded_observations_count = repo.count_observations_for_run(run_id)
 
     queries_count = (
         latest_usage.queries_executed
@@ -232,9 +312,9 @@ def derive_run_usage_summary(
 
     # 1. Estimated Cost: Calculated from documented assumptions
     estimated_cost = calculate_cost_estimate(
-        local_tasks=local_tasks,
-        remote_tasks=remote_tasks,
-        remote_duration_ms=remote_duration_ms,
+        local_tasks=task_metrics["local_tasks_count"],
+        remote_tasks=task_metrics["remote_tasks_count"],
+        remote_duration_ms=task_metrics["remote_duration_ms"],
         queries_count=queries_count,
         evaluations_count=evals_completed,
     )
@@ -281,31 +361,36 @@ def derive_run_usage_summary(
             is_provider_reported=False,
         )
 
-    # Reconciliation status
-    reconciliation_status = "reconciled"
-    if tasks_total > 0 and evals_completed > 0 and tasks_completed < evals_completed:
-        # A discrepancy exists if completed tasks count does not account for evaluations
-        reconciliation_status = "discrepancy_detected"
+    # Evaluate reconciliation status and discrepancies
+    discrepancies, _ = _evaluate_run_discrepancies(
+        run=run,
+        task_metrics=task_metrics,
+        queries_count=queries_count,
+        evals_completed=evals_completed,
+        recorded_observations_count=recorded_observations_count,
+    )
+    reconciliation_status = "reconciled" if len(discrepancies) == 0 else "discrepancy_detected"
 
     return RunUsageSummary(
         run_id=run_id,
         queries_executed=queries_count,
         evaluations_scheduled=evals_scheduled,
         evaluations_completed=evals_completed,
-        tasks_total=tasks_total,
-        tasks_submitted=tasks_submitted,
-        tasks_completed=tasks_completed,
-        tasks_failed=tasks_failed,
-        tasks_timed_out=tasks_timed_out,
-        tasks_cancelled=tasks_cancelled,
-        tasks_retried=tasks_retried,
-        local_tasks_count=local_tasks,
-        remote_tasks_count=remote_tasks,
-        total_execution_duration_ms=total_duration_ms,
+        tasks_total=task_metrics["tasks_total"],
+        tasks_submitted=task_metrics["tasks_submitted"],
+        tasks_completed=task_metrics["tasks_completed"],
+        tasks_failed=task_metrics["tasks_failed"],
+        tasks_timed_out=task_metrics["tasks_timed_out"],
+        tasks_cancelled=task_metrics["tasks_cancelled"],
+        tasks_retried=task_metrics["tasks_retried"],
+        local_tasks_count=task_metrics["local_tasks_count"],
+        remote_tasks_count=task_metrics["remote_tasks_count"],
+        total_execution_duration_ms=task_metrics["total_execution_duration_ms"],
         estimated_cost=estimated_cost,
         accruing_cost=accruing_cost,
         settled_cost=settled_cost,
         reconciliation_status=reconciliation_status,
+        reconciliation_discrepancies=discrepancies,
         is_budget_exhausted=is_budget_exhausted,
         exhaustion_reason=exhaustion_reason,
         recorded_at=latest_usage.recorded_at if latest_usage else datetime.now(timezone.utc),
@@ -317,20 +402,53 @@ def reconcile_run_usage(
     run_id: str,
 ) -> Dict[str, Any]:
     """Reconcile run-level usage records with underlying task-level execution records."""
-    summary = derive_run_usage_summary(session, run_id)
     repo = ClarityRepository(session)
-    tasks = repo.list_compute_tasks_for_run(run_id)
+    run = repo.get_run(run_id)
+    if not run:
+        raise ValueError(f"Run '{run_id}' not found.")
 
-    task_completed_count = len([t for t in tasks if t.status == "completed"])
-    task_duration_sum = sum((t.duration_ms or 0) for t in tasks)
+    task_metrics = repo.get_task_metrics_for_run(run_id)
+    latest_usage = repo.get_latest_usage_for_run(run_id)
+    budget_usage = repo.get_budget_usage(run_id)
+    recorded_observations_count = repo.count_observations_for_run(run_id)
+
+    queries_count = (
+        latest_usage.queries_executed
+        if latest_usage
+        else (budget_usage.queries_committed if budget_usage else 0)
+    )
+    evals_completed = (
+        latest_usage.evaluations_completed
+        if latest_usage
+        else (budget_usage.evaluations_committed if budget_usage else 0)
+    )
+
+    discrepancies, run_wall_clock_ms = _evaluate_run_discrepancies(
+        run=run,
+        task_metrics=task_metrics,
+        queries_count=queries_count,
+        evals_completed=evals_completed,
+        recorded_observations_count=recorded_observations_count,
+    )
+
+    is_reconciled = len(discrepancies) == 0
+    status_str = "reconciled" if is_reconciled else "discrepancy_detected"
 
     return {
         "run_id": run_id,
-        "is_reconciled": summary.reconciliation_status == "reconciled",
-        "task_count": summary.tasks_total,
-        "tasks_completed": task_completed_count,
-        "total_duration_ms": task_duration_sum,
-        "queries_executed": summary.queries_executed,
-        "evaluations_completed": summary.evaluations_completed,
-        "reconciliation_status": summary.reconciliation_status,
+        "is_reconciled": is_reconciled,
+        "reconciliation_status": status_str,
+        "discrepancies": discrepancies,
+        "task_count": task_metrics["tasks_total"],
+        "tasks_submitted": task_metrics["tasks_submitted"],
+        "tasks_completed": task_metrics["tasks_completed"],
+        "tasks_failed": task_metrics["tasks_failed"],
+        "tasks_timed_out": task_metrics["tasks_timed_out"],
+        "tasks_cancelled": task_metrics["tasks_cancelled"],
+        "tasks_retried": task_metrics["tasks_retried"],
+        "total_duration_ms": task_metrics["total_execution_duration_ms"],
+        "run_duration_ms": run_wall_clock_ms,
+        "queries_executed": queries_count,
+        "recorded_observations_count": recorded_observations_count,
+        "evaluations_completed": evals_completed,
     }

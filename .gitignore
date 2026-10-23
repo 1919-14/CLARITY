@@ -236,3 +236,8 @@ frontend/dist-ssr/
 .env*.local
 backend/.env
 frontend/.env
+
+# Generated report artifacts
+reports/
+backend/reports/
+

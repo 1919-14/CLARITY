@@ -22,6 +22,8 @@ from .models import (
     RunBudgetUsageModel,
     BudgetReservationModel,
 )
+from ...domain.sanitization import sanitize_metadata
+from ...domain.usage_contracts import AuditEventConflictError, TaskRunConflictError
 
 
 class ClarityRepository:
@@ -204,9 +206,13 @@ class ClarityRepository:
     # =========================================================================
 
     def record_compute_task(self, task: ComputeTaskModel) -> ComputeTaskModel:
-        """Idempotently insert or update a compute task record."""
+        """Idempotently insert or update a compute task record. Reassignment across runs is rejected."""
         existing = self.session.get(ComputeTaskModel, task.task_id)
         if existing:
+            if existing.run_id != task.run_id:
+                raise TaskRunConflictError(
+                    f"Task '{task.task_id}' already belongs to run '{existing.run_id}' and cannot be reassigned to run '{task.run_id}'."
+                )
             existing.status = task.status
             if task.started_at is not None:
                 existing.started_at = task.started_at
@@ -221,9 +227,11 @@ class ClarityRepository:
             if task.candidate_id is not None:
                 existing.candidate_id = task.candidate_id
             if task.error_metadata is not None:
-                existing.error_metadata = task.error_metadata
+                existing.error_metadata = sanitize_metadata(task.error_metadata)
             self.session.flush()
             return existing
+        if task.error_metadata is not None:
+            task.error_metadata = sanitize_metadata(task.error_metadata)
         self.session.add(task)
         self.session.flush()
         return task
@@ -271,14 +279,107 @@ class ClarityRepository:
             stmt = stmt.where(ComputeTaskModel.execution_mode == execution_mode)
         return self.session.scalar(stmt) or 0
 
+    def get_task_metrics_for_run(self, run_id: str) -> Dict[str, Any]:
+        """Aggregate compute task counters, execution modes, and durations using SQL aggregates."""
+        stmt = (
+            select(
+                ComputeTaskModel.status,
+                ComputeTaskModel.execution_mode,
+                func.count(ComputeTaskModel.task_id),
+                func.coalesce(func.sum(ComputeTaskModel.duration_ms), 0),
+                func.coalesce(func.max(ComputeTaskModel.duration_ms), 0),
+                func.count(ComputeTaskModel.candidate_id),
+            )
+            .where(ComputeTaskModel.run_id == run_id)
+            .group_by(ComputeTaskModel.status, ComputeTaskModel.execution_mode)
+        )
+        rows = self.session.execute(stmt).all()
+
+        total_tasks = 0
+        tasks_submitted = 0
+        tasks_completed = 0
+        tasks_failed = 0
+        tasks_timed_out = 0
+        tasks_cancelled = 0
+        tasks_retried = 0
+        local_tasks = 0
+        remote_tasks = 0
+        total_duration_ms = 0
+        remote_duration_ms = 0
+        max_task_duration_ms = 0
+        evaluation_tasks_count = 0
+        evaluation_tasks_completed = 0
+
+        for status, mode, count, sum_dur, max_dur, cand_count in rows:
+            count = int(count or 0)
+            sum_dur = int(sum_dur or 0)
+            max_dur = int(max_dur or 0)
+            cand_count = int(cand_count or 0)
+
+            total_tasks += count
+            if status in ("pending", "running", "completed", "failed", "timed_out", "cancelled", "retrying"):
+                tasks_submitted += count
+            if status == "completed":
+                tasks_completed += count
+                evaluation_tasks_completed += cand_count
+            elif status == "failed":
+                tasks_failed += count
+            elif status == "timed_out":
+                tasks_timed_out += count
+            elif status == "cancelled":
+                tasks_cancelled += count
+            elif status == "retrying":
+                tasks_retried += count
+
+            if mode in ("local", "mock"):
+                local_tasks += count
+            elif mode == "nodus_remote":
+                remote_tasks += count
+                remote_duration_ms += sum_dur
+
+            total_duration_ms += sum_dur
+            if max_dur > max_task_duration_ms:
+                max_task_duration_ms = max_dur
+            evaluation_tasks_count += cand_count
+
+        return {
+            "tasks_total": total_tasks,
+            "tasks_submitted": tasks_submitted,
+            "tasks_completed": tasks_completed,
+            "tasks_failed": tasks_failed,
+            "tasks_timed_out": tasks_timed_out,
+            "tasks_cancelled": tasks_cancelled,
+            "tasks_retried": tasks_retried,
+            "local_tasks_count": local_tasks,
+            "remote_tasks_count": remote_tasks,
+            "total_execution_duration_ms": total_duration_ms,
+            "remote_duration_ms": remote_duration_ms,
+            "max_task_duration_ms": max_task_duration_ms,
+            "evaluation_tasks_count": evaluation_tasks_count,
+            "evaluation_tasks_completed": evaluation_tasks_completed,
+        }
+
     # =========================================================================
     # Audit Events (Append-Only)
     # =========================================================================
 
     def record_audit_event(self, event: AuditEventModel) -> AuditEventModel:
-        """Append an audit event. Existing events with the same event_id are not overwritten."""
+        """Append an audit event. Existing events with the same event_id are validated for identical content."""
         existing = self.session.get(AuditEventModel, event.event_id)
         if existing:
+            conflicts = []
+            if existing.run_id != event.run_id:
+                conflicts.append(f"run_id mismatch ('{existing.run_id}' != '{event.run_id}')")
+            if existing.event_type != event.event_type:
+                conflicts.append(f"event_type mismatch ('{existing.event_type}' != '{event.event_type}')")
+            if existing.actor != event.actor:
+                conflicts.append(f"actor mismatch ('{existing.actor}' != '{event.actor}')")
+            if (existing.metadata_json or {}) != (event.metadata_json or {}):
+                conflicts.append("metadata payload mismatch")
+            if conflicts:
+                raise AuditEventConflictError(
+                    f"Conflicting audit event reuse for event_id '{event.event_id}': {', '.join(conflicts)}."
+                )
             return existing
         self.session.add(event)
         self.session.flush()
