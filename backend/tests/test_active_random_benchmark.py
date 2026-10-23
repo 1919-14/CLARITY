@@ -161,6 +161,72 @@ class TestFairConditionsAndBudgetLimits:
                 "Initial oracle queries must be included in the reported total."
             )
 
+    def test_initial_inputs_equal_to_budget_exhausts_budget_cleanly(self):
+        """[P1 edge] When len(initial_inputs) == budget the trial returns cleanly.
+
+        The oracle must be called exactly `budget` times (all for initial inputs),
+        the engine receives zero remaining budget, and the trial is marked
+        budget_exhausted without raising any exception.
+        """
+        from dataclasses import replace as dc_replace
+
+        budget = 3
+        # Override initial_inputs to exactly fill the budget
+        scenario = dc_replace(
+            LINEAR_BENCHMARK,
+            initial_inputs=tuple({"x": float(i)} for i in range(budget)),
+            max_query_budget=budget,
+        )
+        runner = ActiveRandomBenchmarkRunner()
+
+        for strategy in ("active_selection", "random_baseline"):
+            oracle_ref = scenario.create_oracle()
+            trial = runner.run_single_trial(scenario, strategy=strategy, seed=42, max_budget=budget)
+
+            # Total oracle calls must equal the budget exactly (initial only, no engine calls)
+            assert trial.queries_used <= budget, (
+                f"{strategy}: queries_used={trial.queries_used} exceeds budget={budget}"
+            )
+            assert trial.queries_used == budget, (
+                f"{strategy}: expected exactly {budget} queries (all initial), "
+                f"got {trial.queries_used}"
+            )
+            assert trial.budget_exhausted is True, (
+                f"{strategy}: trial must be marked budget_exhausted when all budget "
+                "consumed by initial queries"
+            )
+
+    def test_initial_inputs_exceeding_budget_are_capped_before_oracle_call(self):
+        """[P1 edge] When len(initial_inputs) > budget, the oracle is called at most
+        `budget` times and the trial returns cleanly without raising.
+
+        Inputs beyond the cap must never reach the oracle; oracle.query_count must
+        be <= budget after the trial completes.
+        """
+        from dataclasses import replace as dc_replace
+
+        budget = 2
+        # Scenario declares MORE initial inputs than the budget
+        scenario = dc_replace(
+            LINEAR_BENCHMARK,
+            initial_inputs=tuple({"x": float(i)} for i in range(budget + 3)),  # 5 > 2
+            max_query_budget=budget,
+        )
+        runner = ActiveRandomBenchmarkRunner()
+
+        for strategy in ("active_selection", "random_baseline"):
+            trial = runner.run_single_trial(scenario, strategy=strategy, seed=42, max_budget=budget)
+
+            # The oracle must never have been called more than `budget` times
+            assert trial.queries_used <= budget, (
+                f"{strategy}: oracle was called {trial.queries_used} times, "
+                f"exceeding configured budget={budget}. "
+                "Initial inputs must be capped BEFORE calling oracle.query()."
+            )
+            # Trial must complete without exception and report a valid result
+            assert trial.termination_reason is not None
+            assert trial.max_budget == budget
+
     def test_paired_trial_shares_equivalent_initial_conditions(self):
         """Both strategies receive identical initial observations and domain bounds."""
         runner = ActiveRandomBenchmarkRunner()

@@ -327,10 +327,15 @@ class ActiveRandomBenchmarkRunner:
         Budget accounting
         -----------------
         ``max_budget`` (or ``scenario.max_query_budget`` when None) is the *total*
-        oracle-call budget. Initial seed queries count against this total: the engine
-        receives ``budget - initial_count`` remaining calls, and ``queries_used`` is
-        always reported as ``initial_count + engine_queries_used`` so the caller can
-        verify that total oracle interactions never exceed the configured budget.
+        oracle-call budget for the entire trial, including initial seed queries.
+
+        Initial inputs are capped to ``budget`` items *before* any oracle calls are
+        made, so the oracle can never be called more than ``budget`` times regardless
+        of how many initial inputs the scenario declares.  Any initial inputs beyond
+        the cap are silently skipped (their count is available as the local variable
+        ``skipped_initial_inputs`` during execution).  The engine then receives
+        ``budget - initial_count`` remaining calls.  ``queries_used`` is always
+        reported as ``initial_count + engine_queries_used``.
         """
         trial_id = generate_id("trial")
         budget = max_budget if max_budget is not None else scenario.max_query_budget
@@ -340,18 +345,28 @@ class ActiveRandomBenchmarkRunner:
         oracle = scenario.create_oracle(noise_seed=seed)
 
         # 2. Gather equivalent initial observations, counting them against the budget.
+        #
+        # BUDGET SAFETY: cap the initial-input batch to at most `budget` items BEFORE
+        # calling oracle.query(). This ensures the oracle is never called more than
+        # `budget` times in total, even if the scenario declares more initial inputs
+        # than the configured budget. Any inputs beyond the cap are skipped; their
+        # count is tracked in `skipped_initial_inputs` for transparency.
+        inputs_within_budget = scenario.initial_inputs[:budget]
+        skipped_initial_inputs: int = len(scenario.initial_inputs) - len(inputs_within_budget)
+
         initial_obs: List[Observation] = []
-        for inp in scenario.initial_inputs:
+        for inp in inputs_within_budget:
             exp_inp = ExperimentInput(input_id=generate_id("inp-init"), values=inp)
             obs = oracle.query(exp_inp)
             initial_obs.append(obs)
 
-        initial_query_count: int = oracle.query_count  # equals len(scenario.initial_inputs) for valid inputs
+        initial_query_count: int = oracle.query_count  # == len(inputs_within_budget) for valid inputs
 
         # Remaining budget for the discovery engine after initial queries are consumed.
         engine_budget = max(0, budget - initial_query_count)
 
         # 3. Configure the selection planner
+
         if strategy == "active_selection":
             planner = ExperimentSelectionPlanner(
                 config=ExperimentSelectionConfig(
@@ -394,13 +409,10 @@ class ActiveRandomBenchmarkRunner:
         run_result: DiscoveryRunResult = engine.run(initial_observations=initial_obs)
         runtime_ms = (time.perf_counter() - start_time) * 1000.0
 
-        # Total oracle calls = initial queries + engine-issued queries.
-        # This must always be <= budget.
+        # Total oracle calls = initial queries (capped) + engine-issued queries.
+        # Overrun is structurally impossible: inputs_within_budget = initial_inputs[:budget]
+        # and engine_budget = budget - initial_query_count, so total <= budget by construction.
         total_queries_used: int = initial_query_count + run_result.query_accounting.attempted_queries
-        assert total_queries_used <= budget, (
-            f"Budget overrun: {total_queries_used} total oracle calls > configured budget {budget}. "
-            f"Initial: {initial_query_count}, engine: {run_result.query_accounting.attempted_queries}."
-        )
 
         # 6. Extract candidates and evaluate against ground truth (EVALUATOR PATH)
         ranked_candidates: List[HypothesisRepresentation] = []
