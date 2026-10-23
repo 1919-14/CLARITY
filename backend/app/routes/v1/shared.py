@@ -4,6 +4,7 @@ All serialization uses explicit allowlists to prevent ORM internals,
 oracle ground truth, or private evaluator details from leaking into responses.
 """
 
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from flask import jsonify
 
@@ -79,7 +80,22 @@ def serialize_run(run: RunModel) -> Dict[str, Any]:
     }
 
 
+def iso_utc(value: Optional[datetime]) -> Optional[str]:
+    """Serialize a timestamp as timezone-aware UTC ISO-8601.
+
+    Timestamps are stored in UTC. Some backends (notably SQLite) return them
+    without an offset, which would make API output ambiguous; those values are
+    explicitly interpreted as UTC rather than left naive.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def serialize_revision(rev: HypothesisRevisionModel) -> Dict[str, Any]:
+    """Serialize an immutable revision, including its provenance chain."""
     return {
         "revision_id": rev.revision_id,
         "revision_number": rev.revision_number,
@@ -87,7 +103,11 @@ def serialize_revision(rev: HypothesisRevisionModel) -> Dict[str, Any]:
         "parameters": rev.parameters,
         "complexity": rev.complexity,
         "creation_source": rev.creation_source,
-        "created_at": rev.created_at.isoformat() if rev.created_at else None,
+        "previous_revision_id": getattr(rev, "previous_revision_id", None),
+        "change_reason": getattr(rev, "change_reason", None),
+        "actor": getattr(rev, "actor", None),
+        "actor_id": getattr(rev, "actor_id", None),
+        "created_at": iso_utc(rev.created_at),
     }
 
 
@@ -96,14 +116,17 @@ def serialize_evaluation(eval_res: EvaluationResultModel) -> Dict[str, Any]:
     The oracle's hidden formula or ground-truth parameters are never included."""
     return {
         "evaluation_id": eval_res.evaluation_id,
+        "revision_id": eval_res.revision_id,
         "status": eval_res.status,
         "sample_count": eval_res.sample_count,
         "dataset_version": eval_res.dataset_version,
+        # Exact scientific input identity (Issue #17), distinct from the count.
+        "dataset_snapshot_id": getattr(eval_res, "dataset_snapshot_id", None),
         "metrics": eval_res.metrics,
         # held_out_metrics may be None when not yet computed
         "held_out_metrics": eval_res.held_out_metrics,
         "error_message": eval_res.error_message,
-        "evaluated_at": eval_res.evaluated_at.isoformat() if eval_res.evaluated_at else None,
+        "evaluated_at": iso_utc(eval_res.evaluated_at),
     }
 
 
@@ -226,14 +249,26 @@ def serialize_usage(usage: Optional[UsageRecordModel]) -> Dict[str, Any]:
 
 
 def serialize_audit_event(event: AuditEventModel) -> Dict[str, Any]:
-    """Serialize an immutable audit event."""
+    """Serialize an immutable audit event with its structured provenance.
+
+    ``before`` and ``after`` are ``None`` when the action has no relevant state
+    snapshot of that side, which is distinct from an empty object ``{}``.
+    """
     return {
         "event_id": event.event_id,
         "run_id": event.run_id,
         "event_type": event.event_type,
         "actor": event.actor,
+        "actor_id": getattr(event, "actor_id", None),
+        "hypothesis_id": getattr(event, "hypothesis_id", None),
+        "revision_id": getattr(event, "revision_id", None),
+        "correlation_id": getattr(event, "correlation_id", None),
+        "before": getattr(event, "before_json", None),
+        "after": getattr(event, "after_json", None),
+        "reason": getattr(event, "reason", None),
+        "corrects_event_id": getattr(event, "corrects_event_id", None),
         "metadata": event.metadata_json or {},
-        "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+        "timestamp": iso_utc(event.timestamp),
     }
 
 

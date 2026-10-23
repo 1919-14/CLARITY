@@ -13,8 +13,8 @@ Researchers and operators can inspect what happened during a run, which resource
    - Missing or unmeasurable provider data is classified as `unavailable` (`null` spend); it is **never** fabricated, guessed, or represented as $0.00 spend.
 
 2. **Append-Only Immutability**:
-   - Audit trail records cannot be modified or deleted via application or REST interfaces.
-   - Corrections or state changes (e.g., hypothesis unpinning, task retries, run cancellation) append new events preserving full historical provenance.
+   - Audit trail records cannot be modified or deleted via application or REST interfaces; the ORM/session layer rejects UPDATE/DELETE on `audit_events`.
+   - Corrections or state changes (e.g., hypothesis unpinning, task retries, run cancellation) append new events preserving full historical provenance. A correction appends `AUDIT_EVENT_CORRECTED` with `corrects_event_id` pointing at the superseded event (Issue #17).
 
 3. **Idempotency & Re-entrancy**:
    - Ingestion of duplicate task lifecycle events or audit event IDs does not duplicate records or double-count compute usage duration.
@@ -99,7 +99,8 @@ The audit trail records major lifecycle transitions:
 - **Budget Lifecycle**: `BUDGET_CONFIGURED`, `BUDGET_WARNING`, `BUDGET_EXHAUSTED`
 - **Task Lifecycle**: `TASK_SUBMITTED`, `TASK_STARTED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_TIMED_OUT`, `TASK_RETRYING`, `TASK_CANCELLED`
 - **Oracle Lifecycle**: `ORACLE_QUERY_SUBMITTED`, `ORACLE_QUERY_EXECUTED`, `OBSERVATION_RECORDED`
-- **Hypothesis Lifecycle**: `HYPOTHESIS_PROPOSED`, `HYPOTHESIS_EVALUATED`, `HYPOTHESIS_RANKED`, `HYPOTHESIS_PINNED`, `HYPOTHESIS_EXCLUDED`, `HYPOTHESIS_RE_EVALUATED`
+- **Hypothesis Lifecycle**: `HYPOTHESIS_PROPOSED`, `HYPOTHESIS_REVISED`, `HYPOTHESIS_EVALUATED`, `HYPOTHESIS_RANKED`, `HYPOTHESIS_PINNED`, `HYPOTHESIS_UNPINNED`, `HYPOTHESIS_EXCLUDED`, `HYPOTHESIS_RESTORED`, `HYPOTHESIS_REEVALUATED`, `HYPOTHESIS_REEVALUATE_REQUESTED`, `HYPOTHESIS_REEVALUATION_CONSUMED`
+- **History Integrity**: `AUDIT_EVENT_CORRECTED`
 - **Reporting Lifecycle**: `REPORT_GENERATED`, `REPORT_EXPORTED`
 
 ### 4.2 Event Schema
@@ -110,7 +111,15 @@ The audit trail records major lifecycle transitions:
   "run_id": "run-001",
   "event_type": "TASK_COMPLETED",
   "actor": "system",
-  "timestamp": "2026-10-23T12:00:05.123456Z",
+  "actor_id": null,
+  "hypothesis_id": null,
+  "revision_id": null,
+  "correlation_id": null,
+  "before": null,
+  "after": null,
+  "reason": null,
+  "corrects_event_id": null,
+  "timestamp": "2026-10-23T12:00:05.123456+00:00",
   "metadata": {
     "task_id": "tsk-42",
     "execution_mode": "nodus",
@@ -120,6 +129,12 @@ The audit trail records major lifecycle transitions:
   }
 }
 ```
+
+Issue #17 adds the structured provenance fields (`actor_id`, `hypothesis_id`,
+`revision_id`, `correlation_id`, `before`, `after`, `reason`, `corrects_event_id`)
+and the `GET /api/v1/runs/{run_id}/history` read model (filtering, cursor
+pagination). See [researcher-history.md](researcher-history.md) for the full
+event, revision and evaluation-provenance contract.
 
 ### 4.3 Data Retention & Chronology
 

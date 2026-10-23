@@ -10,7 +10,7 @@ Design Principles:
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 _REDACTION_PATTERNS = [
     # Redact URI credentials: ://user:password@ -> ://user:***@
@@ -40,6 +40,17 @@ def sanitize_exception_text(text: str) -> str:
     for pattern, replacement in _REDACTION_PATTERNS:
         sanitized = pattern.sub(replacement, sanitized)
     return sanitized
+
+
+def sanitize_reason_text(reason: Optional[str]) -> Optional[str]:
+    """Redact credentials from a free-text explanation while keeping its wording.
+
+    Researcher-supplied reasons are stored verbatim in history, so a pasted
+    connection string or bearer token must not end up in the audit trail.
+    """
+    if reason is None:
+        return None
+    return sanitize_exception_text(str(reason))
 
 
 def sanitize_metadata(obj: Any) -> Any:
