@@ -49,19 +49,30 @@ from ...services.hypothesis_service import (
     HypothesisNotFoundError,
     propose_hypothesis_service,
 )
+from ...services.audit_service import (
+    list_audit_events_service,
+    record_audit_event_service,
+)
 from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
 from ...services.run_service import (
     RunConflictError,
     create_run_service,
 )
+from ...services.usage_service import (
+    derive_run_usage_summary,
+    reconcile_run_usage,
+    record_task_usage_service,
+)
 from .shared import (
     error_response,
     log_safe_error,
+    serialize_audit_event,
     serialize_benchmark,
     serialize_hypothesis,
     serialize_observation,
     serialize_report,
     serialize_run,
+    serialize_task,
     serialize_usage,
 )
 
@@ -730,3 +741,185 @@ def create_run_hypothesis(run_id: str):
         return error_response("An internal error occurred while creating the hypothesis.", 500)
 
     return jsonify({"hypothesis": serialized}), 201
+
+
+@runs_v1_bp.route("/runs/<run_id>/usage", methods=["GET"])
+def get_run_usage(run_id: str):
+    """GET /api/v1/runs/<run_id>/usage — Comprehensive compute-usage summary.
+
+    Reconciles task-level compute with run-level usage, breaks down local vs remote
+    execution, and separates estimated, accruing, and settled costs (Issue #15).
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            summary = derive_run_usage_summary(session, run_id)
+            payload = summary.to_dict()
+    except ValueError as exc:
+        return error_response(str(exc), 404)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_run_usage db error", exc)
+        return error_response("An internal error occurred while retrieving run usage.", 500)
+
+    return jsonify({"run_id": run_id, "usage": payload}), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/tasks", methods=["GET"])
+def list_run_tasks(run_id: str):
+    """GET /api/v1/runs/<run_id>/tasks — Task-level compute execution records.
+
+    Query params:
+      status (str, optional)
+      execution_mode (str, optional: local, nodus_remote, mock)
+      limit (int, 1–200, default 50)
+      offset (int, >= 0, default 0)
+    """
+    try:
+        limit, offset = _parse_pagination(request.args)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+
+    status_filter = request.args.get("status")
+    mode_filter = request.args.get("execution_mode")
+    if mode_filter and mode_filter not in _VALID_EXECUTION_MODES:
+        return error_response(
+            f"'execution_mode' filter must be one of: {', '.join(sorted(_VALID_EXECUTION_MODES))}.",
+            400,
+        )
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            tasks = repo.list_compute_tasks_for_run(
+                run_id=run_id,
+                status=status_filter,
+                execution_mode=mode_filter,
+                limit=limit,
+                offset=offset,
+            )
+            total_count = repo.count_compute_tasks_for_run(
+                run_id=run_id,
+                status=status_filter,
+                execution_mode=mode_filter,
+            )
+            serialized = [serialize_task(t) for t in tasks]
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("list_run_tasks db error", exc)
+        return error_response("An internal error occurred while listing tasks.", 500)
+
+    return jsonify({
+        "run_id": run_id,
+        "tasks": serialized,
+        "count": len(serialized),
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/audit-events", methods=["GET"])
+def list_run_audit_events(run_id: str):
+    """GET /api/v1/runs/<run_id>/audit-events — Chronological append-only audit trail.
+
+    Query params:
+      event_type (str, optional filter)
+      limit (int, 1–200, default 50)
+      offset (int, >= 0, default 0)
+    """
+    try:
+        limit, offset = _parse_pagination(request.args)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
+
+    event_type = request.args.get("event_type")
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            events, total_count = list_audit_events_service(
+                session=session,
+                run_id=run_id,
+                event_type=event_type,
+                limit=limit,
+                offset=offset,
+            )
+            serialized = [serialize_audit_event(e) for e in events]
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("list_run_audit_events db error", exc)
+        return error_response("An internal error occurred while retrieving audit events.", 500)
+
+    return jsonify({
+        "run_id": run_id,
+        "audit_events": serialized,
+        "count": len(serialized),
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "event_type": event_type,
+    }), 200
+
+
+@runs_v1_bp.route("/runs/<run_id>/audit-events", methods=["POST"])
+def record_run_audit_event(run_id: str):
+    """POST /api/v1/runs/<run_id>/audit-events — Append a new audit event for a run.
+
+    Body:
+      event_type (str, required)
+      actor (str, optional, default "researcher")
+      metadata (dict, optional)
+    """
+    if not request.is_json:
+        return error_response("Payload must be JSON with Content-Type application/json.", 400)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return error_response("Request body must be a JSON object.", 400)
+
+    event_type = data.get("event_type")
+    if not event_type or not isinstance(event_type, str) or not event_type.strip():
+        return error_response("Field 'event_type' is required and must be a non-empty string.", 400)
+
+    actor = data.get("actor", "researcher")
+    if not isinstance(actor, str) or not actor.strip():
+        actor = "researcher"
+
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return error_response("Field 'metadata' must be a JSON object when provided.", 400)
+
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            run = repo.get_run(run_id)
+            if not run:
+                return error_response(f"Run '{run_id}' not found.", 404)
+
+            event = record_audit_event_service(
+                session=session,
+                run_id=run_id,
+                event_type=event_type.strip(),
+                actor=actor.strip(),
+                metadata=metadata,
+            )
+            serialized = serialize_audit_event(event)
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("record_run_audit_event db error", exc)
+        return error_response("An internal error occurred while recording audit event.", 500)
+
+    return jsonify({"audit_event": serialized}), 201

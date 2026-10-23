@@ -200,21 +200,126 @@ class ClarityRepository:
         return list(self.session.scalars(stmt).all())
 
     # =========================================================================
-    # Audit Events
+    # Compute Tasks Operations (Issue #15 Task-Level Tracking)
+    # =========================================================================
+
+    def record_compute_task(self, task: ComputeTaskModel) -> ComputeTaskModel:
+        """Idempotently insert or update a compute task record."""
+        existing = self.session.get(ComputeTaskModel, task.task_id)
+        if existing:
+            existing.status = task.status
+            if task.started_at is not None:
+                existing.started_at = task.started_at
+            if task.completed_at is not None:
+                existing.completed_at = task.completed_at
+            if task.duration_ms is not None:
+                existing.duration_ms = task.duration_ms
+            if task.provider_task_id is not None:
+                existing.provider_task_id = task.provider_task_id
+            if task.execution_mode is not None:
+                existing.execution_mode = task.execution_mode
+            if task.candidate_id is not None:
+                existing.candidate_id = task.candidate_id
+            if task.error_metadata is not None:
+                existing.error_metadata = task.error_metadata
+            self.session.flush()
+            return existing
+        self.session.add(task)
+        self.session.flush()
+        return task
+
+    def get_compute_task(self, task_id: str) -> Optional[ComputeTaskModel]:
+        return self.session.get(ComputeTaskModel, task_id)
+
+    def list_compute_tasks_for_run(
+        self,
+        run_id: str,
+        status: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> List[ComputeTaskModel]:
+        stmt = (
+            select(ComputeTaskModel)
+            .where(ComputeTaskModel.run_id == run_id)
+            .order_by(ComputeTaskModel.created_at.asc(), ComputeTaskModel.task_id.asc())
+        )
+        if status is not None:
+            stmt = stmt.where(ComputeTaskModel.status == status)
+        if execution_mode is not None:
+            stmt = stmt.where(ComputeTaskModel.execution_mode == execution_mode)
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def count_compute_tasks_for_run(
+        self,
+        run_id: str,
+        status: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+    ) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(ComputeTaskModel)
+            .where(ComputeTaskModel.run_id == run_id)
+        )
+        if status is not None:
+            stmt = stmt.where(ComputeTaskModel.status == status)
+        if execution_mode is not None:
+            stmt = stmt.where(ComputeTaskModel.execution_mode == execution_mode)
+        return self.session.scalar(stmt) or 0
+
+    # =========================================================================
+    # Audit Events (Append-Only)
     # =========================================================================
 
     def record_audit_event(self, event: AuditEventModel) -> AuditEventModel:
+        """Append an audit event. Existing events with the same event_id are not overwritten."""
+        existing = self.session.get(AuditEventModel, event.event_id)
+        if existing:
+            return existing
         self.session.add(event)
         self.session.flush()
         return event
 
-    def list_audit_events_for_run(self, run_id: str) -> List[AuditEventModel]:
+    def get_audit_event(self, event_id: str) -> Optional[AuditEventModel]:
+        return self.session.get(AuditEventModel, event_id)
+
+    def list_audit_events_for_run(
+        self,
+        run_id: str,
+        event_type: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> List[AuditEventModel]:
         stmt = (
             select(AuditEventModel)
             .where(AuditEventModel.run_id == run_id)
-            .order_by(AuditEventModel.timestamp)
+            .order_by(AuditEventModel.timestamp.asc(), AuditEventModel.event_id.asc())
         )
+        if event_type is not None:
+            stmt = stmt.where(AuditEventModel.event_type == event_type)
+        if offset is not None:
+            stmt = stmt.offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
+
+    def count_audit_events_for_run(
+        self,
+        run_id: str,
+        event_type: Optional[str] = None,
+    ) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(AuditEventModel)
+            .where(AuditEventModel.run_id == run_id)
+        )
+        if event_type is not None:
+            stmt = stmt.where(AuditEventModel.event_type == event_type)
+        return self.session.scalar(stmt) or 0
 
     # =========================================================================
     # Usage & Budget Operations
