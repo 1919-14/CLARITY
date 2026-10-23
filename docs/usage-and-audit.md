@@ -53,13 +53,14 @@ Each unit of computational work (hypothesis evaluation, oracle query batch, or e
 
 ### 2.2 Run-Level Derivation & Reconciliation
 
-Run totals are derived directly from underlying task records. The service endpoint `reconcile_run_usage(session, run_id)` compares:
-- Derived task count vs recorded completed tasks.
-- Sum of task durations vs run wall-clock duration.
-- Total oracle queries and candidate evaluations consumed across all tasks.
-- Task counts broken down by status: `tasks_submitted`, `tasks_completed`, `tasks_failed`, `tasks_timed_out`, `tasks_cancelled`.
+Task counters, execution modes, and durations are derived directly from underlying task records using aggregate database queries. Query and evaluation totals are tracked via run budget usage records and verified during reconciliation against entity observations and candidate tasks. The service endpoint `reconcile_run_usage(session, run_id)` compares:
+- Completed task count vs completed evaluation count (flagging positive evaluations without matching candidate evaluation tasks).
+- Candidate evaluation tasks completed vs recorded evaluation completions.
+- Sum of task durations vs run wall-clock duration (sequential duration for local execution; maximum individual task duration for remote execution).
+- Recorded oracle query count from run usage vs stored observation entities in the database.
+- Task counts broken down by status (`tasks_submitted`, `tasks_completed`, `tasks_failed`, `tasks_timed_out`, `tasks_cancelled`, `tasks_retried`) against total recorded tasks.
 
-If discrepancies arise, the reconciliation report returns `is_reconciled: false` with detailed discrepancy metrics.
+If discrepancies arise, the reconciliation report returns `is_reconciled: false` with detailed discrepancy descriptions in `discrepancies`.
 
 ---
 
@@ -69,7 +70,7 @@ Every cost figure in CLARITY is classified into one of four distinct states:
 
 | Cost State | Meaning | Serialization |
 |---|---|---|
-| `estimated` | Application-calculated using documented pricing models and measured task durations. | `amount_usd: <float>`, `state: "estimated"`, accompanied by `pricing_assumptions` and `calculation_method`. |
+| `estimated` | Application-calculated using documented pricing models and measured task durations. | `amount_usd: <float>`, `state: "estimated"`, accompanied by `pricing_assumptions`, `calculation_method`, and `is_complete`. |
 | `accruing` | Provider-reported usage or charges that are still accumulating and not yet final. | `amount_usd: <float>`, `state: "accruing"`. |
 | `settled` | Finalized provider-reported billing charges. | `amount_usd: <float>`, `state: "settled"`. |
 | `unavailable` | Insufficient information from the provider to determine actual spend. | `amount_usd: null`, `state: "unavailable"`. |
@@ -82,7 +83,7 @@ Every cost figure in CLARITY is classified into one of four distinct states:
 - **Nodus Remote Execution (`nodus`)**:
   - Rate: $0.05 / task minute ($3.00 / compute hour).
   - Formula: `(duration_seconds / 60.0) * 0.05 USD`.
-  - Missing duration: Uses `0.00 USD` base estimate with flagged incomplete status.
+  - Incomplete / Unknown duration: When remote tasks have missing duration, the estimate is explicitly flagged with `is_complete: false` and `completeness: "partial"`. If all remote tasks have missing duration with zero measured duration and no query/eval spend, the estimate is classified as `state: "unavailable"` (`amount_usd: null`) rather than an unqualified $0.00 estimate.
 
 > **Zero Spend Semantics**: A cost of `0.0` is only returned when spend was actually measured as zero (e.g. local compute). If remote compute cost is unknown or unavailable from the provider, `amount_usd` is serialized as `null` with state `unavailable`.
 

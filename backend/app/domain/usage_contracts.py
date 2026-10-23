@@ -73,6 +73,7 @@ class CostEstimateDetail:
     pricing_assumptions: Dict[str, Any] = field(default_factory=dict)
     source: str = "application"
     is_provider_reported: bool = False
+    is_complete: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,6 +84,7 @@ class CostEstimateDetail:
             "pricing_assumptions": dict(self.pricing_assumptions),
             "source": self.source,
             "is_provider_reported": self.is_provider_reported,
+            "is_complete": self.is_complete,
         }
 
 

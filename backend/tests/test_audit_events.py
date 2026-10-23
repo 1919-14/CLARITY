@@ -258,6 +258,58 @@ class TestSensitiveDataRedaction:
         assert meta["nested"]["secret_key"] == "***REDACTED***"
         assert meta["nested"]["normal"] == 42
 
+    def test_bearer_token_and_auth_headers_redacted_in_free_form_strings(self, db_session):
+        """Raw Authorization headers and Bearer tokens are scrubbed in ordinary metadata keys like error_message."""
+        run = _create_run(db_session)
+        payload = {
+            "error_message": "Remote call failed: Authorization: Bearer abc123def456 from client",
+            "details": "Invalid credentials: Bearer my-secret-jwt-token-789",
+            "log_line": "Request headers sent: {'Authorization': 'Bearer raw-header-token-000'}",
+            "http_status": "401 Unauthorized",
+            "nested": {
+                "raw_exception": "Exception: Bearer inline-nested-secret failed to authenticate",
+                "normal_field": "ordinary_value",
+            },
+        }
+
+        event = record_audit_event_service(
+            session=db_session,
+            run_id=run.run_id,
+            event_type="AUTH_FAILURE_LOG",
+            metadata=payload,
+        )
+
+        meta = event.metadata_json
+        # Raw bearer tokens must be scrubbed, never leaked
+        assert "abc123def456" not in meta["error_message"]
+        assert "Bearer ***" in meta["error_message"]
+
+        assert "my-secret-jwt-token-789" not in meta["details"]
+        assert "Bearer ***" in meta["details"]
+
+        assert "raw-header-token-000" not in meta["log_line"]
+        assert "Bearer ***" in meta["log_line"]
+
+        assert meta["http_status"] == "401 Unauthorized"
+
+        assert "inline-nested-secret" not in meta["nested"]["raw_exception"]
+        assert "Bearer ***" in meta["nested"]["raw_exception"]
+        assert meta["nested"]["normal_field"] == "ordinary_value"
+
+    def test_sanitize_exception_text_redacts_embedded_bearer_headers(self):
+        """sanitize_exception_text scrubs Authorization headers and Bearer tokens directly."""
+        from app.domain.sanitization import sanitize_exception_text
+
+        # Header style with Bearer
+        assert sanitize_exception_text("Authorization: Bearer secret123") == "Authorization: Bearer ***"
+        # Standalone Bearer token
+        assert sanitize_exception_text("Failed due to Bearer sk-secret-abc") == "Failed due to Bearer ***"
+        # Basic auth in header
+        assert sanitize_exception_text("Authorization: Basic dXNlcjpwYXNz") == "Authorization: Basic ***"
+        # Quoted Bearer token
+        assert "secret123" not in sanitize_exception_text("Authorization: Bearer 'secret123'")
+
+
 
 class TestAuditPersistenceAcrossFailureAndBudget:
     def test_audit_history_retained_after_run_cancelled(self, db_session):
@@ -352,4 +404,29 @@ class TestAuditApiEndpoints:
         )
         assert res_conflict_payload.status_code == 409
         assert "metadata payload mismatch" in res_conflict_payload.get_json()["message"]
+
+    def test_post_audit_event_scrubs_embedded_bearer_headers(self, client):
+        """POST /api/v1/runs/<run_id>/audit-events scrubs embedded raw bearer tokens under non-sensitive keys."""
+        res_run = client.post("/api/v1/runs", json={"name": "API Bearer Scrub Run"})
+        run_id = res_run.get_json()["run"]["run_id"]
+
+        res = client.post(
+            f"/api/v1/runs/{run_id}/audit-events",
+            json={
+                "event_type": "TASK_ERROR_LOG",
+                "actor": "worker-1",
+                "metadata": {
+                    "error_message": "Upstream service error: Authorization: Bearer secret-raw-token-4433",
+                    "log_context": "Authenticated via Bearer internal-secret-token",
+                },
+            },
+        )
+        assert res.status_code == 201
+        event = res.get_json()["audit_event"]
+        meta = event["metadata"]
+        assert "secret-raw-token-4433" not in meta["error_message"]
+        assert "Bearer ***" in meta["error_message"]
+        assert "internal-secret-token" not in meta["log_context"]
+        assert "Bearer ***" in meta["log_context"]
+
 

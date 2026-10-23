@@ -21,6 +21,12 @@ _REDACTION_PATTERNS = [
     (re.compile(r"""(password|passwd|secret|token|api_key|ground_truth)['"]?\s*[:=]\s*(?:'[^']*'|"[^"]*"|[^\s,;)]+)""", re.IGNORECASE), r"\1=***"),
     # Redact parameters / DSN key-value pairs: pwd=..., secret=...
     (re.compile(r"\b(pwd|password)\s*=\s*[^\s,)]+", re.IGNORECASE), r"\1=***"),
+    # Redact raw Authorization header values: Authorization: Bearer abc123 or Authorization: Basic xyz
+    (re.compile(r"""\b(Authorization\s*:\s*(?:Bearer|Basic|Token)?\s*)['"]?[a-zA-Z0-9_\-\.~+/=]+['"]?""", re.IGNORECASE), r"\1***"),
+    # Redact raw Bearer tokens in free-form text: Bearer abc123 or 'Bearer abc123'
+    (re.compile(r"""\b(Bearer\s+)['"]?[a-zA-Z0-9_\-\.~+/=]+['"]?""", re.IGNORECASE), r"\1***"),
+    # Redact raw Basic auth credentials in free-form text: Basic dXNlcjpwYXNz
+    (re.compile(r"""\b(Basic\s+)['"]?[a-zA-Z0-9+/=]{6,}['"]?""", re.IGNORECASE), r"\1***"),
 ]
 
 SENSITIVE_KEY_PATTERN = re.compile(

@@ -315,8 +315,24 @@ class TestRunUsageDerivationAndReconciliation:
         assert summary_dict["reconciliation"]["is_reconciled"] is False
         assert len(summary_dict["reconciliation"]["discrepancies"]) >= 1
 
+    def test_reconciliation_flags_positive_evaluations_without_candidate_tasks(self, db_session):
+        """Positive recorded evaluations without matching candidate evaluation tasks are flagged as a discrepancy."""
+        run = _create_run(db_session)
+        repo = ClarityRepository(db_session)
+
+        # Record run usage with 3 completed evaluations, but 0 candidate evaluation tasks
+        usage = repo.get_latest_usage_for_run(run.run_id)
+        usage.evaluations_completed = 3
+        db_session.flush()
+
+        recon = reconcile_run_usage(db_session, run.run_id)
+        assert recon["is_reconciled"] is False
+        assert recon["reconciliation_status"] == "discrepancy_detected"
+        assert any("Candidate evaluation tasks completed (0) is less than recorded completed evaluations (3)" in d for d in recon["discrepancies"])
+
 
 class TestCostClassificationAndHonesty:
+
     def test_cost_estimate_arithmetic_pins_rate_to_docs(self, db_session):
         """Pricing arithmetic strictly matches documented rate ($0.05/min = $3.00/hr, $0.01/query, $0.005/eval)."""
         assert DEFAULT_REMOTE_TASK_MINUTE_RATE_USD == 0.05
@@ -403,8 +419,73 @@ class TestCostClassificationAndHonesty:
         assert summary.settled_cost.amount_usd == 4.25
         assert summary.settled_cost.is_provider_reported is True
 
+    def test_remote_task_with_unknown_duration_is_unavailable_not_unqualified_zero(self):
+        """When remote tasks have missing/unknown duration and no spend, cost is unavailable (null) not $0.00."""
+        # Single remote task with unknown duration (remote_duration_ms=0, remote_tasks_missing_duration=1)
+        est = calculate_cost_estimate(
+            local_tasks=0,
+            remote_tasks=1,
+            remote_duration_ms=0,
+            queries_count=0,
+            evaluations_count=0,
+            remote_tasks_missing_duration=1,
+        )
+        assert est.state == CostState.UNAVAILABLE
+        assert est.amount_usd is None  # Never unqualified 0.0!
+        assert est.is_complete is False
+        assert est.pricing_assumptions["is_complete"] is False
+        assert est.pricing_assumptions["completeness"] == "incomplete"
+        assert est.calculation_method == "remote_task_duration_unavailable"
+
+        # Also test default behavior when remote_tasks_missing_duration is omitted but remote_duration_ms is 0
+        est_default = calculate_cost_estimate(remote_tasks=1, remote_duration_ms=0)
+        assert est_default.state == CostState.UNAVAILABLE
+        assert est_default.amount_usd is None
+        assert est_default.is_complete is False
+
+    def test_remote_task_with_partial_duration_reports_partial_completeness(self):
+        """When some remote tasks have known duration but others are missing, status is partial."""
+        # 2 remote tasks: 1 with 1 minute known duration ($0.05), 1 missing duration
+        est = calculate_cost_estimate(
+            local_tasks=0,
+            remote_tasks=2,
+            remote_duration_ms=60000,
+            queries_count=0,
+            evaluations_count=0,
+            remote_tasks_missing_duration=1,
+        )
+        assert est.state == CostState.ESTIMATED
+        assert est.amount_usd == 0.05
+        assert est.is_complete is False
+        assert est.pricing_assumptions["is_complete"] is False
+        assert est.pricing_assumptions["completeness"] == "partial"
+        assert est.calculation_method == "application_documented_rates_partial"
+        assert est.pricing_assumptions["remote_tasks_missing_duration"] == 1
+
+    def test_derive_run_usage_summary_flags_incomplete_for_in_flight_remote_task(self, db_session):
+        """A run with an in-flight or unmeasured remote task sets is_complete=False and state=unavailable."""
+        run = _create_run(db_session, mode="nodus_remote")
+
+        # Record remote task with no duration (in-flight/pending)
+        record_task_usage_service(
+            session=db_session,
+            run_id=run.run_id,
+            task_id="task-remote-pending-1",
+            execution_mode="nodus_remote",
+            status="pending",
+            duration_ms=None,
+        )
+
+        summary = derive_run_usage_summary(db_session, run.run_id)
+        assert summary.remote_tasks_count == 1
+        assert summary.estimated_cost.state == CostState.UNAVAILABLE
+        assert summary.estimated_cost.amount_usd is None
+        assert summary.estimated_cost.is_complete is False
+        assert summary.estimated_cost.pricing_assumptions["completeness"] == "incomplete"
+
 
 class TestUsageApiEndpoints:
+
     def test_get_run_usage_endpoint(self, client):
         """GET /api/v1/runs/<run_id>/usage returns complete usage summary."""
         res_run = client.post("/api/v1/runs", json={"name": "API Usage Run"})
@@ -474,3 +555,31 @@ class TestUsageApiEndpoints:
         assert meta["password"] == "***REDACTED***"
         assert meta["token"] == "***REDACTED***"
         assert meta["task_metadata"]["api_key"] == "***REDACTED***"
+
+    def test_get_run_usage_serializes_incomplete_remote_estimate(self, client, app):
+        """GET /api/v1/runs/<run_id>/usage serializes is_complete and handles unknown remote task duration."""
+        res_run = client.post("/api/v1/runs", json={"name": "API Incomplete Cost Run", "execution_mode": "nodus_remote"})
+        run_id = res_run.get_json()["run"]["run_id"]
+
+        # Record a remote task with missing duration (e.g. running)
+        db_uri = app.config.get("SQLALCHEMY_DATABASE_URI")
+        db = get_db_manager(db_uri)
+        with db.session_scope() as session:
+            record_task_usage_service(
+                session,
+                run_id,
+                "api-remote-in-flight",
+                execution_mode="nodus_remote",
+                status="running",
+                duration_ms=None,
+            )
+
+        res = client.get(f"/api/v1/runs/{run_id}/usage")
+        assert res.status_code == 200
+        usage = res.get_json()["usage"]
+        est = usage["costs"]["estimated"]
+        assert est["is_complete"] is False
+        assert est["state"] == "unavailable"
+        assert est["amount_usd"] is None
+        assert est["pricing_assumptions"]["completeness"] == "incomplete"
+

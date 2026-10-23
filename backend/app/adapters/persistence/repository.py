@@ -289,6 +289,7 @@ class ClarityRepository:
                 func.coalesce(func.sum(ComputeTaskModel.duration_ms), 0),
                 func.coalesce(func.max(ComputeTaskModel.duration_ms), 0),
                 func.count(ComputeTaskModel.candidate_id),
+                func.count(ComputeTaskModel.duration_ms),
             )
             .where(ComputeTaskModel.run_id == run_id)
             .group_by(ComputeTaskModel.status, ComputeTaskModel.execution_mode)
@@ -304,17 +305,21 @@ class ClarityRepository:
         tasks_retried = 0
         local_tasks = 0
         remote_tasks = 0
+        remote_tasks_with_duration = 0
+        remote_tasks_missing_duration = 0
         total_duration_ms = 0
         remote_duration_ms = 0
         max_task_duration_ms = 0
         evaluation_tasks_count = 0
         evaluation_tasks_completed = 0
 
-        for status, mode, count, sum_dur, max_dur, cand_count in rows:
+        for status, mode, count, sum_dur, max_dur, cand_count, with_dur_count in rows:
             count = int(count or 0)
             sum_dur = int(sum_dur or 0)
             max_dur = int(max_dur or 0)
             cand_count = int(cand_count or 0)
+            with_dur_count = int(with_dur_count or 0)
+            missing_dur_count = max(0, count - with_dur_count)
 
             total_tasks += count
             if status in ("pending", "running", "completed", "failed", "timed_out", "cancelled", "retrying"):
@@ -336,6 +341,8 @@ class ClarityRepository:
             elif mode == "nodus_remote":
                 remote_tasks += count
                 remote_duration_ms += sum_dur
+                remote_tasks_with_duration += with_dur_count
+                remote_tasks_missing_duration += missing_dur_count
 
             total_duration_ms += sum_dur
             if max_dur > max_task_duration_ms:
@@ -352,6 +359,8 @@ class ClarityRepository:
             "tasks_retried": tasks_retried,
             "local_tasks_count": local_tasks,
             "remote_tasks_count": remote_tasks,
+            "remote_tasks_with_duration": remote_tasks_with_duration,
+            "remote_tasks_missing_duration": remote_tasks_missing_duration,
             "total_execution_duration_ms": total_duration_ms,
             "remote_duration_ms": remote_duration_ms,
             "max_task_duration_ms": max_task_duration_ms,

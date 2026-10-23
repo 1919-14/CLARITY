@@ -152,11 +152,12 @@ def record_task_usage_service(
 
 
 def calculate_cost_estimate(
-    local_tasks: int,
-    remote_tasks: int,
-    remote_duration_ms: int,
-    queries_count: int,
-    evaluations_count: int,
+    local_tasks: int = 0,
+    remote_tasks: int = 0,
+    remote_duration_ms: int = 0,
+    queries_count: int = 0,
+    evaluations_count: int = 0,
+    remote_tasks_missing_duration: Optional[int] = None,
 ) -> CostEstimateDetail:
     """Calculate application-side estimated compute cost based on documented pricing assumptions.
 
@@ -166,19 +167,50 @@ def calculate_cost_estimate(
     - Oracle Query: $0.01 / query
     - Candidate Evaluation: $0.005 / evaluation
     """
+    if remote_tasks_missing_duration is None:
+        remote_tasks_missing_duration = remote_tasks if (remote_tasks > 0 and remote_duration_ms == 0) else 0
+
     remote_minutes = remote_duration_ms / (1000.0 * 60.0)
     remote_hours = remote_minutes / 60.0
     remote_compute_cost = remote_minutes * DEFAULT_REMOTE_TASK_MINUTE_RATE_USD
     queries_cost = queries_count * DEFAULT_ORACLE_QUERY_COST_USD
     evaluations_cost = evaluations_count * DEFAULT_EVALUATION_COST_USD
 
+    is_complete = (remote_tasks == 0) or (remote_tasks_missing_duration == 0)
+
+    # When remote tasks exist with completely unknown duration and no other measured spend,
+    # mark as UNAVAILABLE (null spend) rather than serializing an unqualified $0.00 estimate.
+    if remote_tasks > 0 and remote_tasks_missing_duration == remote_tasks and remote_duration_ms == 0 and queries_cost == 0.0 and evaluations_cost == 0.0:
+        return CostEstimateDetail(
+            state=CostState.UNAVAILABLE,
+            amount_usd=None,
+            currency="USD",
+            calculation_method="remote_task_duration_unavailable",
+            pricing_assumptions={
+                "remote_task_minute_rate_usd": DEFAULT_REMOTE_TASK_MINUTE_RATE_USD,
+                "remote_task_hourly_rate_usd": DEFAULT_REMOTE_TASK_HOURLY_RATE_USD,
+                "local_task_hourly_rate_usd": DEFAULT_LOCAL_TASK_HOURLY_RATE_USD,
+                "oracle_query_cost_usd": DEFAULT_ORACLE_QUERY_COST_USD,
+                "candidate_evaluation_cost_usd": DEFAULT_EVALUATION_COST_USD,
+                "remote_execution_minutes": 0.0,
+                "remote_execution_hours": 0.0,
+                "remote_tasks_missing_duration": remote_tasks_missing_duration,
+                "is_complete": False,
+                "completeness": "incomplete",
+            },
+            source="application_estimate",
+            is_provider_reported=False,
+            is_complete=False,
+        )
+
     total_est = round(remote_compute_cost + queries_cost + evaluations_cost, 4)
+    calc_method = "application_documented_rates" if is_complete else "application_documented_rates_partial"
 
     return CostEstimateDetail(
         state=CostState.ESTIMATED,
         amount_usd=total_est,
         currency="USD",
-        calculation_method="application_documented_rates",
+        calculation_method=calc_method,
         pricing_assumptions={
             "remote_task_minute_rate_usd": DEFAULT_REMOTE_TASK_MINUTE_RATE_USD,
             "remote_task_hourly_rate_usd": DEFAULT_REMOTE_TASK_HOURLY_RATE_USD,
@@ -187,9 +219,13 @@ def calculate_cost_estimate(
             "candidate_evaluation_cost_usd": DEFAULT_EVALUATION_COST_USD,
             "remote_execution_minutes": round(remote_minutes, 4),
             "remote_execution_hours": round(remote_hours, 4),
+            "remote_tasks_missing_duration": remote_tasks_missing_duration,
+            "is_complete": is_complete,
+            "completeness": "complete" if is_complete else "partial",
         },
         source="application_estimate",
         is_provider_reported=False,
+        is_complete=is_complete,
     )
 
 
@@ -207,15 +243,14 @@ def _evaluate_run_discrepancies(
     tasks_completed = task_metrics["tasks_completed"]
 
     # 1. Tasks completed vs evaluations completed
-    if tasks_total > 0 and evals_completed > 0 and tasks_completed < evals_completed:
+    if evals_completed > 0 and tasks_completed < evals_completed:
         discrepancies.append(
             f"Completed tasks count ({tasks_completed}) is less than recorded completed evaluations ({evals_completed})."
         )
 
-    # 2. Candidate evaluation tasks vs evaluations completed
+    # 2. Candidate evaluation tasks vs evaluations completed (must not skip when eval_tasks_count is 0)
     eval_tasks_completed = task_metrics.get("evaluation_tasks_completed", 0)
-    eval_tasks_count = task_metrics.get("evaluation_tasks_count", 0)
-    if eval_tasks_count > 0 and evals_completed > 0 and eval_tasks_completed < evals_completed:
+    if evals_completed > 0 and eval_tasks_completed < evals_completed:
         discrepancies.append(
             f"Candidate evaluation tasks completed ({eval_tasks_completed}) is less than recorded completed evaluations ({evals_completed})."
         )
@@ -317,6 +352,7 @@ def derive_run_usage_summary(
         remote_duration_ms=task_metrics["remote_duration_ms"],
         queries_count=queries_count,
         evaluations_count=evals_completed,
+        remote_tasks_missing_duration=task_metrics.get("remote_tasks_missing_duration", 0),
     )
 
     # 2. Accruing Cost: Provider-reported in-flight cost, or unavailable
