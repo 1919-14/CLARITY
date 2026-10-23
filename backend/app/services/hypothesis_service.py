@@ -27,6 +27,7 @@ from ..domain.contracts import (
     ObservationStatus,
 )
 from ..domain.evaluation import EvaluationPipeline
+from ..domain.expression_validator import validate_hypothesis_expression
 from ..domain.hypothesis_models import POLYNOMIAL_FAMILY_ID
 
 
@@ -42,29 +43,50 @@ class HypothesisValidationError(HypothesisServiceError):
     """Raised when hypothesis data fails validation."""
 
 
+class HypothesisConflictError(HypothesisServiceError):
+    """Raised on concurrent edit conflict or duplicate identifier."""
+
+
 def propose_hypothesis_service(
     session: Session,
     run_id: str,
     model_family: str,
     formula: str,
-    parameters: Dict[str, Any],
-    complexity: int = 1,
+    parameters: Optional[Dict[str, Any]] = None,
+    complexity: Optional[int] = None,
     creation_source: str = "researcher",
     hypothesis_id: Optional[str] = None,
 ) -> HypothesisModel:
-    """Create a new candidate hypothesis and its initial revision under a run."""
+    """Validate and create a new candidate hypothesis and its initial revision under a run."""
     repo = ClarityRepository(session)
     run = repo.get_run(run_id)
     if not run:
         raise HypothesisNotFoundError(f"Run '{run_id}' not found.")
 
+    # 1. Validate expression safely using AST parser (strictly rejects code execution/eval/exec/imports)
+    validated, error = validate_hypothesis_expression(
+        formula=formula,
+        model_family=model_family,
+        parameters=parameters,
+        complexity=complexity,
+    )
+    if error:
+        raise HypothesisValidationError(error.message)
+
+    # 2. Check for duplicate ID / conflict
+    if hypothesis_id and repo.get_hypothesis(hypothesis_id):
+        raise HypothesisConflictError(f"Hypothesis '{hypothesis_id}' already exists.")
+
     hyp_id = hypothesis_id or f"hyp-{uuid.uuid4().hex[:12]}"
     rev_id = f"rev-{uuid.uuid4().hex[:12]}"
+
+    final_complexity = complexity if (complexity and complexity >= 1) else (validated.complexity if validated else 1)
+    final_params = dict(parameters) if parameters else (validated.parameters if validated else {})
 
     hypothesis = HypothesisModel(
         hypothesis_id=hyp_id,
         run_id=run_id,
-        model_family=model_family,
+        model_family=model_family.strip(),
         current_revision=1,
         is_pinned=False,
         is_excluded=False,
@@ -73,9 +95,9 @@ def propose_hypothesis_service(
         revision_id=rev_id,
         hypothesis_id=hyp_id,
         revision_number=1,
-        formula=formula,
-        parameters=parameters,
-        complexity=complexity,
+        formula=formula.strip(),
+        parameters=final_params,
+        complexity=final_complexity,
         creation_source=creation_source,
     )
     repo.create_hypothesis_with_initial_revision(hypothesis, initial_rev)
@@ -88,9 +110,9 @@ def propose_hypothesis_service(
         metadata_json={
             "hypothesis_id": hyp_id,
             "revision_id": rev_id,
-            "model_family": model_family,
-            "formula": formula,
-            "complexity": complexity,
+            "model_family": model_family.strip(),
+            "formula": formula.strip(),
+            "complexity": final_complexity,
         },
     )
     repo.record_audit_event(audit)
@@ -103,12 +125,19 @@ def update_hypothesis_flags_service(
     hypothesis_id: str,
     is_pinned: Optional[bool] = None,
     is_excluded: Optional[bool] = None,
+    expected_revision: Optional[int] = None,
 ) -> HypothesisModel:
-    """Update pinning and exclusion flags on a hypothesis with appropriate audit trail."""
+    """Update pinning and exclusion flags on a hypothesis with optimistic locking and audit trail."""
     repo = ClarityRepository(session)
     hyp = repo.get_hypothesis(hypothesis_id)
     if not hyp:
         raise HypothesisNotFoundError(f"Hypothesis '{hypothesis_id}' not found.")
+
+    if expected_revision is not None and hyp.current_revision != expected_revision:
+        raise HypothesisConflictError(
+            f"Hypothesis '{hypothesis_id}' revision conflict: expected revision {expected_revision}, "
+            f"but current revision is {hyp.current_revision}."
+        )
 
     if is_pinned is not None and hyp.is_pinned != is_pinned:
         event_type = "HYPOTHESIS_PINNED" if is_pinned else "HYPOTHESIS_UNPINNED"
@@ -141,6 +170,62 @@ def update_hypothesis_flags_service(
     )
     session.flush()
     return hyp
+
+
+def pin_hypothesis_service(
+    session: Session,
+    hypothesis_id: str,
+    expected_revision: Optional[int] = None,
+) -> HypothesisModel:
+    """Pin a hypothesis (display preference, does not alter scores)."""
+    return update_hypothesis_flags_service(
+        session=session,
+        hypothesis_id=hypothesis_id,
+        is_pinned=True,
+        expected_revision=expected_revision,
+    )
+
+
+def unpin_hypothesis_service(
+    session: Session,
+    hypothesis_id: str,
+    expected_revision: Optional[int] = None,
+) -> HypothesisModel:
+    """Unpin a hypothesis."""
+    return update_hypothesis_flags_service(
+        session=session,
+        hypothesis_id=hypothesis_id,
+        is_pinned=False,
+        expected_revision=expected_revision,
+    )
+
+
+def exclude_hypothesis_service(
+    session: Session,
+    hypothesis_id: str,
+    expected_revision: Optional[int] = None,
+) -> HypothesisModel:
+    """Exclude a hypothesis from active candidate selection without deleting history."""
+    return update_hypothesis_flags_service(
+        session=session,
+        hypothesis_id=hypothesis_id,
+        is_excluded=True,
+        expected_revision=expected_revision,
+    )
+
+
+def restore_hypothesis_service(
+    session: Session,
+    hypothesis_id: str,
+    expected_revision: Optional[int] = None,
+) -> HypothesisModel:
+    """Restore an excluded hypothesis to active candidate selection."""
+    return update_hypothesis_flags_service(
+        session=session,
+        hypothesis_id=hypothesis_id,
+        is_excluded=False,
+        expected_revision=expected_revision,
+    )
 
 
 def _execute_pipeline_for_revision(
@@ -263,6 +348,12 @@ def reevaluate_hypothesis_service(
     if not revisions:
         raise HypothesisValidationError(
             f"Hypothesis '{hypothesis_id}' has no revisions and cannot be re-evaluated."
+        )
+
+    if hyp.is_excluded:
+        raise HypothesisValidationError(
+            f"Cannot re-evaluate excluded hypothesis '{hypothesis_id}'. "
+            f"Restore it first before requesting re-evaluation."
         )
 
     latest_rev = revisions[-1]

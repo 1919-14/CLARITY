@@ -24,7 +24,9 @@ from flask import Blueprint, current_app, jsonify, request
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
 from ...services.hypothesis_service import (
+    HypothesisConflictError,
     HypothesisNotFoundError,
+    HypothesisValidationError,
     propose_hypothesis_service,
 )
 from ...services.run_service import (
@@ -487,6 +489,10 @@ def create_run_hypothesis(run_id: str):
             serialized = serialize_hypothesis(hyp, repo)
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
+    except HypothesisConflictError as exc:
+        return error_response(str(exc), 409)
+    except HypothesisValidationError as exc:
+        return error_response(str(exc), 422)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("create_run_hypothesis db error", exc)
         return error_response("An internal error occurred while creating the hypothesis.", 500)
