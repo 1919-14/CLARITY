@@ -80,6 +80,7 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
 - [Parallel evaluation on Nodus](docs/nodus-parallel.md)
 - [Researcher history & evaluation provenance](docs/researcher-history.md)
 - [Nodus remote readiness](docs/nodus-readiness.md)
+- [Research dashboard (React)](docs/research-dashboard.md)
 - [Development guide](docs/development.md)
 - [Decision record](docs/decisions.md)
 - [GitHub Issues](https://github.com/1919-14/CLARITY/issues)
@@ -100,12 +101,21 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    ```bash
    pip install -r backend/requirements.txt
    ```
-3. Run backend tests (from repository root):
+3. Create the local database schema (first setup, and after pulling new
+   migrations). This writes `backend/clarity_dev.db` regardless of the
+   directory you run it from:
+   ```bash
+   python -m alembic upgrade head
+   ```
+   Set `DATABASE_URL` to use MySQL or a different database instead. The app never
+   creates tables by itself; without this step every API read fails with
+   `no such table: runs`.
+4. Run backend tests (from repository root):
    ```bash
    python -m pytest backend/tests -q
    ```
    *(Or navigate into `backend` and run `python -m pytest -q`)*
-4. Start development server (from repository root):
+5. Start development server (from repository root):
    ```bash
    python backend/run.py
    ```
@@ -126,8 +136,9 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    cd frontend
    npm ci
    ```
-2. Run lint and production build:
+2. Run tests, lint and production build:
    ```bash
+   npm test
    npm run lint
    npm run build
    ```
@@ -135,8 +146,12 @@ Exact libraries, Nodus SDK capabilities, schema migration tooling, and deploymen
    ```bash
    npm run dev
    ```
-   Open `http://localhost:5173` in your browser.
+   Open `http://localhost:5173` in your browser. The API base URL is read from
+   `VITE_API_BASE_URL` (default `http://127.0.0.1:5000/api/v1`); copy
+   `frontend/.env.example` to `frontend/.env` to override it. The resolved URL is
+   printed in the page footer, and a full page map is in
+   [docs/research-dashboard.md](docs/research-dashboard.md).
 
 ## Development status
 
-The application skeleton and automated CI checks (Issue #3), the scientific data contracts and black-box oracle interface (Issue #4), bounded candidate hypothesis representation/generation (Issue #5), the fitting/evaluation pipeline (Issue #6), hypothesis ranking and evidence tracking (Issue #7), candidate experiment generation (Issue #9), the end-to-end discovery loop (Issue #8), disagreement-driven active experiment selection with a seeded random baseline (Issue #10), and an optional, provider-independent LLM Scientist with offline tests and a synthetic comparison (Issue #41) are in place. The Flask backend, React status interface, GitHub Actions CI workflow, domain contracts, deterministic local oracle, isolated benchmark evaluator, polynomial model family, prediction interface, seeded candidate generator, least-squares fitter, train/held-out evaluation pipeline, ranking/evidence engine, experiment generator, budgeted discovery orchestrator, and opt-in active experiment selector are established. The LLM Scientist is disabled by default: it proposes bounded, locally validated hypotheses from permitted evidence, while CLARITY retains fitting, evaluation, ranking, experiment selection, oracle access, budget, and stopping. Information-gain selection and stopping controls (Issue #11) and the Nodus Compute SDK integration (Issue #12) are in place. Issue #13 adds parallel candidate evaluation behind an explicit `local_sequential` / `nodus_parallel` mode on top of that adapter, with deterministic aggregation, bounded concurrency and retries, and explicit partial-failure handling. Issue #17 adds auditable researcher history: hypothesis edits append immutable revisions while preserving the previous definition (including the validated model family each revision was created under, which is what evaluation replays), every evaluation records the exact revision plus a content-addressed dataset-snapshot fingerprint and reconstructable manifest of the observations it used, researcher actions are recorded in Issue #15's append-only trail with actor, before/after state and reason, and `GET /api/v1/runs/<id>/history` exposes the run's chronological action history with cursor pagination. See [docs/researcher-history.md](docs/researcher-history.md). Issue #14 adds a validated per-run budget manager: database-atomic admission for oracle queries, candidate evaluations, hypotheses, and remote concurrency; runtime deadlines; structured exhaustion that preserves completed results; and an honest separation of application-side estimates from provider-enforced spending limits (no provider hard cap is claimed). See [docs/budget-manager.md](docs/budget-manager.md). Parallel remote execution and remote benchmarking are implemented and covered by offline tests, but **live Nodus execution is pending** (no credits/service access), so no remote task IDs, durations, costs, or speedups are claimed. See [docs/nodus-parallel.md](docs/nodus-parallel.md) and [docs/nodus-readiness.md](docs/nodus-readiness.md).
+The application skeleton and automated CI checks (Issue #3), the scientific data contracts and black-box oracle interface (Issue #4), bounded candidate hypothesis representation/generation (Issue #5), the fitting/evaluation pipeline (Issue #6), hypothesis ranking and evidence tracking (Issue #7), candidate experiment generation (Issue #9), the end-to-end discovery loop (Issue #8), disagreement-driven active experiment selection with a seeded random baseline (Issue #10), and an optional, provider-independent LLM Scientist with offline tests and a synthetic comparison (Issue #41) are in place. The Flask backend, React status interface, GitHub Actions CI workflow, domain contracts, deterministic local oracle, isolated benchmark evaluator, polynomial model family, prediction interface, seeded candidate generator, least-squares fitter, train/held-out evaluation pipeline, ranking/evidence engine, experiment generator, budgeted discovery orchestrator, and opt-in active experiment selector are established. The LLM Scientist is disabled by default: it proposes bounded, locally validated hypotheses from permitted evidence, while CLARITY retains fitting, evaluation, ranking, experiment selection, oracle access, budget, and stopping. Information-gain selection and stopping controls (Issue #11) and the Nodus Compute SDK integration (Issue #12) are in place. Issue #21 adds the React research dashboard: run configuration, a lifecycle ledger with bounded polling, budget accounting that marks missing values unavailable, and read-only hypothesis, report, and benchmark workflows, all covered by Vitest tests. See [docs/research-dashboard.md](docs/research-dashboard.md). Issue #13 adds parallel candidate evaluation behind an explicit `local_sequential` / `nodus_parallel` mode on top of that adapter, with deterministic aggregation, bounded concurrency and retries, and explicit partial-failure handling. Issue #17 adds auditable researcher history: hypothesis edits append immutable revisions while preserving the previous definition (including the validated model family each revision was created under, which is what evaluation replays), every evaluation records the exact revision plus a content-addressed dataset-snapshot fingerprint and reconstructable manifest of the observations it used, researcher actions are recorded in Issue #15's append-only trail with actor, before/after state and reason, and `GET /api/v1/runs/<id>/history` exposes the run's chronological action history with cursor pagination. See [docs/researcher-history.md](docs/researcher-history.md). Issue #14 adds a validated per-run budget manager: database-atomic admission for oracle queries, candidate evaluations, hypotheses, and remote concurrency; runtime deadlines; structured exhaustion that preserves completed results; and an honest separation of application-side estimates from provider-enforced spending limits (no provider hard cap is claimed). See [docs/budget-manager.md](docs/budget-manager.md). Parallel remote execution and remote benchmarking are implemented and covered by offline tests, but **live Nodus execution is pending** (no credits/service access), so no remote task IDs, durations, costs, or speedups are claimed. See [docs/nodus-parallel.md](docs/nodus-parallel.md) and [docs/nodus-readiness.md](docs/nodus-readiness.md).

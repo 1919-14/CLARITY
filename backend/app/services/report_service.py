@@ -257,7 +257,7 @@ def generate_report_service(
             complexity=selected_rev.complexity or 1,
             hypothesis_id=hyp.hypothesis_id,
             revision=selected_rev.revision_number,
-            status=HypothesisStatus.EVALUATED if selected_ev else HypothesisStatus.PROPOSED,
+            status=HypothesisStatus.EVALUATED if selected_ev else HypothesisStatus.CANDIDATE,
         )
         hypotheses.append(candidate_repr)
 

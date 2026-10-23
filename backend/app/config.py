@@ -1,4 +1,31 @@
 import os
+from pathlib import Path
+
+
+# SQLite resolves a relative database path against the process working
+# directory, so `python backend/run.py` (run from the repository root) and
+# `python run.py` (run from backend/) used to open two different databases.
+# Anchor the development default to the backend package directory so both
+# invocations share one schema. Deployments should still set DATABASE_URL.
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DATABASE_URL = f"sqlite:///{(BACKEND_DIR / 'clarity_dev.db').as_posix()}"
+
+
+def normalize_database_url(url: str) -> str:
+    """Anchor a relative SQLite file URL to the backend directory.
+
+    `backend/.env` and `backend/.env.example` use `sqlite:///clarity_dev.db`.
+    SQLite would interpret that against the process working directory, which
+    made running from the repository root open a different, empty database.
+    In-memory databases and absolute paths are returned unchanged.
+    """
+    prefix = "sqlite:///"
+    if not url or not url.startswith(prefix) or url.startswith(prefix + "/"):
+        return url
+    path = url[len(prefix):]
+    if path in ("", ":memory:") or Path(path).is_absolute():
+        return url
+    return f"{prefix}{(BACKEND_DIR / path).as_posix()}"
 
 
 class Config:
@@ -17,8 +44,8 @@ class Config:
 
 
     # Database configuration
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:///clarity_dev.db"
+    SQLALCHEMY_DATABASE_URI = normalize_database_url(
+        os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
@@ -46,8 +73,8 @@ class DevelopmentConfig(Config):
     SECRET_KEY = os.environ.get(
         "SECRET_KEY", "dev-clarity-secret-key-change-in-production"
     )
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:///clarity_dev.db"
+    SQLALCHEMY_DATABASE_URI = normalize_database_url(
+        os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
     )
 
 

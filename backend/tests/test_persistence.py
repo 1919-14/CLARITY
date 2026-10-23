@@ -15,6 +15,7 @@ import os
 import pytest
 from sqlalchemy.exc import IntegrityError
 from app.adapters.persistence.database import DatabaseManager, get_db_manager, reset_db_manager
+from app.config import DEFAULT_DATABASE_URL
 from app.adapters.persistence.models import (
     Base,
     RunModel,
@@ -637,10 +638,10 @@ def test_get_db_manager_rebinds_when_resolved_uri_differs(monkeypatch):
         assert mgr2.database_uri == env_uri
         assert mgr2 is not mgr1
 
-        # 3. Clear environment and verify fallback to default development URI
+        # 3. Clear environment and verify fallback to the backend-anchored default URI
         monkeypatch.delenv("DATABASE_URL", raising=False)
         mgr3 = get_db_manager()
-        assert mgr3.database_uri == "sqlite:///clarity_dev.db"
+        assert mgr3.database_uri == DEFAULT_DATABASE_URL
         assert mgr3 is not mgr2
     finally:
         reset_db_manager()

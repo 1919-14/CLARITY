@@ -1,0 +1,80 @@
+/**
+ * Academia / Classical design tokens.
+ *
+ * All colour, type, spacing, radius and motion decisions live here so the
+ * components stay consistent. Warm tones only; no pure black or pure white.
+ */
+:root {
+  color-scheme: dark;
+
+  /* Library at night */
+  --color-bg: #1c1714;
+  --color-bg-alt: #251e19;
+  --color-bg-deep: #15110f;
+  --color-fg: #e8dfd4;
+  --color-fg-soft: #d6c9ba;
+  --color-muted: #3d332b;
+  --color-muted-fg: #9c8b7a;
+  --color-border: #4a3f35;
+  --color-border-strong: #5d5044;
+
+  /* Polished brass + library crimson */
+  --color-accent: #c9a962;
+  --color-accent-strong: #d4b872;
+  --color-accent-deep: #b8953f;
+  --color-accent-fg: #1c1714;
+  --color-crimson: #8b2635;
+  --color-crimson-strong: #a5303f;
+  --color-success: #a8b892;
+  --color-warning: #d9a65e;
+  --color-danger: #d98b8b;
+  --color-danger-soft: #e7b4b8;
+
+  /* Typography */
+  --font-heading: 'Cormorant Garamond', 'Iowan Old Style', Georgia, serif;
+  --font-body: 'Crimson Pro', Georgia, 'Times New Roman', serif;
+  --font-display: 'Cinzel', 'Trajan Pro', 'Times New Roman', serif;
+
+  /* Geometry */
+  --radius: 4px;
+  --radius-arch: 40% 40% 0 0 / 20% 20% 0 0;
+  --border-hairline: 1px solid var(--color-border);
+
+  /* Spacing rhythm (8px) */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+  --space-9: 6rem;
+
+  /* Elevation */
+  --shadow-card-hover: 0 8px 24px rgba(0, 0, 0, 0.3);
+  --shadow-dialog: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --brass-gradient: linear-gradient(180deg, #d4b872 0%, #c9a962 50%, #b8953f 100%);
+  --engraved-text: 1px 1px 1px rgba(0, 0, 0, 0.4), -1px -1px 1px rgba(255, 255, 255, 0.1);
+
+  /* Motion — dignified, never bouncy */
+  --duration-fast: 150ms;
+  --duration-base: 300ms;
+  --duration-slow: 500ms;
+  --duration-dramatic: 700ms;
+  --ease: ease-out;
+
+  /* Layout */
+  --page-max: 1280px;
+  --page-narrow: 896px;
+  --header-height: 82px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0.01ms;
+    --duration-base: 0.01ms;
+    --duration-slow: 0.01ms;
+    --duration-dramatic: 0.01ms;
+  }
+}

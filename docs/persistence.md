@@ -126,13 +126,18 @@ See [budget-manager.md](budget-manager.md) for accounting and recovery semantics
 ### Configuration via Environment Variables:
 - **`DATABASE_URL`:**
   - Production: Required valid database URL (e.g. `mysql+pymysql://<user>:<password>@<host>:3306/<dbname>`). Silent fallback to SQLite is strictly forbidden in production.
-  - Local Development Fallback: `sqlite:///clarity_dev.db`
+  - Local Development Fallback: SQLite at `backend/clarity_dev.db`. Relative SQLite file URLs (including `sqlite:///clarity_dev.db` from `backend/.env`) are anchored to the backend package directory, so the server opens the same file whether it is started from the repository root or from `backend/`
   - Automated Unit Tests: `sqlite:///:memory:` (with SQLite foreign key enforcement enabled via `PRAGMA foreign_keys=ON`)
 
 ### Migration Commands (Alembic):
+
+The application does not create tables at startup. Run these from the
+repository root (or set `DATABASE_URL`); without an explicit URL, Alembic uses
+the same backend-anchored SQLite default as the application.
+
 ```bash
 # Run pending migrations to head
-alembic upgrade head
+python -m alembic upgrade head
 
 # Revert last migration
 alembic downgrade -1

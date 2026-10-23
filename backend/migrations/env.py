@@ -23,11 +23,23 @@ if backend_path not in sys.path:
 
 from app.adapters.persistence.database import Base
 from app.adapters.persistence.models import *  # Ensure all models are registered
+from app.config import DEFAULT_DATABASE_URL, normalize_database_url
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url with environment variable if present
+# Use DATABASE_URL when set, otherwise the same backend-anchored SQLite default
+# as the application, so migrations and the running app never disagree about
+# which file the schema lives in.
+# Respect an explicit URL supplied by the caller (for example tests or
+# `alembic -x`). DATABASE_URL wins; the stock alembic.ini placeholder resolves to
+# the same backend-anchored default as the application.
+configured_url = config.get_main_option("sqlalchemy.url")
 env_db_url = os.environ.get("DATABASE_URL")
+if env_db_url:
+    env_db_url = normalize_database_url(env_db_url)
+elif configured_url in (None, "", "sqlite:///clarity_dev.db"):
+    env_db_url = DEFAULT_DATABASE_URL
+
 if env_db_url:
     # Escape % for ConfigParser interpolation (e.g. URL-encoded passwords containing %40)
     config.set_main_option("sqlalchemy.url", env_db_url.replace("%", "%%"))

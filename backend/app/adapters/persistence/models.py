@@ -14,8 +14,9 @@ Persists:
 - Reports (top candidate rankings, summary artifact references)
 """
 
+import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from sqlalchemy import (
     Column,
@@ -39,6 +40,29 @@ from ...domain.history_contracts import AppendOnlyViolationError
 def utc_now() -> datetime:
     """Return timezone-aware current UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+_audit_timestamp_lock = threading.Lock()
+_last_audit_timestamp: Optional[datetime] = None
+
+
+def monotonic_utc_now() -> datetime:
+    """Return a UTC timestamp that strictly increases for audit-event inserts.
+
+    Windows and some SQLite builds report the same microsecond for events
+    created back-to-back (for example exclude then restore). The audit trail is
+    ordered by ``(timestamp, event_id)`` and event IDs are random UUIDs, so an
+    equal timestamp would let an older action sort after a newer one. Bumping
+    the stored timestamp by one microsecond keeps the documented chronological
+    order without changing the schema.
+    """
+    global _last_audit_timestamp
+    with _audit_timestamp_lock:
+        now = datetime.now(timezone.utc)
+        if _last_audit_timestamp is not None and now <= _last_audit_timestamp:
+            now = _last_audit_timestamp + timedelta(microseconds=1)
+        _last_audit_timestamp = now
+        return now
 
 
 def generate_version_token() -> str:
@@ -263,7 +287,10 @@ class EvaluationResultModel(Base):
     metrics = Column(JSON, nullable=False)  # {"mae": 0.045, "rmse": 0.052, ...}
     held_out_metrics = Column(JSON, nullable=True)  # {"mae": 0.082, "rmse": 0.091, ...}
     error_message = Column(Text, nullable=True)
-    evaluated_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    # Evaluations are ordered chronologically (evaluated_at, evaluation_id).
+    # Two evaluations admitted within one clock tick would otherwise tie and
+    # fall back to a random ID, making "the earlier evaluation" ambiguous.
+    evaluated_at = Column(DateTime(timezone=True), default=monotonic_utc_now, nullable=False)
 
     revision = relationship("HypothesisRevisionModel", back_populates="evaluations")
 
@@ -439,7 +466,7 @@ class AuditEventModel(Base):
     event_type = Column(String(64), nullable=False)  # RUN_STARTED, HYPOTHESIS_PINNED, HYPOTHESIS_EXCLUDED, etc.
     actor = Column(String(64), nullable=False, default="researcher")  # researcher, automated_agent, system, worker
     metadata_json = Column(JSON, nullable=True)
-    timestamp = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    timestamp = Column(DateTime(timezone=True), default=monotonic_utc_now, nullable=False)
 
     # Researcher history provenance (Issue #17)
     hypothesis_id = Column(String(64), nullable=True)

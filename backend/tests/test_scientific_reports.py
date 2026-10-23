@@ -292,6 +292,46 @@ class TestScientificReportGeneration:
         # Cannot plan next resolving experiment with only 1 candidate
         assert report.next_experiment.recommended is False
 
+    def test_unevaluated_hypothesis_generates_report_without_fabricated_status(self, db_session):
+        """A recorded but unevaluated hypothesis must not break report generation.
+
+        Regression: report assembly referenced a non-existent status enum member
+        for candidates without an evaluation, so any run holding an unevaluated
+        candidate failed with AttributeError and no report could be produced.
+        """
+        run = RunModel(
+            run_id="run-unevaluated-01",
+            name="Unevaluated Run",
+            domain="1d_polynomial",
+            status="completed",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+        )
+        db_session.add(run)
+        h1 = HypothesisModel(
+            hypothesis_id="hyp-unevaluated-1",
+            run_id=run.run_id,
+            model_family="polynomial",
+            current_revision=1,
+        )
+        db_session.add(h1)
+        r1 = HypothesisRevisionModel(
+            revision_id="rev-unevaluated-1",
+            hypothesis_id=h1.hypothesis_id,
+            revision_number=1,
+            formula="y = 1.0*x + 2.0",
+            parameters={"coefficients": [2.0, 1.0], "degree": 1},
+            complexity=2,
+        )
+        db_session.add(r1)
+        db_session.flush()
+
+        report_model, report = generate_report_service(db_session, run.run_id)
+
+        assert report_model.status == "generated"
+        assert report.run_summary.run_id == run.run_id
+        assert all(hypothesis.status != "evaluated" for hypothesis in report.ranked_hypotheses)
+
     def test_missing_metrics_remain_explicitly_unavailable(self, db_session):
         """Missing metrics remain null / unavailable and are never converted to zero."""
         run = RunModel(

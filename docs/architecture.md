@@ -44,6 +44,12 @@ The diagram is conceptual. Modules may be grouped differently, but the responsib
 
 The frontend is not authoritative for budgets or scientific scores. Server-side validation and enforcement are required.
 
+Current implementation as of Issue #21: run configuration, the lifecycle ledger
+with bounded polling and budget accounting, and read-only hypothesis, report,
+and benchmark views. Researcher actions (add, pin/unpin, exclude/restore,
+re-evaluate) remain API-only for now. See
+[research-dashboard.md](research-dashboard.md).
+
 ### Flask API and services
 - Validate requests and return consistent errors.
 - Expose health, run, hypothesis, observation, report, and metric resources.
