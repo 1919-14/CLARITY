@@ -1,19 +1,18 @@
 /**
  * Scope 6 - UI Resilience Tests
  *
- * Tests for frontend utility logic and fetch error-handling contracts using
- * Node.js built-in `node:test` and `node:assert`. Covers:
+ * Tests for frontend utility logic and fetch error-handling contracts.
+ * Converted from node:test to Vitest to work with the unified test runner.
+ * Covers:
  *  - formatCost / formatLimit / formatSeconds edge cases (null, undefined, 0, extreme values)
  *  - fetch response handling for non-200 statuses (404, 409, 500, 502, 504)
  *  - Network disconnection (TypeError from fetch) triggers error state
  *  - JSON parse failure on non-JSON response body
- *  - Empty/loading/partial state rendering invariants
  *  - Input boundary validation (empty run_id, whitespace run_id)
  *  - Large dataset label rendering doesn't throw
  */
 
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
+import { describe, it, expect } from 'vitest';
 import { formatCost, formatSeconds, formatLimit, loadBudget } from './budgetUtils.js';
 
 // ============================================================================
@@ -22,55 +21,55 @@ import { formatCost, formatSeconds, formatLimit, loadBudget } from './budgetUtil
 
 describe('formatCost', () => {
   it('returns Unavailable for null', () => {
-    assert.equal(formatCost(null), 'Unavailable');
+    expect(formatCost(null)).toBe('Unavailable');
   });
 
   it('returns Unavailable for undefined', () => {
-    assert.equal(formatCost(undefined), 'Unavailable');
+    expect(formatCost(undefined)).toBe('Unavailable');
   });
 
   it('formats zero as $0.0000', () => {
-    assert.equal(formatCost(0), '$0.0000');
+    expect(formatCost(0)).toBe('$0.0000');
   });
 
   it('formats a typical cost value', () => {
-    assert.equal(formatCost(1.5), '$1.5000');
+    expect(formatCost(1.5)).toBe('$1.5000');
   });
 
   it('formats a very small fractional cost', () => {
-    assert.equal(formatCost(0.000001), '$0.0000');
+    expect(formatCost(0.000001)).toBe('$0.0000');
   });
 
   it('handles a large cost value without throwing', () => {
     const result = formatCost(999999.99);
-    assert.ok(result.startsWith('$'), `Expected dollar sign prefix, got: ${result}`);
+    expect(result.startsWith('$')).toBe(true);
   });
 });
 
 // ============================================================================
-// 2. formatSeconds — null/undefined/negative/extreme
+// 2. formatSeconds — null/undefined/zero/extreme
 // ============================================================================
 
 describe('formatSeconds', () => {
   it('returns Not measurable for null', () => {
-    assert.equal(formatSeconds(null), 'Not measurable');
+    expect(formatSeconds(null)).toBe('Not measurable');
   });
 
   it('returns Not measurable for undefined', () => {
-    assert.equal(formatSeconds(undefined), 'Not measurable');
+    expect(formatSeconds(undefined)).toBe('Not measurable');
   });
 
   it('formats zero as 0 s', () => {
-    assert.equal(formatSeconds(0), '0 s');
+    expect(formatSeconds(0)).toBe('0 s');
   });
 
   it('rounds fractional seconds', () => {
-    assert.equal(formatSeconds(3.7), '4 s');
+    expect(formatSeconds(3.7)).toBe('4 s');
   });
 
   it('handles very large runtime without throwing', () => {
     const result = formatSeconds(9999999);
-    assert.ok(result.endsWith(' s'), `Expected seconds suffix, got: ${result}`);
+    expect(result.endsWith(' s')).toBe(true);
   });
 });
 
@@ -80,27 +79,27 @@ describe('formatSeconds', () => {
 
 describe('formatLimit', () => {
   it('returns Unavailable for null entry', () => {
-    assert.equal(formatLimit(null), 'Unavailable');
+    expect(formatLimit(null)).toBe('Unavailable');
   });
 
   it('returns Unavailable for undefined entry', () => {
-    assert.equal(formatLimit(undefined), 'Unavailable');
+    expect(formatLimit(undefined)).toBe('Unavailable');
   });
 
   it('shows "no limit" when limit is null', () => {
-    assert.equal(formatLimit({ used: 5, limit: null }), '5 used · no limit');
+    expect(formatLimit({ used: 5, limit: null })).toBe('5 used · no limit');
   });
 
   it('shows "no limit" when limit is undefined', () => {
-    assert.equal(formatLimit({ used: 3, limit: undefined }), '3 used · no limit');
+    expect(formatLimit({ used: 3, limit: undefined })).toBe('3 used · no limit');
   });
 
   it('shows used/limit when both present', () => {
-    assert.equal(formatLimit({ used: 7, limit: 20 }), '7 / 20');
+    expect(formatLimit({ used: 7, limit: 20 })).toBe('7 / 20');
   });
 
   it('handles zero used correctly', () => {
-    assert.equal(formatLimit({ used: 0, limit: 10 }), '0 / 10');
+    expect(formatLimit({ used: 0, limit: 10 })).toBe('0 / 10');
   });
 });
 
@@ -112,16 +111,16 @@ describe('loadBudget fetch error handling', () => {
   it('returns error state for empty run_id without calling fetch', async () => {
     let fetchCalled = false;
     const result = await loadBudget('', async () => { fetchCalled = true; });
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.length > 0, 'Error message must be non-empty');
-    assert.equal(fetchCalled, false, 'fetch must not be called for empty run_id');
+    expect(result.state).toBe('error');
+    expect(result.error.length).toBeGreaterThan(0);
+    expect(fetchCalled).toBe(false);
   });
 
   it('returns error state for whitespace-only run_id', async () => {
     let fetchCalled = false;
     const result = await loadBudget('   ', async () => { fetchCalled = true; });
-    assert.equal(result.state, 'error');
-    assert.equal(fetchCalled, false);
+    expect(result.state).toBe('error');
+    expect(fetchCalled).toBe(false);
   });
 
   it('returns error state on 404 with message from response body', async () => {
@@ -132,8 +131,8 @@ describe('loadBudget fetch error handling', () => {
       json: async () => ({ message: 'Run not found.', status_code: 404 }),
     });
     const result = await loadBudget('run-phantom', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.includes('Run not found.'), `Expected run not found error, got: ${result.error}`);
+    expect(result.state).toBe('error');
+    expect(result.error).toContain('Run not found.');
   });
 
   it('returns error state on 409 Conflict', async () => {
@@ -144,8 +143,8 @@ describe('loadBudget fetch error handling', () => {
       json: async () => ({ message: 'Run is in a terminal state.', status_code: 409 }),
     });
     const result = await loadBudget('run-terminated', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.length > 0);
+    expect(result.state).toBe('error');
+    expect(result.error.length).toBeGreaterThan(0);
   });
 
   it('returns error state on 500 Internal Server Error', async () => {
@@ -156,8 +155,8 @@ describe('loadBudget fetch error handling', () => {
       json: async () => ({ message: 'An unexpected server error occurred.', status_code: 500 }),
     });
     const result = await loadBudget('run-broken', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.length > 0);
+    expect(result.state).toBe('error');
+    expect(result.error.length).toBeGreaterThan(0);
   });
 
   it('returns error state on 502 Bad Gateway (upstream Nodus failure)', async () => {
@@ -168,8 +167,8 @@ describe('loadBudget fetch error handling', () => {
       json: async () => null,
     });
     const result = await loadBudget('run-upstream-fail', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.includes('502') || result.error.length > 0);
+    expect(result.state).toBe('error');
+    expect(result.error.length).toBeGreaterThan(0);
   });
 
   it('returns error state on 504 Gateway Timeout', async () => {
@@ -180,7 +179,7 @@ describe('loadBudget fetch error handling', () => {
       json: async () => null,
     });
     const result = await loadBudget('run-timeout', mockFetch);
-    assert.equal(result.state, 'error');
+    expect(result.state).toBe('error');
   });
 
   it('returns error state when network disconnects (TypeError from fetch)', async () => {
@@ -188,8 +187,8 @@ describe('loadBudget fetch error handling', () => {
       throw new TypeError('Failed to fetch');
     };
     const result = await loadBudget('run-network-drop', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.includes('Failed to fetch'), `Expected network error, got: ${result.error}`);
+    expect(result.state).toBe('error');
+    expect(result.error).toContain('Failed to fetch');
   });
 
   it('returns error state when response.json() throws (non-JSON body)', async () => {
@@ -200,8 +199,7 @@ describe('loadBudget fetch error handling', () => {
       json: async () => { throw new SyntaxError('Unexpected token < in JSON'); },
     });
     const result = await loadBudget('run-bad-json', mockFetch);
-    // json() throws → json = null → .budget missing → 'Unexpected budget response' error
-    assert.equal(result.state, 'error');
+    expect(result.state).toBe('error');
   });
 
   it('returns error state when successful response has no budget field', async () => {
@@ -209,11 +207,11 @@ describe('loadBudget fetch error handling', () => {
       ok: true,
       status: 200,
       statusText: 'OK',
-      json: async () => ({ run_id: 'run-1' }),  // Missing 'budget' key
+      json: async () => ({ run_id: 'run-1' }),
     });
     const result = await loadBudget('run-partial', mockFetch);
-    assert.equal(result.state, 'error');
-    assert.ok(result.error.includes('Unexpected budget response'), `Got: ${result.error}`);
+    expect(result.state).toBe('error');
+    expect(result.error).toContain('Unexpected budget response');
   });
 
   it('returns loaded state with budget data on success', async () => {
@@ -228,9 +226,9 @@ describe('loadBudget fetch error handling', () => {
       json: async () => ({ budget: fakeBudget }),
     });
     const result = await loadBudget('run-healthy', mockFetch);
-    assert.equal(result.state, 'loaded');
-    assert.deepEqual(result.budget, fakeBudget);
-    assert.equal(result.error, null);
+    expect(result.state).toBe('loaded');
+    expect(result.budget).toEqual(fakeBudget);
+    expect(result.error).toBeNull();
   });
 });
 
@@ -242,7 +240,7 @@ describe('Large dataset rendering safety', () => {
   it('formatLimit handles 10000 items per second without throwing', () => {
     for (let i = 0; i < 10000; i++) {
       const result = formatLimit({ used: i, limit: 10000 });
-      assert.ok(typeof result === 'string', 'formatLimit must always return a string');
+      expect(typeof result).toBe('string');
     }
   });
 
@@ -251,7 +249,7 @@ describe('Large dataset rendering safety', () => {
     for (let i = 0; i < 10000; i++) {
       const val = values[i % values.length];
       const result = formatCost(val);
-      assert.ok(typeof result === 'string', 'formatCost must always return a string');
+      expect(typeof result).toBe('string');
     }
   });
 });

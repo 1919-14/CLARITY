@@ -10,6 +10,8 @@ from typing import Generator
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, Session
 
+from ...config import DEFAULT_DATABASE_URL
+
 # Declarative Base for all persistent models
 Base = declarative_base()
 
@@ -129,7 +131,7 @@ def get_db_manager(database_uri: str = None) -> DatabaseManager:
                 "DATABASE_URL must be explicitly configured in production environment. "
                 "Silent fallback to SQLite is prohibited in production."
             )
-        resolved_uri = "sqlite:///clarity_dev.db"
+        resolved_uri = DEFAULT_DATABASE_URL
 
     if env == "production" and resolved_uri.startswith("sqlite"):
         raise ValueError(

@@ -1,0 +1,235 @@
+/* --------------------------------------------------------------------------
+   Shell
+   -------------------------------------------------------------------------- */
+.site-header {
+  border-bottom: var(--border-hairline);
+  background: rgba(28, 23, 20, 0.94);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+}
+
+.site-header__inner {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-6);
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  min-height: var(--header-height);
+}
+
+.wordmark {
+  display: grid;
+  gap: 0.2rem;
+  color: var(--color-fg);
+  flex-shrink: 0;
+}
+
+.wordmark:hover {
+  color: var(--color-fg);
+  text-decoration: none;
+}
+
+.wordmark__name {
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  letter-spacing: 0.34em;
+  line-height: 1;
+}
+
+.wordmark__rule {
+  height: 1px;
+  width: 100%;
+  background: linear-gradient(90deg, var(--color-accent), transparent);
+}
+
+.wordmark__tagline {
+  font-family: var(--font-display);
+  font-size: 0.52rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-muted-fg);
+}
+
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  margin-left: auto;
+}
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  font-family: var(--font-display);
+  font-size: 0.66rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-muted-fg);
+  border-bottom: 2px solid transparent;
+  transition: color var(--duration-base) var(--ease),
+    border-color var(--duration-base) var(--ease);
+}
+
+.nav-link svg {
+  color: currentColor;
+}
+
+.nav-link:hover {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.nav-link.is-active {
+  color: var(--color-accent);
+  border-bottom-color: var(--color-accent);
+}
+
+.site-header__action {
+  flex-shrink: 0;
+}
+
+.page {
+  flex: 1;
+  width: 100%;
+}
+
+.page-inner {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: var(--space-7) var(--space-6) var(--space-9);
+}
+
+.page-inner--narrow {
+  max-width: var(--page-narrow);
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-6);
+  flex-wrap: wrap;
+}
+
+.page-header__text {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 62ch;
+}
+
+.page-title {
+  font-size: clamp(2.4rem, 5vw, 4rem);
+  line-height: 1.03;
+  letter-spacing: -0.015em;
+}
+
+.page-header__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.site-footer {
+  border-top: var(--border-hairline);
+  background: rgba(37, 30, 25, 0.6);
+}
+
+.site-footer__inner {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.site-footer__motto {
+  font-style: italic;
+  color: var(--color-muted-fg);
+  font-size: 0.95rem;
+}
+
+.site-footer__meta {
+  font-family: var(--font-display);
+  font-size: 0.6rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--color-muted-fg);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.site-footer__meta code {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* --------------------------------------------------------------------------
+   Responsive navigation
+   -------------------------------------------------------------------------- */
+@media (max-width: 1080px) {
+  .site-header__inner {
+    flex-wrap: wrap;
+    gap: var(--space-3) var(--space-5);
+    padding: var(--space-4);
+    min-height: auto;
+  }
+
+  .site-nav {
+    order: 3;
+    width: 100%;
+    margin-left: 0;
+    gap: var(--space-4);
+    overflow-x: auto;
+  }
+
+  .site-header__action {
+    margin-left: auto;
+  }
+
+  .page-inner {
+    padding: var(--space-6) var(--space-4) var(--space-8);
+  }
+}
+
+@media (max-width: 560px) {
+  .nav-link {
+    font-size: 0.6rem;
+    letter-spacing: 0.12em;
+  }
+
+  .wordmark__tagline {
+    display: none;
+  }
+
+  .page-title {
+    font-size: clamp(2rem, 9vw, 2.6rem);
+  }
+
+  .page-header {
+    align-items: flex-start;
+  }
+
+  .page-header__actions {
+    width: 100%;
+  }
+
+  .page-header__actions .button {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .site-footer__inner {
+    padding: var(--space-4);
+  }
+}

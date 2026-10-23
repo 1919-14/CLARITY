@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from ..adapters.persistence.models import AuditEventModel
+from ..adapters.persistence.models import AuditEventModel, monotonic_utc_now
 from ..adapters.persistence.repository import ClarityRepository
 from ..domain.history_contracts import AUDIT_AUDIT_EVENT_CORRECTED
 from ..domain.sanitization import sanitize_metadata, sanitize_reason_text
@@ -63,7 +63,7 @@ def record_audit_event_service(
     sanitized_before = sanitize_metadata(dict(before)) if before is not None else None
     sanitized_after = sanitize_metadata(dict(after)) if after is not None else None
     sanitized_reason = sanitize_reason_text(reason)
-    event_time = timestamp or datetime.now(timezone.utc)
+    event_time = timestamp or monotonic_utc_now()
 
     existing = repo.get_audit_event(eid)
     if existing:

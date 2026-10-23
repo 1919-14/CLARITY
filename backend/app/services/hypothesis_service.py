@@ -17,6 +17,7 @@ from ..adapters.persistence.models import (
     HypothesisModel,
     HypothesisRevisionModel,
     ObservationModel,
+    monotonic_utc_now,
 )
 from ..adapters.persistence.repository import ClarityRepository
 from ..domain.budget_contracts import BudgetAdmissionDenied, BudgetReservationReplay
@@ -758,7 +759,9 @@ def _execute_pipeline_for_revision(
     eval_model.metrics = result.metrics or {}
     eval_model.held_out_metrics = result.held_out_metrics
     eval_model.error_message = error_msg
-    eval_model.evaluated_at = datetime.now(timezone.utc)
+    # Evaluation history is ordered by (evaluated_at, evaluation_id); use the
+    # strictly increasing clock so two back-to-back evaluations cannot tie.
+    eval_model.evaluated_at = monotonic_utc_now()
 
     repo.record_audit_event(
         AuditEventModel(
