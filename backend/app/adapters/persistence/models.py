@@ -14,6 +14,7 @@ Persists:
 - Reports (top candidate rankings, summary artifact references)
 """
 
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from sqlalchemy import (
@@ -36,6 +37,12 @@ from .database import Base
 def utc_now() -> datetime:
     """Return timezone-aware current UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+def generate_version_token() -> str:
+    """Generate a unique version token for optimistic locking."""
+    return f"vt-{uuid.uuid4().hex[:12]}"
+
 
 
 class RunModel(Base):
@@ -100,10 +107,13 @@ class HypothesisModel(Base):
     run_id = Column(String(64), ForeignKey("runs.run_id", ondelete="RESTRICT"), nullable=False)
     model_family = Column(String(64), nullable=False)
     current_revision = Column(Integer, nullable=False, default=1)
+    version = Column(Integer, nullable=False, default=1)
+    version_token = Column(String(64), nullable=False, default=generate_version_token)
     
     # Scientific & Researcher UI flags
     is_pinned = Column(Boolean, nullable=False, default=False)
     is_excluded = Column(Boolean, nullable=False, default=False)
+
     
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)

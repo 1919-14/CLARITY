@@ -16,6 +16,7 @@ from flask import Blueprint, current_app, jsonify, request
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
 from ...services.hypothesis_service import (
+    HypothesisConflictError,
     HypothesisNotFoundError,
     HypothesisValidationError,
     reevaluate_hypothesis_service,
@@ -88,6 +89,22 @@ def update_hypothesis(hypothesis_id: str):
     if has_exclude and not isinstance(is_excluded, bool):
         return error_response("Field 'is_excluded' must be a boolean.", 400)
 
+    expected_revision = data.get("expected_revision")
+    if expected_revision is not None:
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            return error_response("Field 'expected_revision' must be an integer >= 1.", 400)
+
+    expected_version = data.get("expected_version")
+    if expected_version is not None:
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            return error_response("Field 'expected_version' must be an integer >= 1.", 400)
+
+    expected_version_token = data.get("expected_version_token")
+    if expected_version_token is not None:
+        if not isinstance(expected_version_token, str) or not expected_version_token.strip():
+            return error_response("Field 'expected_version_token' must be a non-empty string.", 400)
+        expected_version_token = expected_version_token.strip()
+
     db = _get_db()
     try:
         with db.session_scope() as session:
@@ -96,11 +113,19 @@ def update_hypothesis(hypothesis_id: str):
                 hypothesis_id=hypothesis_id,
                 is_pinned=is_pinned if has_pin else None,
                 is_excluded=is_excluded if has_exclude else None,
+                expected_revision=expected_revision,
+                expected_version=expected_version,
+                expected_version_token=expected_version_token,
             )
             repo = ClarityRepository(session)
             serialized = serialize_hypothesis(hyp, repo, include_revisions=True)
+
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
+    except HypothesisConflictError as exc:
+        return error_response(str(exc), 409)
+    except HypothesisValidationError as exc:
+        return error_response(str(exc), 422)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("update_hypothesis db error", exc)
         return error_response("An internal error occurred while updating the hypothesis.", 500)

@@ -46,7 +46,9 @@ from ...services.budget_service import (
 from ...services.hypothesis_service import (
     HypothesisAlreadyAdmittedError,
     HypothesisBudgetExhaustedError,
+    HypothesisConflictError,
     HypothesisNotFoundError,
+    HypothesisValidationError,
     propose_hypothesis_service,
 )
 from ...services.audit_service import (
@@ -802,6 +804,10 @@ def create_run_hypothesis(run_id: str):
         )
     except HypothesisNotFoundError as exc:
         return error_response(str(exc), 404)
+    except HypothesisConflictError as exc:
+        return error_response(str(exc), 409)
+    except HypothesisValidationError as exc:
+        return error_response(str(exc), 422)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("create_run_hypothesis db error", exc)
         return error_response("An internal error occurred while creating the hypothesis.", 500)

@@ -20,13 +20,17 @@ def _create_run(client, name="Hyp Test Run"):
     return res.get_json()["run"]
 
 
-def _create_hypothesis(client, run_id, formula="y = a*x + b", model_family="linear"):
-    res = client.post(f"/api/v1/runs/{run_id}/hypotheses", json={
+def _create_hypothesis(client, run_id, formula="y = a*x + b", model_family="linear", parameters=None):
+    payload = {
         "model_family": model_family,
         "formula": formula,
-        "parameters": {"a": 1.0, "b": 0.0},
         "complexity": 1,
-    })
+    }
+    if parameters is not None:
+        payload["parameters"] = parameters
+    elif "a" in formula or "b" in formula:
+        payload["parameters"] = {"a": 1.0, "b": 0.0}
+    res = client.post(f"/api/v1/runs/{run_id}/hypotheses", json=payload)
     assert res.status_code == 201, res.get_data(as_text=True)
     return res.get_json()["hypothesis"]
 
