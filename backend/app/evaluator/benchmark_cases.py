@@ -130,6 +130,11 @@ class BenchmarkCaseDefinition:
     noise_std: float = 0.0
     held_out_inputs: Tuple[Dict[str, float], ...] = ()
     initial_inputs: Tuple[Dict[str, float], ...] = ({"x": 0.0},)
+    # Public declared search-space capability for the discovery engine.
+    # Set this to the maximum polynomial degree the runner should search over.
+    # This is a capability declaration, NOT a hint about the hidden target degree —
+    # it must be determined independently of ground_truth.target_parameters.
+    max_hypothesis_degree: int = 3
 
     @property
     def id(self) -> str:
@@ -185,6 +190,7 @@ class BenchmarkCaseDefinition:
             "max_query_budget": self.max_query_budget,
             "success_threshold": self.success_threshold,
             "noise_std": self.noise_std,
+            "max_hypothesis_degree": self.max_hypothesis_degree,
             "initial_inputs": [dict(inp) for inp in self.initial_inputs],
             "held_out_sample_count": len(self.held_out_inputs) if self.held_out_inputs else 8,
         }
@@ -200,6 +206,7 @@ CONSTANT_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=8,
     success_threshold=0.05,
     noise_std=0.0,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-4.0, -2.5, -1.0, 1.0, 2.5, 4.0]),
     initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
@@ -221,6 +228,7 @@ LINEAR_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=8,
     success_threshold=0.05,
     noise_std=0.0,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-4.5, -3.0, -1.5, 1.5, 3.0, 4.5]),
     initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
@@ -242,6 +250,7 @@ QUADRATIC_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=10,
     success_threshold=0.05,
     noise_std=0.0,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-3.5, -2.2, -1.1, 1.1, 2.2, 3.5]),
     initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
@@ -263,6 +272,7 @@ CUBIC_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=12,
     success_threshold=0.1,
     noise_std=0.0,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-2.7, -2.0, -1.2, 1.2, 2.0, 2.7]),
     initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
@@ -284,6 +294,7 @@ NOISY_POLYNOMIAL_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=10,
     success_threshold=0.25,
     noise_std=0.15,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-4.0, -2.0, 1.0, 3.0]),
     initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
@@ -305,6 +316,7 @@ BOUNDARY_EDGE_CASES_BENCHMARK = BenchmarkCaseDefinition(
     max_query_budget=10,
     success_threshold=0.08,
     noise_std=0.0,
+    max_hypothesis_degree=3,
     held_out_inputs=tuple({"x": float(x)} for x in [-1.95, -1.2, -0.5, 0.5, 1.2, 1.95]),
     initial_inputs=({"x": -1.95},),
     ground_truth=PolynomialGroundTruthRule(

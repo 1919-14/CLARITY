@@ -322,7 +322,16 @@ class ActiveRandomBenchmarkRunner:
         seed: int,
         max_budget: Optional[int] = None,
     ) -> BenchmarkTrialResult:
-        """Run an isolated discovery trial with the given selection strategy."""
+        """Run an isolated discovery trial with the given selection strategy.
+
+        Budget accounting
+        -----------------
+        ``max_budget`` (or ``scenario.max_query_budget`` when None) is the *total*
+        oracle-call budget. Initial seed queries count against this total: the engine
+        receives ``budget - initial_count`` remaining calls, and ``queries_used`` is
+        always reported as ``initial_count + engine_queries_used`` so the caller can
+        verify that total oracle interactions never exceed the configured budget.
+        """
         trial_id = generate_id("trial")
         budget = max_budget if max_budget is not None else scenario.max_query_budget
         tolerance = self._tolerance_override or scenario.success_threshold
@@ -330,12 +339,17 @@ class ActiveRandomBenchmarkRunner:
         # 1. Instantiate the isolated oracle (ground-truth kept strictly inside)
         oracle = scenario.create_oracle(noise_seed=seed)
 
-        # 2. Gather equivalent initial observations
+        # 2. Gather equivalent initial observations, counting them against the budget.
         initial_obs: List[Observation] = []
         for inp in scenario.initial_inputs:
             exp_inp = ExperimentInput(input_id=generate_id("inp-init"), values=inp)
             obs = oracle.query(exp_inp)
             initial_obs.append(obs)
+
+        initial_query_count: int = oracle.query_count  # equals len(scenario.initial_inputs) for valid inputs
+
+        # Remaining budget for the discovery engine after initial queries are consumed.
+        engine_budget = max(0, budget - initial_query_count)
 
         # 3. Configure the selection planner
         if strategy == "active_selection":
@@ -352,15 +366,16 @@ class ActiveRandomBenchmarkRunner:
         else:
             raise ValueError(f"Unknown strategy '{strategy}'. Must be 'active_selection' or 'random_baseline'.")
 
-        # 4. Build discovery configuration
-        target_deg = scenario.ground_truth.target_parameters.get("degree", 2) if scenario.ground_truth.target_parameters else 2
+        # 4. Build discovery configuration using the scenario's declared search-space capability.
+        # IMPORTANT: max_degree comes from scenario.max_hypothesis_degree — a public field
+        # set independently of the hidden ground truth — NOT from scenario.ground_truth.target_parameters.
         engine_config = DiscoveryRunConfig(
-            max_query_budget=budget,
-            max_iterations=budget * 2,
+            max_query_budget=engine_budget,
+            max_iterations=engine_budget * 2 if engine_budget > 0 else 1,
             domain_bounds=scenario.domain_bounds,
             hypothesis_config=HypothesisGenerationConfig(
                 min_degree=0,
-                max_degree=min(3, max(2, target_deg)),
+                max_degree=scenario.max_hypothesis_degree,
                 candidate_count=5,
                 seed=seed,
             ),
@@ -379,6 +394,14 @@ class ActiveRandomBenchmarkRunner:
         run_result: DiscoveryRunResult = engine.run(initial_observations=initial_obs)
         runtime_ms = (time.perf_counter() - start_time) * 1000.0
 
+        # Total oracle calls = initial queries + engine-issued queries.
+        # This must always be <= budget.
+        total_queries_used: int = initial_query_count + run_result.query_accounting.attempted_queries
+        assert total_queries_used <= budget, (
+            f"Budget overrun: {total_queries_used} total oracle calls > configured budget {budget}. "
+            f"Initial: {initial_query_count}, engine: {run_result.query_accounting.attempted_queries}."
+        )
+
         # 6. Extract candidates and evaluate against ground truth (EVALUATOR PATH)
         ranked_candidates: List[HypothesisRepresentation] = []
         if run_result.ranking and run_result.ranking.ranked_candidates:
@@ -393,7 +416,7 @@ class ActiveRandomBenchmarkRunner:
         eval_report = evaluator.evaluate_candidates(
             run_id=run_result.run_id,
             ranked_candidates=ranked_candidates,
-            queries_executed=run_result.query_accounting.attempted_queries,
+            queries_executed=total_queries_used,
         )
 
         # 7. Held-out predictive error on reproducible held-out points
@@ -410,7 +433,7 @@ class ActiveRandomBenchmarkRunner:
 
         # 8. Check target achievement
         target_reached = eval_report.hit_at_1 or (held_out_mae is not None and held_out_mae <= tolerance)
-        queries_to_target = run_result.query_accounting.attempted_queries if target_reached else None
+        queries_to_target = total_queries_used if target_reached else None
 
         # 9. Format selection and observation history
         selection_history = []
@@ -434,7 +457,9 @@ class ActiveRandomBenchmarkRunner:
             })
 
         term_reason = run_result.termination_reason.value if run_result.termination_reason else "unknown"
-        budget_exhausted = (run_result.status == DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED)
+        budget_exhausted = (total_queries_used >= budget) or (
+            run_result.status == DiscoveryLifecycleStatus.TERMINATED_BUDGET_EXHAUSTED
+        )
 
         return BenchmarkTrialResult(
             trial_id=trial_id,
@@ -442,7 +467,7 @@ class ActiveRandomBenchmarkRunner:
             seed=seed,
             scenario_id=scenario.id,
             scenario_version=scenario.version,
-            queries_used=run_result.query_accounting.attempted_queries,
+            queries_used=total_queries_used,
             max_budget=budget,
             budget_exhausted=budget_exhausted,
             target_reached=target_reached,

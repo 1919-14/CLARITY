@@ -135,6 +135,32 @@ class TestFairConditionsAndBudgetLimits:
         assert active_trial.max_budget == budget
         assert random_trial.max_budget == budget
 
+    def test_initial_oracle_queries_are_counted_against_budget(
+        self,
+    ):
+        """[P1] Initial seed queries count against the configured budget.
+
+        Total oracle interactions (initial + engine) must never exceed max_budget
+        for either strategy, regardless of how many initial_inputs the scenario defines.
+        """
+        runner = ActiveRandomBenchmarkRunner()
+        # Use a scenario with one initial input so the off-by-one is observable
+        scenario = LINEAR_BENCHMARK  # 1 initial input, budget=4 → engine gets at most 3
+        budget = 4
+
+        for strategy in ("active_selection", "random_baseline"):
+            trial = runner.run_single_trial(scenario, strategy=strategy, seed=42, max_budget=budget)
+            assert trial.queries_used <= budget, (
+                f"{strategy}: queries_used={trial.queries_used} exceeds budget={budget}. "
+                "Initial queries must be subtracted from the engine's remaining budget."
+            )
+            # queries_used must include the initial query, so it must be >= 1
+            assert trial.queries_used >= len(scenario.initial_inputs), (
+                f"{strategy}: queries_used={trial.queries_used} is less than "
+                f"initial_inputs count={len(scenario.initial_inputs)}. "
+                "Initial oracle queries must be included in the reported total."
+            )
+
     def test_paired_trial_shares_equivalent_initial_conditions(self):
         """Both strategies receive identical initial observations and domain bounds."""
         runner = ActiveRandomBenchmarkRunner()
@@ -204,6 +230,54 @@ class TestGroundTruthIsolation:
             assert "target_formula" not in trial
             assert "target_parameters" not in trial
 
+    def test_discovery_config_max_degree_does_not_read_ground_truth(self):
+        """[P1] Changing the hidden target degree must not change the discovery configuration.
+
+        max_hypothesis_degree is declared independently on BenchmarkCaseDefinition.
+        The runner must NOT read scenario.ground_truth.target_parameters to configure
+        the hypothesis search space.
+        """
+        from dataclasses import replace as dc_replace
+        from app.evaluator.benchmark_cases import PolynomialGroundTruthRule
+
+        # Build two scenarios that differ only in the hidden target degree.
+        # Both have the same public max_hypothesis_degree=3.
+        scenario_deg1 = dc_replace(
+            LINEAR_BENCHMARK,
+            max_hypothesis_degree=3,
+            ground_truth=PolynomialGroundTruthRule(
+                domain="polynomial",
+                target_formula="y = 1.0 + 2.0*x",
+                target_parameters={"degree": 1, "coefficients": {"c0": 1.0, "c1": 2.0}},
+                evaluator_label="test_deg1",
+                secret_seed=1,
+            ),
+        )
+        scenario_deg3 = dc_replace(
+            LINEAR_BENCHMARK,
+            max_hypothesis_degree=3,
+            ground_truth=PolynomialGroundTruthRule(
+                domain="polynomial",
+                target_formula="y = 3.0*x - 0.5*x^3",
+                target_parameters={"degree": 3, "coefficients": {"c0": 0.0, "c1": 3.0, "c2": 0.0, "c3": -0.5}},
+                evaluator_label="test_deg3",
+                secret_seed=2,
+            ),
+        )
+
+        runner = ActiveRandomBenchmarkRunner()
+        # Both trials must run without error and report the same queries_used,
+        # because max_hypothesis_degree=3 is identical for both.
+        trial_deg1 = runner.run_single_trial(scenario_deg1, strategy="random_baseline", seed=77, max_budget=4)
+        trial_deg3 = runner.run_single_trial(scenario_deg3, strategy="random_baseline", seed=77, max_budget=4)
+
+        # The search-space config is the same so the engine makes the same number of calls
+        assert trial_deg1.queries_used == trial_deg3.queries_used, (
+            "Discovery configuration must not depend on the hidden target degree. "
+            f"Got {trial_deg1.queries_used} queries for degree=1 and "
+            f"{trial_deg3.queries_used} queries for degree=3 with the same max_hypothesis_degree=3."
+        )
+
 
 # ==============================================================================
 # 4. Scenario Coverage & Challenges
@@ -236,6 +310,54 @@ class TestBenchmarkScenariosCoverage:
         assert obs.noise_metadata is not None
         assert obs.noise_metadata["noise_std"] == scenario.noise_std
         assert obs.noise_metadata["distribution"] == "gaussian"
+
+    def test_noisy_paired_trial_initial_observations_are_identical(self):
+        """[P2] Both strategies in a paired noisy trial must receive bitwise-identical
+        initial observations.
+
+        create_oracle(noise_seed=seed) is called separately for each strategy, so the
+        two oracle RNG instances are independent. Because both are seeded with the same
+        seed and the initial inputs are queried first, the noise draws for the initial
+        observations must be identical. Subsequent noise draws are independent between
+        the two oracle instances (they diverge naturally after the shared initial state).
+        """
+        runner = ActiveRandomBenchmarkRunner()
+        scenario = NOISY_POLYNOMIAL_BENCHMARK
+        seed = 42
+
+        active_trial, random_trial = runner.run_paired_trial(scenario, seed=seed, max_budget=6)
+
+        # Both trials must have at least one observation (the initial query)
+        assert len(active_trial.observations_history) >= 1
+        assert len(random_trial.observations_history) >= 1
+
+        # Initial observation input must be identical in both (same initial_inputs)
+        active_init = active_trial.observations_history[0]
+        random_init = random_trial.observations_history[0]
+        assert active_init["input_values"] == random_init["input_values"], (
+            "Both strategies must query the same initial input value."
+        )
+
+        # Initial output (including noise) must be identical because both oracles
+        # are seeded with the same noise_seed and the first RNG draw is the same.
+        assert active_init["output_values"] == random_init["output_values"], (
+            "Initial observations must be bitwise-identical for both strategies "
+            "(same noise_seed, same first RNG draw). Paired fairness requires this."
+        )
+
+        # Verify the noise seed mechanism is documented in observation metadata.
+        # (Re-query a fresh oracle with the same seed to confirm reproducibility.)
+        oracle_a = scenario.create_oracle(noise_seed=seed)
+        oracle_b = scenario.create_oracle(noise_seed=seed)
+        from app.domain.contracts import ExperimentInput, generate_id
+        inp = ExperimentInput(input_id=generate_id("inp"), values=scenario.initial_inputs[0])
+        obs_a = oracle_a.query(inp)
+        obs_b = oracle_b.query(inp)
+        assert obs_a.output_values == obs_b.output_values, (
+            "Two oracles with the same noise_seed must produce identical outputs for the same input."
+        )
+        assert obs_a.noise_metadata is not None
+        assert obs_a.noise_metadata["noise_std"] == scenario.noise_std
 
     def test_boundary_edge_cases_scenario_constrains_inputs(self):
         """Boundary scenario enforces strict domain bounds."""
