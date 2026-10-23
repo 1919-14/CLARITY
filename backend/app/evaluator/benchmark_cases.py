@@ -9,9 +9,10 @@ general API serializers.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from ..domain.contracts import GroundTruthRule, HypothesisRepresentation
+from ..domain.contracts import GroundTruthRule, HypothesisRepresentation, OracleInterface
+from ..domain.experiment_generator import NumericalDomainBounds
 
 
 class PolynomialGroundTruthRule(GroundTruthRule):
@@ -118,12 +119,96 @@ class BenchmarkCaseDefinition:
     description: str
     ground_truth: GroundTruthRule
     expected_baseline_queries: Optional[Dict[str, int]] = None
+    scenario_id: Optional[str] = None
+    version: str = "1.0.0"
+    challenge_type: str = "simple_numerical"  # simple_numerical, nonlinear, competing_hypotheses, noisy, boundary_edge_cases
+    domain_bounds: NumericalDomainBounds = field(
+        default_factory=lambda: NumericalDomainBounds(variable_name="x", min_val=-2.0, max_val=2.0, domain_name="1d_polynomial")
+    )
+    max_query_budget: int = 10
+    success_threshold: float = 0.05
+    noise_std: float = 0.0
+    held_out_inputs: Tuple[Dict[str, float], ...] = ()
+    initial_inputs: Tuple[Dict[str, float], ...] = ({"x": 0.0},)
+    # Public declared search-space capability for the discovery engine.
+    # Set this to the maximum polynomial degree the runner should search over.
+    # This is a capability declaration, NOT a hint about the hidden target degree —
+    # it must be determined independently of ground_truth.target_parameters.
+    max_hypothesis_degree: int = 3
+
+    @property
+    def id(self) -> str:
+        return self.scenario_id or self.benchmark_name
+
+    def create_oracle(self, noise_seed: Optional[int] = None) -> OracleInterface:
+        """Instantiate an isolated oracle simulator for this scenario without leaking ground-truth objects."""
+        from ..adapters.oracle.local_simulator import PolynomialLocalOracle
+        target_params = self.ground_truth.target_parameters or {}
+        raw_coeffs = PolynomialGroundTruthRule._extract_coefficients(target_params)
+        coeffs = {f"w{p}": val for p, val in raw_coeffs.items()}
+        return PolynomialLocalOracle(
+            domain_name=self.domain_bounds.domain_name,
+            min_x=self.domain_bounds.min_val,
+            max_x=self.domain_bounds.max_val,
+            coefficients=coeffs,
+            noise_std=self.noise_std,
+            seed=noise_seed,
+        )
+
+    def generate_held_out_dataset(self) -> List[Dict[str, Any]]:
+        """Compute exact ground truth answers for held-out inputs (Evaluator-side only!)."""
+        inputs = self.held_out_inputs
+        if not inputs:
+            span = self.domain_bounds.max_val - self.domain_bounds.min_val
+            inputs = tuple(
+                {"x": round(self.domain_bounds.min_val + i * span / 9.0, 4)}
+                for i in range(1, 9)
+            )
+        dataset = []
+        for inp in inputs:
+            out = self.ground_truth.evaluate_exact(inp)
+            dataset.append({
+                "input": dict(inp),
+                "expected_output": dict(out),
+            })
+        return dataset
+
+    def to_sanitized_dict(self) -> Dict[str, Any]:
+        """Expose scenario metadata for discovery/API without leaking evaluator ground-truth rules."""
+        return {
+            "scenario_id": self.id,
+            "benchmark_name": self.benchmark_name,
+            "version": self.version,
+            "description": self.description,
+            "challenge_type": self.challenge_type,
+            "domain_bounds": {
+                "variable_name": self.domain_bounds.variable_name,
+                "min_val": self.domain_bounds.min_val,
+                "max_val": self.domain_bounds.max_val,
+                "domain_name": self.domain_bounds.domain_name,
+            },
+            "max_query_budget": self.max_query_budget,
+            "success_threshold": self.success_threshold,
+            "noise_std": self.noise_std,
+            "max_hypothesis_degree": self.max_hypothesis_degree,
+            "initial_inputs": [dict(inp) for inp in self.initial_inputs],
+            "held_out_sample_count": len(self.held_out_inputs) if self.held_out_inputs else 8,
+        }
 
 
 # Standard benchmark suite for CLARITY discovery
 CONSTANT_BENCHMARK = BenchmarkCaseDefinition(
     benchmark_name="polynomial_constant_benchmark",
+    scenario_id="polynomial_constant_benchmark",
     description="Discovery of constant function y = 5.0",
+    challenge_type="simple_numerical",
+    domain_bounds=NumericalDomainBounds("x", -5.0, 5.0, "1d_polynomial"),
+    max_query_budget=8,
+    success_threshold=0.05,
+    noise_std=0.0,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-4.0, -2.5, -1.0, 1.0, 2.5, 4.0]),
+    initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
         domain="polynomial",
         target_formula="y = 5.0",
@@ -136,7 +221,16 @@ CONSTANT_BENCHMARK = BenchmarkCaseDefinition(
 
 LINEAR_BENCHMARK = BenchmarkCaseDefinition(
     benchmark_name="polynomial_linear_benchmark",
+    scenario_id="polynomial_linear_benchmark",
     description="Discovery of linear function y = 1.0 + 2.0*x",
+    challenge_type="simple_numerical",
+    domain_bounds=NumericalDomainBounds("x", -5.0, 5.0, "1d_polynomial"),
+    max_query_budget=8,
+    success_threshold=0.05,
+    noise_std=0.0,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-4.5, -3.0, -1.5, 1.5, 3.0, 4.5]),
+    initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
         domain="polynomial",
         target_formula="y = 1.0 + 2.0*x",
@@ -149,7 +243,16 @@ LINEAR_BENCHMARK = BenchmarkCaseDefinition(
 
 QUADRATIC_BENCHMARK = BenchmarkCaseDefinition(
     benchmark_name="polynomial_quadratic_benchmark",
+    scenario_id="polynomial_quadratic_benchmark",
     description="Discovery of quadratic curve y = -1.0 + 0.5*x^2",
+    challenge_type="nonlinear",
+    domain_bounds=NumericalDomainBounds("x", -4.0, 4.0, "1d_polynomial"),
+    max_query_budget=10,
+    success_threshold=0.05,
+    noise_std=0.0,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-3.5, -2.2, -1.1, 1.1, 2.2, 3.5]),
+    initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
         domain="polynomial",
         target_formula="y = -1.0 + 0.5*x^2",
@@ -162,7 +265,16 @@ QUADRATIC_BENCHMARK = BenchmarkCaseDefinition(
 
 CUBIC_BENCHMARK = BenchmarkCaseDefinition(
     benchmark_name="polynomial_cubic_benchmark",
-    description="Discovery of cubic polynomial y = 3.0*x - 0.5*x^3",
+    scenario_id="polynomial_cubic_benchmark",
+    description="Discovery of cubic polynomial y = 3.0*x - 0.5*x^3 with competing behavior near origin",
+    challenge_type="competing_hypotheses",
+    domain_bounds=NumericalDomainBounds("x", -3.0, 3.0, "1d_polynomial"),
+    max_query_budget=12,
+    success_threshold=0.1,
+    noise_std=0.0,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-2.7, -2.0, -1.2, 1.2, 2.0, 2.7]),
+    initial_inputs=({"x": 0.0},),
     ground_truth=PolynomialGroundTruthRule(
         domain="polynomial",
         target_formula="y = 3.0*x - 0.5*x^3",
@@ -173,19 +285,79 @@ CUBIC_BENCHMARK = BenchmarkCaseDefinition(
     expected_baseline_queries={"random_sampling": 100, "passive_uniform": 75},
 )
 
+NOISY_POLYNOMIAL_BENCHMARK = BenchmarkCaseDefinition(
+    benchmark_name="noisy_polynomial_benchmark",
+    scenario_id="noisy_polynomial_benchmark",
+    description="Discovery of linear relationship y = 1.0 + 2.0*x under Gaussian observation noise (std=0.15)",
+    challenge_type="noisy",
+    domain_bounds=NumericalDomainBounds("x", -5.0, 5.0, "1d_polynomial"),
+    max_query_budget=10,
+    success_threshold=0.25,
+    noise_std=0.15,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-4.0, -2.0, 1.0, 3.0]),
+    initial_inputs=({"x": 0.0},),
+    ground_truth=PolynomialGroundTruthRule(
+        domain="polynomial",
+        target_formula="y = 1.0 + 2.0*x",
+        target_parameters={"degree": 1, "coefficients": {"c0": 1.0, "c1": 2.0}},
+        evaluator_label="target_noisy_linear",
+        secret_seed=777,
+    ),
+    expected_baseline_queries={"random_sampling": 40, "passive_uniform": 35},
+)
+
+BOUNDARY_EDGE_CASES_BENCHMARK = BenchmarkCaseDefinition(
+    benchmark_name="boundary_edge_cases_benchmark",
+    scenario_id="boundary_edge_cases_benchmark",
+    description="Discovery with strict domain boundary inputs x in [-2.0, 2.0] for y = 2.0 + 1.5*x - 0.25*x^2",
+    challenge_type="boundary_edge_cases",
+    domain_bounds=NumericalDomainBounds("x", -2.0, 2.0, "1d_polynomial"),
+    max_query_budget=10,
+    success_threshold=0.08,
+    noise_std=0.0,
+    max_hypothesis_degree=3,
+    held_out_inputs=tuple({"x": float(x)} for x in [-1.95, -1.2, -0.5, 0.5, 1.2, 1.95]),
+    initial_inputs=({"x": -1.95},),
+    ground_truth=PolynomialGroundTruthRule(
+        domain="polynomial",
+        target_formula="y = 2.0 + 1.5*x - 0.25*x^2",
+        target_parameters={"degree": 2, "coefficients": {"c0": 2.0, "c1": 1.5, "c2": -0.25}},
+        evaluator_label="target_boundary_quad",
+        secret_seed=888,
+    ),
+    expected_baseline_queries={"random_sampling": 50, "passive_uniform": 40},
+)
+
+ALL_BENCHMARK_CASES = [
+    CONSTANT_BENCHMARK,
+    LINEAR_BENCHMARK,
+    QUADRATIC_BENCHMARK,
+    CUBIC_BENCHMARK,
+    NOISY_POLYNOMIAL_BENCHMARK,
+    BOUNDARY_EDGE_CASES_BENCHMARK,
+]
+
 BENCHMARK_CASES: Dict[str, BenchmarkCaseDefinition] = {
     "polynomial_constant": CONSTANT_BENCHMARK,
     "polynomial_constant_benchmark": CONSTANT_BENCHMARK,
     "target_constant_c5": CONSTANT_BENCHMARK,
     "polynomial_linear": LINEAR_BENCHMARK,
     "polynomial_linear_benchmark": LINEAR_BENCHMARK,
+    "linear_1d": LINEAR_BENCHMARK,
     "target_linear_2x_plus_1": LINEAR_BENCHMARK,
     "polynomial_quadratic": QUADRATIC_BENCHMARK,
     "polynomial_quadratic_benchmark": QUADRATIC_BENCHMARK,
+    "quadratic_nonlinear": QUADRATIC_BENCHMARK,
     "target_quadratic_neg1_plus_half_x2": QUADRATIC_BENCHMARK,
     "polynomial_cubic": CUBIC_BENCHMARK,
     "polynomial_cubic_benchmark": CUBIC_BENCHMARK,
+    "competing_cubic": CUBIC_BENCHMARK,
     "target_cubic_3x_minus_half_x3": CUBIC_BENCHMARK,
+    "noisy_polynomial": NOISY_POLYNOMIAL_BENCHMARK,
+    "noisy_polynomial_benchmark": NOISY_POLYNOMIAL_BENCHMARK,
+    "boundary_edge_cases": BOUNDARY_EDGE_CASES_BENCHMARK,
+    "boundary_edge_cases_benchmark": BOUNDARY_EDGE_CASES_BENCHMARK,
 }
 
 
@@ -198,8 +370,19 @@ def list_benchmark_cases() -> List[str]:
     """List unique registered benchmark case names."""
     seen = set()
     cases = []
-    for case in [CONSTANT_BENCHMARK, LINEAR_BENCHMARK, QUADRATIC_BENCHMARK, CUBIC_BENCHMARK]:
+    for case in ALL_BENCHMARK_CASES:
         if case.benchmark_name not in seen:
             seen.add(case.benchmark_name)
             cases.append(case.benchmark_name)
     return cases
+
+
+def list_benchmark_scenarios() -> List[Dict[str, Any]]:
+    """List sanitized benchmark scenario descriptors safe for API consumption."""
+    seen = set()
+    scenarios = []
+    for case in ALL_BENCHMARK_CASES:
+        if case.benchmark_name not in seen:
+            seen.add(case.benchmark_name)
+            scenarios.append(case.to_sanitized_dict())
+    return scenarios
