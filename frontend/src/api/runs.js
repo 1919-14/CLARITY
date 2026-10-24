@@ -66,12 +66,14 @@ export function generateRunReport(runId, { signal } = {}) {
   return apiPost(`/runs/${enc(runId)}/report`, undefined, { signal });
 }
 
-/** GET /runs/<run_id>/benchmarks */
-export function getRunBenchmarks(runId, { signal } = {}) {
-  return apiGet(`/runs/${enc(runId)}/benchmarks`, { signal });
-}
-
-/** GET /benchmarks/scenarios */
-export function listBenchmarkScenarios({ signal } = {}) {
-  return apiGet('/benchmarks/scenarios', { signal });
-}
+export {
+  getBenchmarkComparison,
+  getPerformanceMeasurement,
+  getRunBenchmarks,
+  getRunPerformanceMeasurements,
+  listBenchmarkScenarios,
+  listPerformanceMeasurements,
+  triggerBenchmarkComparison,
+  triggerPerformanceMeasurement,
+  triggerRunBenchmark,
+} from './benchmarks.js';

@@ -123,3 +123,79 @@ export const CompareIcon = (props) => (
   </Svg>
 );
 
+export const CheckCircleIcon = (props) => (
+  <Svg {...props}>
+    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+    <path d="m9 11 3 3L22 4" />
+  </Svg>
+);
+
+export const ClockIcon = (props) => (
+  <Svg {...props}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 6v6l4 2" />
+  </Svg>
+);
+
+export const PlayIcon = (props) => (
+  <Svg {...props}>
+    <polygon points="5 3 19 12 5 21 5 3" />
+  </Svg>
+);
+
+export const WarningIcon = (props) => (
+  <Svg {...props}>
+    <path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+  </Svg>
+);
+
+export const InfoIcon = (props) => (
+  <Svg {...props}>
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 16v-4M12 8h.01" />
+  </Svg>
+);
+
+export const EyeIcon = (props) => (
+  <Svg {...props}>
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+    <circle cx="12" cy="12" r="3" />
+  </Svg>
+);
+
+export const ChevronDownIcon = (props) => (
+  <Svg {...props}>
+    <path d="m6 9 6 6 6-6" />
+  </Svg>
+);
+
+export const ChevronUpIcon = (props) => (
+  <Svg {...props}>
+    <path d="m18 15-6-6-6 6" />
+  </Svg>
+);
+
+export const ShieldIcon = (props) => (
+  <Svg {...props}>
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </Svg>
+);
+
+export const AlertTriangleIcon = WarningIcon;
+export const HelpCircleIcon = InfoIcon;
+
+export const TrendingUpIcon = (props) => (
+  <Svg {...props}>
+    <polyline points="23 6 13.5 15.5 8.5 10.5 1 18" />
+    <polyline points="17 6 23 6 23 12" />
+  </Svg>
+);
+
+export const TrendingDownIcon = (props) => (
+  <Svg {...props}>
+    <polyline points="23 18 13.5 8.5 8.5 13.5 1 6" />
+    <polyline points="17 18 23 18 23 12" />
+  </Svg>
+);
+
+

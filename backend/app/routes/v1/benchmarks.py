@@ -363,6 +363,14 @@ def list_performance_measurements():
             for r in records:
                 meta = r.execution_metadata or {}
                 verify_no_ground_truth_leakage(meta)
+                status = meta.get("status") or meta.get("evaluation_status")
+                if not status:
+                    if meta.get("error") or meta.get("failure_reason"):
+                        status = "failed"
+                    elif "metric_comparisons" in meta or "active_aggregates" in meta or "accuracy" in meta or "active_stats" in meta:
+                        status = "completed"
+                    else:
+                        status = "unknown"
                 items.append({
                     "benchmark_id": r.benchmark_id,
                     "run_id": r.run_id,
@@ -372,6 +380,7 @@ def list_performance_measurements():
                     "reciprocal_rank": r.reciprocal_rank,
                     "held_out_mae": r.held_out_mae,
                     "efficiency_gain": r.efficiency_gain,
+                    "status": status,
                     "executed_at": r.executed_at.isoformat() if r.executed_at else None,
                     "has_measurements": "metric_comparisons" in meta or "active_aggregates" in meta or "accuracy" in meta,
                 })
