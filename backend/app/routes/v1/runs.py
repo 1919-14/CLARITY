@@ -36,6 +36,7 @@ from ...domain.contracts import (
     HypothesisStatus,
     Observation,
     ObservationStatus,
+    StructuredError,
 )
 from ...domain.ranking_contracts import RankingPolicyConfig
 from ...domain.ranking_engine import HypothesisRanker

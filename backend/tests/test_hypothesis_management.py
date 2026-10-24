@@ -1119,4 +1119,66 @@ class TestConcurrencyAndConflicts:
         assert data["summary"]["evaluation_status"] == "failed"
         assert data["summary"]["plausibility_status"] == "unevaluable"
 
+    def test_failed_candidate_evaluation_does_not_break_run_hypotheses_ranking(self, client, db_session):
+        """When one candidate has a failed evaluation with an error message, StructuredError is constructed
+
+        cleanly without raising NameError, and other candidates retain their scientific rankings.
+        """
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        for i in range(4):
+            obs = ObservationModel(
+                observation_id=f"obs-fail-rk-{i}",
+                run_id=run.run_id,
+                input_id=f"in-fail-rk-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(3 * i)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i >= 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Candidate 1: valid candidate with completed evaluation
+        h1 = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 3*x")
+        client.post(f"/api/v1/hypotheses/{h1.hypothesis_id}/reevaluate")
+
+        # Candidate 2: candidate with explicitly failed evaluation
+        h2 = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 99*x")
+        rev2_id = h2.revisions[0].revision_id
+        eval_failed = EvaluationResultModel(
+            evaluation_id="eval-failed-candidate-2",
+            revision_id=rev2_id,
+            run_id=run.run_id,
+            status="failed",
+            sample_count=1,
+            dataset_version=1,
+            metrics={},
+            held_out_metrics=None,
+            error_message="Matrix inversion singular",
+        )
+        repo.record_evaluation(eval_failed)
+        db_session.commit()
+
+        # Request run hypotheses
+        res = client.get(f"/api/v1/runs/{run.run_id}/hypotheses")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert len(data["hypotheses"]) == 2
+
+        h1_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h1.hypothesis_id)
+        h2_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h2.hypothesis_id)
+
+        # Candidate 1 must retain its ranking and NOT have ranking wiped to None by NameError
+        assert h1_data["ranking"] is not None
+        assert h1_data["scientific_ranking"] is not None
+        assert h1_data["ranking"]["within_cohort_rank"] == 1
+
+        # Candidate 2 has failed evaluation tier
+        assert h2_data["ranking"] is not None
+        assert h2_data["scientific_ranking"] is not None
+        assert h2_data["ranking"]["evaluation_tier"] == "evaluation_failed"
+
+
 

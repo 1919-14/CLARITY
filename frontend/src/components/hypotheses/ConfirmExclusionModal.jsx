@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
+import { useModalFocusTrap } from '../../hooks/useModalFocusTrap.js';
 
 export function ConfirmExclusionModal({
   open,
@@ -10,29 +11,14 @@ export function ConfirmExclusionModal({
 }) {
   const titleId = useId();
   const descriptionId = useId();
-  const confirmRef = useRef(null);
-  const previousFocusRef = useRef(null);
   const [reason, setReason] = useState('');
+  const containerRef = useModalFocusTrap({ open, onClose: onCancel, busy });
 
   useEffect(() => {
-    if (!open) return undefined;
-    setReason('');
-    previousFocusRef.current = document.activeElement;
-    confirmRef.current?.focus();
-
-    const handleKey = (event) => {
-      if (event.key === 'Escape' && !busy) {
-        event.preventDefault();
-        onCancel();
-      }
-    };
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('keydown', handleKey);
-      const previous = previousFocusRef.current;
-      if (previous && typeof previous.focus === 'function') previous.focus();
-    };
-  }, [open, busy, onCancel]);
+    if (open) {
+      setReason('');
+    }
+  }, [open]);
 
   if (!open || !hypothesis) return null;
 
@@ -57,6 +43,8 @@ export function ConfirmExclusionModal({
       }}
     >
       <div
+        ref={containerRef}
+        tabIndex={-1}
         className="dialog"
         role="dialog"
         aria-modal="true"
@@ -94,7 +82,6 @@ export function ConfirmExclusionModal({
             Cancel
           </button>
           <button
-            ref={confirmRef}
             type="button"
             className={`button button--${isExclude ? 'danger' : 'primary'}`}
             onClick={handleConfirm}

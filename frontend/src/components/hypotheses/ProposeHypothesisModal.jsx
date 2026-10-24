@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { useModalFocusTrap } from '../../hooks/useModalFocusTrap.js';
 import { Field } from '../forms/Field.jsx';
 
 const FAMILY_OPTIONS = [
@@ -19,8 +20,7 @@ export function ProposeHypothesisModal({
 }) {
   const titleId = useId();
   const formRef = useRef(null);
-  const firstInputRef = useRef(null);
-  const previousFocusRef = useRef(null);
+  const containerRef = useModalFocusTrap({ open, onClose: onCancel, busy });
 
   const [modelFamily, setModelFamily] = useState('1d_polynomial');
   const [customFamily, setCustomFamily] = useState('');
@@ -31,7 +31,7 @@ export function ProposeHypothesisModal({
   const [clientErrors, setClientErrors] = useState({});
 
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open) return;
     setModelFamily('1d_polynomial');
     setCustomFamily('');
     setFormula('');
@@ -39,23 +39,7 @@ export function ProposeHypothesisModal({
     setComplexity('');
     setCustomId('');
     setClientErrors({});
-
-    previousFocusRef.current = document.activeElement;
-    setTimeout(() => firstInputRef.current?.focus(), 50);
-
-    const handleKey = (event) => {
-      if (event.key === 'Escape' && !busy) {
-        event.preventDefault();
-        onCancel();
-      }
-    };
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('keydown', handleKey);
-      const previous = previousFocusRef.current;
-      if (previous && typeof previous.focus === 'function') previous.focus();
-    };
-  }, [open, busy, onCancel]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -120,6 +104,8 @@ export function ProposeHypothesisModal({
       }}
     >
       <div
+        ref={containerRef}
+        tabIndex={-1}
         className="dialog dialog--large"
         style={{ width: 'min(100%, 42rem)' }}
         role="dialog"
@@ -188,7 +174,6 @@ export function ProposeHypothesisModal({
             hint="Mathematical expression for the hypothesis (e.g. y = 2*x + 1 or y = a*x + b)."
           >
             <input
-              ref={firstInputRef}
               id="hyp-formula"
               type="text"
               className="input formula-text"
