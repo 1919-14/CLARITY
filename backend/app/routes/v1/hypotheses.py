@@ -14,12 +14,25 @@ Run-scoped hypothesis listing and creation live in runs.py.
 """
 
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
 from ...adapters.persistence.repository import ClarityRepository
+from ...domain.contracts import (
+    EvaluationResult,
+    EvaluationStatus,
+    Observation,
+    ObservationStatus,
+    StructuredError,
+)
+from ...domain.evidence_tracker import (
+    collect_evidence,
+    derive_plausibility_status,
+    summarize_evidence,
+)
+from ...domain.ranking_contracts import RankingPolicyConfig
 from ...domain.history_contracts import (
     ACTOR_RESEARCHER,
     InvalidHistoryCursorError,
@@ -486,4 +499,169 @@ def list_hypothesis_evaluations(hypothesis_id: str):
         "revision_id": latest_rev.revision_id,
         "evaluations": serialized,
         "count": len(serialized),
+    }), 200
+
+
+@hypotheses_v1_bp.route("/hypotheses/<hypothesis_id>/evidence", methods=["GET"])
+def get_hypothesis_evidence(hypothesis_id: str):
+    """GET /api/v1/hypotheses/<hypothesis_id>/evidence — Supporting and contradicting evidence.
+
+    Returns classified observation evidence (supporting, contradicting, indeterminate)
+    along with observed values, model predicted values, residuals, and applied tolerance.
+    Evaluator-only ground truth and hidden oracle rules are NEVER exposed.
+    """
+    db = _get_db()
+    try:
+        with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            hyp = repo.get_hypothesis(hypothesis_id)
+            if not hyp:
+                return error_response(f"Hypothesis '{hypothesis_id}' not found.", 404)
+
+            revisions = sorted(hyp.revisions, key=lambda r: r.revision_number) if hyp.revisions else []
+            if not revisions:
+                return jsonify({
+                    "hypothesis_id": hypothesis_id,
+                    "records": [],
+                    "summary": {
+                        "supporting_count": 0,
+                        "contradicting_count": 0,
+                        "indeterminate_count": 0,
+                        "total_evaluated": 0,
+                        "unverified_membership_count": 0,
+                        "supporting_observation_ids": [],
+                        "contradicting_observation_ids": [],
+                        "indeterminate_observation_ids": [],
+                        "plausibility_status": "unevaluated",
+                    },
+                    "note": "No revisions exist for this hypothesis.",
+                }), 200
+
+            latest_rev = revisions[-1]
+            evals = repo.list_evaluations_for_revision(latest_rev.revision_id)
+            latest_ev = evals[0] if evals else None
+
+            # Fetch run observations
+            raw_obs = repo.list_observations_for_run(hyp.run_id)
+            if not raw_obs:
+                return jsonify({
+                    "hypothesis_id": hypothesis_id,
+                    "revision_id": latest_rev.revision_id,
+                    "evaluation_id": latest_ev.evaluation_id if latest_ev else None,
+                    "records": [],
+                    "summary": {
+                        "supporting_count": 0,
+                        "contradicting_count": 0,
+                        "indeterminate_count": 0,
+                        "total_evaluated": 0,
+                        "unverified_membership_count": 0,
+                        "supporting_observation_ids": [],
+                        "contradicting_observation_ids": [],
+                        "indeterminate_observation_ids": [],
+                        "plausibility_status": "unevaluated",
+                    },
+                    "note": "No observations recorded for this run.",
+                }), 200
+
+            training_ids: List[str] = []
+            held_out_ids: List[str] = []
+            domain_obs: List[Observation] = []
+            for o in raw_obs:
+                status_enum = ObservationStatus.SUCCESS if o.status == "success" else ObservationStatus.ORACLE_FAILURE
+                if o.is_held_out:
+                    held_out_ids.append(o.observation_id)
+                else:
+                    training_ids.append(o.observation_id)
+                domain_obs.append(
+                    Observation(
+                        observation_id=o.observation_id,
+                        input_id=o.input_id or o.observation_id,
+                        input_values=o.input_values or {},
+                        output_values=o.output_values,
+                        status=status_enum,
+                        sequence_number=o.sequence_number,
+                        is_held_out=bool(o.is_held_out),
+                    )
+                )
+
+            # Build domain evaluation result
+            eval_status = EvaluationStatus.COMPLETED if (latest_ev and latest_ev.status == "completed") else EvaluationStatus.PENDING
+            eval_err = None
+            if latest_ev and latest_ev.error_message:
+                eval_err = StructuredError(code="EVALUATION_FAILED", message=latest_ev.error_message)
+
+            eval_res = EvaluationResult(
+                evaluation_id=latest_ev.evaluation_id if latest_ev else "eval-pending",
+                hypothesis_id=hyp.hypothesis_id,
+                status=eval_status,
+                metrics=latest_ev.metrics or {} if latest_ev else {},
+                held_out_metrics=latest_ev.held_out_metrics if latest_ev else None,
+                sample_count=latest_ev.sample_count or len(training_ids) if latest_ev else len(training_ids),
+                held_out_sample_count=len(held_out_ids) if (latest_ev and latest_ev.held_out_metrics) else None,
+                error=eval_err,
+                model_family=hyp.model_family,
+                fitted_specification=latest_rev.parameters or {},
+                metric_version="1.0.0",
+                metric_definitions={
+                    "mae": "Mean Absolute Error",
+                    "rmse": "Root Mean Squared Error",
+                },
+                dataset_ids={
+                    "dataset_id": hyp.run_id,
+                    "dataset_version": latest_ev.dataset_version if latest_ev else 1,
+                    "observation_ids": training_ids,
+                    "training_observation_ids": training_ids,
+                    "held_out_observation_ids": held_out_ids,
+                },
+            )
+
+            policy = RankingPolicyConfig()
+            records = collect_evidence(eval_res, domain_obs, policy)
+            summary = summarize_evidence(hyp.hypothesis_id, records)
+            plausibility = derive_plausibility_status(eval_res, summary, policy)
+
+            serialized_records = [
+                {
+                    "evidence_id": r.evidence_id,
+                    "observation_id": r.observation_id,
+                    "experiment_id": r.experiment_id,
+                    "partition": r.partition,
+                    "classification": r.classification.value,
+                    "observed_value": r.observed_value,
+                    "predicted_value": r.predicted_value,
+                    "residual": r.residual,
+                    "tolerance": r.tolerance,
+                    "is_held_out": r.is_held_out,
+                    "dataset_id": r.dataset_id,
+                    "evaluation_id": r.evaluation_id,
+                    "dataset_version": r.dataset_version,
+                    "timestamp": r.timestamp,
+                    "membership_verified": r.membership_verified,
+                }
+                for r in records
+            ]
+
+            serialized_summary = {
+                "supporting_count": summary.supporting_count,
+                "contradicting_count": summary.contradicting_count,
+                "indeterminate_count": summary.indeterminate_count,
+                "total_evaluated": summary.total_evaluated,
+                "unverified_membership_count": summary.unverified_membership_count,
+                "supporting_observation_ids": summary.supporting_observation_ids,
+                "contradicting_observation_ids": summary.contradicting_observation_ids,
+                "indeterminate_observation_ids": summary.indeterminate_observation_ids,
+                "plausibility_status": plausibility.value,
+            }
+
+    except Exception as exc:  # noqa: BLE001
+        log_safe_error("get_hypothesis_evidence db error", exc)
+        return error_response("An internal error occurred while retrieving hypothesis evidence.", 500)
+
+    return jsonify({
+        "hypothesis_id": hypothesis_id,
+        "revision_id": latest_rev.revision_id,
+        "evaluation_id": latest_ev.evaluation_id if latest_ev else None,
+        "records": serialized_records,
+        "summary": serialized_summary,
+        "count": len(serialized_records),
     }), 200

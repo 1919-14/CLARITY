@@ -22,12 +22,23 @@ RunLifecycleManager. No business logic lives here.
 """
 
 import uuid
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
 from ...adapters.persistence.database import get_db_manager
+from ...adapters.persistence.models import HypothesisModel
 from ...adapters.persistence.repository import ClarityRepository
+from ...domain.contracts import (
+    EvaluationResult,
+    EvaluationStatus,
+    HypothesisRepresentation,
+    HypothesisStatus,
+    Observation,
+    ObservationStatus,
+)
+from ...domain.ranking_contracts import RankingPolicyConfig
+from ...domain.ranking_engine import HypothesisRanker
 from ...domain.budget_contracts import (
     BudgetValidationError,
     RunBudgetConfig,
@@ -795,6 +806,120 @@ def list_run_observations(run_id: str):
     }), 200
 
 
+def _attach_scientific_rankings(
+    hypotheses: List[HypothesisModel],
+    serialized: List[Dict[str, Any]],
+    repo: ClarityRepository,
+    run_id: str,
+) -> None:
+    """Compute and attach within-cohort scientific rankings without conflating pinning or exclusion."""
+    try:
+        raw_obs = repo.list_observations_for_run(run_id)
+        domain_obs: List[Observation] = []
+        training_ids: List[str] = []
+        held_out_ids: List[str] = []
+        for o in raw_obs:
+            obs_status = ObservationStatus.SUCCESS if o.status == "success" else ObservationStatus.ORACLE_FAILURE
+            if o.is_held_out:
+                held_out_ids.append(o.observation_id)
+            else:
+                training_ids.append(o.observation_id)
+            domain_obs.append(
+                Observation(
+                    observation_id=o.observation_id,
+                    input_id=o.input_id or o.observation_id,
+                    input_values=o.input_values or {},
+                    output_values=o.output_values,
+                    status=obs_status,
+                    sequence_number=o.sequence_number,
+                    is_held_out=bool(o.is_held_out),
+                )
+            )
+
+        candidate_reprs: List[HypothesisRepresentation] = []
+        evals_by_hyp: Dict[str, EvaluationResult] = {}
+
+        for h in hypotheses:
+            revisions = sorted(h.revisions, key=lambda r: r.revision_number) if h.revisions else []
+            if not revisions:
+                continue
+            latest_rev = revisions[-1]
+            evals = repo.list_evaluations_for_revision(latest_rev.revision_id)
+            latest_ev = evals[0] if evals else None
+
+            cand_repr = HypothesisRepresentation(
+                model_family=h.model_family,
+                formula=latest_rev.formula or f"Candidate {h.hypothesis_id}",
+                parameters=latest_rev.parameters or {},
+                complexity=latest_rev.complexity or 1,
+                hypothesis_id=h.hypothesis_id,
+                revision=latest_rev.revision_number,
+                status=HypothesisStatus.EVALUATED if latest_ev else HypothesisStatus.CANDIDATE,
+            )
+            candidate_reprs.append(cand_repr)
+
+            if latest_ev:
+                status_enum = EvaluationStatus.COMPLETED if latest_ev.status == "completed" else EvaluationStatus.FAILED
+                eval_res = EvaluationResult(
+                    evaluation_id=latest_ev.evaluation_id,
+                    hypothesis_id=h.hypothesis_id,
+                    status=status_enum,
+                    metrics=latest_ev.metrics or {},
+                    held_out_metrics=latest_ev.held_out_metrics,
+                    sample_count=latest_ev.sample_count or len(training_ids),
+                    held_out_sample_count=len(held_out_ids) if latest_ev.held_out_metrics else None,
+                    error=None,
+                    model_family=h.model_family,
+                    fitted_specification=latest_rev.parameters or {},
+                    metric_version="1.0.0",
+                    metric_definitions={
+                        "mae": "Mean Absolute Error",
+                        "rmse": "Root Mean Squared Error",
+                    },
+                    dataset_ids={
+                        "dataset_id": run_id,
+                        "dataset_version": latest_ev.dataset_version or 1,
+                        "observation_ids": training_ids,
+                        "training_observation_ids": training_ids,
+                        "held_out_observation_ids": held_out_ids,
+                    },
+                )
+                evals_by_hyp[h.hypothesis_id] = eval_res
+
+        ranker = HypothesisRanker(RankingPolicyConfig())
+        obs_map = {c.hypothesis_id: domain_obs for c in candidate_reprs}
+        ranking_result = ranker.rank_candidates(
+            candidates=candidate_reprs,
+            evaluation_results=evals_by_hyp,
+            observations_by_hypothesis=obs_map,
+        )
+
+        ranked_map = {r.hypothesis_id: r for r in ranking_result.ranked_candidates}
+
+        for s in serialized:
+            rc = ranked_map.get(s["hypothesis_id"])
+            if rc:
+                s["ranking"] = {
+                    "rank": rc.rank,
+                    "within_cohort_rank": rc.within_cohort_rank,
+                    "evaluation_tier": rc.evaluation_tier.value,
+                    "plausibility_status": rc.status.value,
+                    "primary_metric_name": rc.primary_metric_name,
+                    "held_out_score": rc.held_out_score,
+                    "training_score": rc.training_score,
+                    "secondary_held_out_score": rc.secondary_held_out_score,
+                    "complexity": rc.complexity,
+                    "limitations": list(rc.limitations),
+                }
+            else:
+                s["ranking"] = None
+    except Exception as exc:
+        log_safe_error("_attach_scientific_rankings error", exc)
+        for s in serialized:
+            if "ranking" not in s:
+                s["ranking"] = None
+
+
 @runs_v1_bp.route("/runs/<run_id>/hypotheses", methods=["GET"])
 def list_run_hypotheses(run_id: str):
     """GET /api/v1/runs/<run_id>/hypotheses — Hypotheses associated with a run.
@@ -815,6 +940,7 @@ def list_run_hypotheses(run_id: str):
 
             hypotheses = repo.list_hypotheses_for_run(run_id, include_excluded=include_excluded)
             serialized = [serialize_hypothesis(h, repo) for h in hypotheses]
+            _attach_scientific_rankings(hypotheses, serialized, repo, run_id)
     except Exception as exc:  # noqa: BLE001
         log_safe_error("list_run_hypotheses db error", exc)
         return error_response("An internal error occurred while retrieving hypotheses.", 500)

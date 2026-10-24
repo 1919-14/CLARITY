@@ -913,3 +913,106 @@ class TestConcurrencyAndConflicts:
                 "y = x + 2",
                 hypothesis_id=hyp_id,
             )
+
+    def test_get_hypothesis_evidence_returns_classified_observations(self, client, db_session):
+        """GET /api/v1/hypotheses/<id>/evidence returns classified observations with residuals and tolerances."""
+        run = _create_test_run(db_session)
+        # Create observations
+        repo = ClarityRepository(db_session)
+        for i in range(3):
+            obs = ObservationModel(
+                observation_id=f"obs-ev-{i}",
+                run_id=run.run_id,
+                input_id=f"in-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(2 * i + 1)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i == 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Propose hypothesis y = 2x + 1
+        hyp = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 2*x + 1",
+        )
+        # Request evaluation
+        res_eval = client.post(f"/api/v1/hypotheses/{hyp.hypothesis_id}/reevaluate")
+        assert res_eval.status_code in (200, 202)
+
+        # Retrieve evidence
+        res = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["hypothesis_id"] == hyp.hypothesis_id
+        assert "records" in data
+        assert "summary" in data
+        assert len(data["records"]) == 3
+        # Invariant: y = 2x + 1 perfectly matches y = 2x + 1 so all 3 should be supporting
+        assert data["summary"]["supporting_count"] == 3
+        assert data["summary"]["contradicting_count"] == 0
+        first_rec = data["records"][0]
+        assert first_rec["classification"] == "supporting"
+        assert first_rec["residual"] == pytest.approx(0.0)
+        assert first_rec["observed_value"] == 1.0
+        assert first_rec["predicted_value"] == 1.0
+
+    def test_list_run_hypotheses_attaches_scientific_ranking(self, client, db_session):
+        """GET /api/v1/runs/<run_id>/hypotheses attaches within_cohort_rank without conflating flags."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        for i in range(4):
+            obs = ObservationModel(
+                observation_id=f"obs-rk-{i}",
+                run_id=run.run_id,
+                input_id=f"in-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(2 * i + 1)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i >= 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Hyp 1: exact match y = 2x + 1
+        h1 = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 2*x + 1",
+        )
+        client.post(f"/api/v1/hypotheses/{h1.hypothesis_id}/reevaluate")
+
+        # Hyp 2: poor fit y = 0.5x
+        h2 = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 0.5*x",
+        )
+        client.post(f"/api/v1/hypotheses/{h2.hypothesis_id}/reevaluate")
+
+        # Hyp 3: pinned, but poor fit
+        client.patch(f"/api/v1/hypotheses/{h2.hypothesis_id}", json={"is_pinned": True})
+
+        res = client.get(f"/api/v1/runs/{run.run_id}/hypotheses")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert len(data["hypotheses"]) == 2
+
+        h1_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h1.hypothesis_id)
+        h2_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h2.hypothesis_id)
+
+        assert h1_data["ranking"] is not None
+        assert h1_data["ranking"]["within_cohort_rank"] == 1
+        assert h2_data["ranking"] is not None
+        assert h2_data["ranking"]["within_cohort_rank"] == 2
+        # Invariant: pinning h2 does NOT make it rank #1 scientifically
+        assert h2_data["is_pinned"] is True
+        assert h1_data["is_pinned"] is False
+

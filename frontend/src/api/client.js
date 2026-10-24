@@ -174,3 +174,7 @@ export const apiGet = (path, options = {}) => apiRequest(path, { ...options, met
 
 export const apiPost = (path, body = undefined, options = {}) =>
   apiRequest(path, { ...options, method: 'POST', body });
+
+export const apiPatch = (path, body = undefined, options = {}) =>
+  apiRequest(path, { ...options, method: 'PATCH', body });
+
