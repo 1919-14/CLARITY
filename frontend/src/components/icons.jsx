@@ -110,3 +110,16 @@ export const BanIcon = (props) => (
     <path d="m6 6 12 12" />
   </Svg>
 );
+
+export const PinIcon = (props) => (
+  <Svg {...props}>
+    <path d="M12 17v5M9 3h6M10 3v5l-3 4v2h10v-2l-3-4V3" />
+  </Svg>
+);
+
+export const CompareIcon = (props) => (
+  <Svg {...props}>
+    <path d="M9 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M12 3v18" />
+  </Svg>
+);
+

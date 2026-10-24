@@ -913,3 +913,272 @@ class TestConcurrencyAndConflicts:
                 "y = x + 2",
                 hypothesis_id=hyp_id,
             )
+
+    def test_get_hypothesis_evidence_returns_classified_observations(self, client, db_session):
+        """GET /api/v1/hypotheses/<id>/evidence returns classified observations with residuals and tolerances."""
+        run = _create_test_run(db_session)
+        # Create observations
+        repo = ClarityRepository(db_session)
+        for i in range(3):
+            obs = ObservationModel(
+                observation_id=f"obs-ev-{i}",
+                run_id=run.run_id,
+                input_id=f"in-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(2 * i + 1)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i == 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Propose hypothesis y = 2x + 1
+        hyp = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 2*x + 1",
+        )
+        # Request evaluation
+        res_eval = client.post(f"/api/v1/hypotheses/{hyp.hypothesis_id}/reevaluate")
+        assert res_eval.status_code in (200, 202)
+
+        # Retrieve evidence
+        res = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["hypothesis_id"] == hyp.hypothesis_id
+        assert "records" in data
+        assert "summary" in data
+        assert len(data["records"]) == 3
+        # Invariant: y = 2x + 1 perfectly matches y = 2x + 1 so all 3 should be supporting
+        assert data["summary"]["supporting_count"] == 3
+        assert data["summary"]["contradicting_count"] == 0
+        first_rec = data["records"][0]
+        assert first_rec["classification"] == "supporting"
+        assert first_rec["residual"] == pytest.approx(0.0)
+        assert first_rec["observed_value"] == 1.0
+        assert first_rec["predicted_value"] == 1.0
+
+    def test_list_run_hypotheses_attaches_scientific_ranking(self, client, db_session):
+        """GET /api/v1/runs/<run_id>/hypotheses attaches within_cohort_rank without conflating flags."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        for i in range(4):
+            obs = ObservationModel(
+                observation_id=f"obs-rk-{i}",
+                run_id=run.run_id,
+                input_id=f"in-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(2 * i + 1)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i >= 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Hyp 1: exact match y = 2x + 1
+        h1 = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 2*x + 1",
+        )
+        client.post(f"/api/v1/hypotheses/{h1.hypothesis_id}/reevaluate")
+
+        # Hyp 2: poor fit constant y = 3
+        h2 = propose_hypothesis_service(
+            db_session,
+            run.run_id,
+            "1d_polynomial",
+            "y = 3",
+        )
+        client.post(f"/api/v1/hypotheses/{h2.hypothesis_id}/reevaluate")
+
+        # Hyp 3: pinned, but poor fit
+        client.patch(f"/api/v1/hypotheses/{h2.hypothesis_id}", json={"is_pinned": True})
+
+        res = client.get(f"/api/v1/runs/{run.run_id}/hypotheses")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert len(data["hypotheses"]) == 2
+
+        h1_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h1.hypothesis_id)
+        h2_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h2.hypothesis_id)
+
+        assert h1_data["ranking"] is not None
+        assert h1_data["scientific_ranking"] is not None
+        assert h1_data["ranking"]["within_cohort_rank"] == 1
+        assert h1_data["scientific_ranking"]["within_cohort_rank"] == 1
+        assert h2_data["ranking"] is not None
+        assert h2_data["scientific_ranking"] is not None
+        assert h2_data["ranking"]["within_cohort_rank"] == 2
+        assert h2_data["scientific_ranking"]["within_cohort_rank"] == 2
+        # Invariant: pinning h2 does NOT make it rank #1 scientifically
+        assert h2_data["is_pinned"] is True
+        assert h1_data["is_pinned"] is False
+
+    def test_post_evaluation_observation_is_unverified_in_older_snapshot(self, client, db_session):
+        """Observations added after an evaluation cannot silently become verified members of an older snapshot."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        obs1 = ObservationModel(
+            observation_id="obs-snap-1",
+            run_id=run.run_id,
+            input_id="in-snap-1",
+            input_values={"x": 1.0},
+            output_values={"y": 3.0},
+            status="success",
+            sequence_number=1,
+            is_held_out=False,
+        )
+        repo.add_observation(obs1)
+        db_session.commit()
+
+        hyp = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 2*x + 1")
+        reeval_res = client.post(f"/api/v1/hypotheses/{hyp.hypothesis_id}/reevaluate")
+        assert reeval_res.status_code in {200, 202}
+
+        # Evidence before new observation
+        ev_res1 = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert ev_res1.status_code == 200
+        ev1 = ev_res1.get_json()
+        assert ev1["count"] == 1
+        assert ev1["summary"]["unverified_membership_count"] == 0
+        assert ev1["records"][0]["membership_verified"] is True
+        assert ev1["dataset_snapshot_id"] is not None
+
+        # Add a new observation post-evaluation
+        obs2 = ObservationModel(
+            observation_id="obs-post-eval-2",
+            run_id=run.run_id,
+            input_id="in-snap-2",
+            input_values={"x": 2.0},
+            output_values={"y": 5.0},
+            status="success",
+            sequence_number=2,
+            is_held_out=False,
+        )
+        repo.add_observation(obs2)
+        db_session.commit()
+
+        # Evidence after new observation: new observation must have membership_verified=False
+        ev_res2 = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert ev_res2.status_code == 200
+        ev2 = ev_res2.get_json()
+        assert ev2["count"] == 2
+        assert ev2["summary"]["unverified_membership_count"] == 1
+
+        rec1 = next(r for r in ev2["records"] if r["observation_id"] == "obs-snap-1")
+        rec2 = next(r for r in ev2["records"] if r["observation_id"] == "obs-post-eval-2")
+        assert rec1["membership_verified"] is True
+        assert rec1["post_evaluation"] is False
+        assert rec2["membership_verified"] is False
+        assert rec2["post_evaluation"] is True
+
+    def test_failed_evaluation_surfaced_as_failed_and_unevaluable(self, client, db_session):
+        """Failed evaluation is mapped to failed state and surfaces as unevaluable, not pending."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        obs = ObservationModel(
+            observation_id="obs-fail-1",
+            run_id=run.run_id,
+            input_id="in-fail-1",
+            input_values={"x": 1.0},
+            output_values={"y": 2.0},
+            status="success",
+            sequence_number=1,
+            is_held_out=False,
+        )
+        repo.add_observation(obs)
+        db_session.commit()
+
+        hyp = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 2*x")
+        rev_id = hyp.revisions[0].revision_id
+
+        # Insert an explicitly failed evaluation
+        eval_failed = EvaluationResultModel(
+            evaluation_id="eval-failed-1",
+            revision_id=rev_id,
+            run_id=run.run_id,
+            status="failed",
+            sample_count=1,
+            dataset_version=1,
+            metrics={},
+            held_out_metrics=None,
+            error_message="Matrix singularity during fit",
+        )
+        repo.record_evaluation(eval_failed)
+        db_session.commit()
+
+        res = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["summary"]["evaluation_status"] == "failed"
+        assert data["summary"]["plausibility_status"] == "unevaluable"
+
+    def test_failed_candidate_evaluation_does_not_break_run_hypotheses_ranking(self, client, db_session):
+        """When one candidate has a failed evaluation with an error message, StructuredError is constructed
+
+        cleanly without raising NameError, and other candidates retain their scientific rankings.
+        """
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        for i in range(4):
+            obs = ObservationModel(
+                observation_id=f"obs-fail-rk-{i}",
+                run_id=run.run_id,
+                input_id=f"in-fail-rk-{i}",
+                input_values={"x": float(i)},
+                output_values={"y": float(3 * i)},
+                status="success",
+                sequence_number=i + 1,
+                is_held_out=(i >= 2),
+            )
+            repo.add_observation(obs)
+        db_session.commit()
+
+        # Candidate 1: valid candidate with completed evaluation
+        h1 = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 3*x")
+        client.post(f"/api/v1/hypotheses/{h1.hypothesis_id}/reevaluate")
+
+        # Candidate 2: candidate with explicitly failed evaluation
+        h2 = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 99*x")
+        rev2_id = h2.revisions[0].revision_id
+        eval_failed = EvaluationResultModel(
+            evaluation_id="eval-failed-candidate-2",
+            revision_id=rev2_id,
+            run_id=run.run_id,
+            status="failed",
+            sample_count=1,
+            dataset_version=1,
+            metrics={},
+            held_out_metrics=None,
+            error_message="Matrix inversion singular",
+        )
+        repo.record_evaluation(eval_failed)
+        db_session.commit()
+
+        # Request run hypotheses
+        res = client.get(f"/api/v1/runs/{run.run_id}/hypotheses")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert len(data["hypotheses"]) == 2
+
+        h1_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h1.hypothesis_id)
+        h2_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h2.hypothesis_id)
+
+        # Candidate 1 must retain its ranking and NOT have ranking wiped to None by NameError
+        assert h1_data["ranking"] is not None
+        assert h1_data["scientific_ranking"] is not None
+        assert h1_data["ranking"]["within_cohort_rank"] == 1
+
+        # Candidate 2 has failed evaluation tier
+        assert h2_data["ranking"] is not None
+        assert h2_data["scientific_ranking"] is not None
+        assert h2_data["ranking"]["evaluation_tier"] == "evaluation_failed"
+
+
+
