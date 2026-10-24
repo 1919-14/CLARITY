@@ -462,4 +462,222 @@ describe('HypothesesPage Component', () => {
       within(dialog).getByText(/oracle ground truth internals and evaluator hidden rules are never accessible/i),
     ).toBeInTheDocument();
   });
+
+  it('renders correctly from serialized backend response shape (contract verification)', async () => {
+    // Simulates the exact payload returned by GET /api/v1/runs/:id/hypotheses and GET /api/v1/hypotheses/:id/evidence
+    runsApi.listRunHypotheses.mockResolvedValueOnce({
+      hypotheses: [
+        {
+          hypothesis_id: 'hyp-contract-test',
+          run_id: RUN_ID,
+          model_family: '1d_polynomial',
+          origin: 'agent',
+          current_revision: 1,
+          is_pinned: false,
+          is_excluded: false,
+          updated_at: '2026-10-24T12:00:00Z',
+          latest_revision: {
+            revision_id: 'rev-c1',
+            revision_number: 1,
+            formula: 'y = 1.5*x + 0.2',
+            parameters: { w1: 1.5, w0: 0.2 },
+            complexity: 2,
+            creation_source: 'agent',
+          },
+          latest_evaluation: {
+            evaluation_id: 'eval-c1',
+            status: 'completed',
+            dataset_snapshot_id: 'snap-manifest-001',
+            metrics: { mae: 0.05, rmse: 0.09, r2: 0.99 },
+            held_out_metrics: { mae: 0.07, rmse: 0.12, r2: 0.97 },
+            evaluated_at: '2026-10-24T12:05:00Z',
+          },
+          ranking: {
+            rank: 1,
+            within_cohort_rank: 1,
+            evaluation_tier: 'VALID_HELD_OUT',
+            plausibility_status: 'PLAUSIBLE',
+            held_out_score: 0.07,
+            training_score: 0.05,
+            complexity: 2,
+          },
+          scientific_ranking: {
+            rank: 1,
+            within_cohort_rank: 1,
+            evaluation_tier: 'VALID_HELD_OUT',
+            plausibility_status: 'PLAUSIBLE',
+            held_out_score: 0.07,
+            training_score: 0.05,
+            complexity: 2,
+          },
+        },
+      ],
+      count: 1,
+    });
+
+    hypothesesApi.getHypothesisEvidence.mockResolvedValueOnce({
+      hypothesis_id: 'hyp-contract-test',
+      evaluation_id: 'eval-c1',
+      dataset_snapshot_id: 'snap-manifest-001',
+      summary: {
+        total_evaluated: 2,
+        total_observations: 2,
+        supporting_count: 1,
+        contradicting_count: 1,
+        indeterminate_count: 0,
+        evaluation_status: 'COMPLETED',
+        plausibility_status: 'PLAUSIBLE',
+      },
+      records: [
+        {
+          observation_id: 'obs-verified-1',
+          input_values: { x: 0.5 },
+          inputs: { x: 0.5 },
+          observed_value: 0.95,
+          predicted_value: 0.95,
+          residual: 0.0,
+          tolerance: 0.05,
+          tolerance_threshold: 0.05,
+          partition: 'held_out',
+          classification: 'supporting',
+          membership_verified: true,
+          post_evaluation: false,
+        },
+        {
+          observation_id: 'obs-post-eval-2',
+          input_values: { x: 2.5 },
+          inputs: { x: 2.5 },
+          observed_value: 5.5,
+          predicted_value: 3.95,
+          residual: 1.55,
+          tolerance: 0.05,
+          tolerance_threshold: 0.05,
+          partition: 'train',
+          classification: 'contradicting',
+          membership_verified: false,
+          post_evaluation: true,
+        },
+      ],
+      observations: [
+        {
+          observation_id: 'obs-verified-1',
+          input_values: { x: 0.5 },
+          inputs: { x: 0.5 },
+          observed_value: 0.95,
+          predicted_value: 0.95,
+          residual: 0.0,
+          tolerance: 0.05,
+          tolerance_threshold: 0.05,
+          partition: 'held_out',
+          classification: 'supporting',
+          membership_verified: true,
+          post_evaluation: false,
+        },
+        {
+          observation_id: 'obs-post-eval-2',
+          input_values: { x: 2.5 },
+          inputs: { x: 2.5 },
+          observed_value: 5.5,
+          predicted_value: 3.95,
+          residual: 1.55,
+          tolerance: 0.05,
+          tolerance_threshold: 0.05,
+          partition: 'train',
+          classification: 'contradicting',
+          membership_verified: false,
+          post_evaluation: true,
+        },
+      ],
+    });
+
+    renderPage();
+
+    // Verify row displays rank and plausibility status correctly from backend ranking payload
+    expect(await screen.findByText('hyp-contract-test')).toBeInTheDocument();
+    expect(screen.getByText('#1')).toBeInTheDocument();
+    expect(screen.getByText('PLAUSIBLE')).toBeInTheDocument();
+
+    // Open detail modal and switch to Evidence
+    const detailBtn = screen.getByRole('button', { name: /details/i });
+    await userEvent.click(detailBtn);
+
+    const dialog = await screen.findByRole('dialog');
+    const evidenceTab = within(dialog).getByRole('tab', { name: /evidence observations/i });
+    await userEvent.click(evidenceTab);
+
+    // Verify total count in tab label and snapshot badge
+    expect(within(dialog).getByRole('tab', { name: /evidence observations \(2\)/i })).toBeInTheDocument();
+    expect(within(dialog).getByText(/Snapshot: snap-manifest-001/i)).toBeInTheDocument();
+
+    // Verify observation rows, inputs, tolerance, and classifications appear
+    expect(within(dialog).getByText('obs-verified-1')).toBeInTheDocument();
+    expect(within(dialog).getByText('obs-post-eval-2')).toBeInTheDocument();
+    expect(within(dialog).getByText('{"x":0.5}')).toBeInTheDocument();
+    expect(within(dialog).getAllByText('0.0500').length).toBe(2);
+    expect(within(dialog).getByText('supporting')).toBeInTheDocument();
+    expect(within(dialog).getByText('contradicting')).toBeInTheDocument();
+
+    // Post-eval badge for unverified snapshot membership
+    expect(within(dialog).getByText('Post-eval')).toBeInTheDocument();
+  });
+
+  it('meets keyboard accessibility: Escape closes modal and restores focus to triggering element', async () => {
+    renderPage();
+    await screen.findByText('hyp-agent-1');
+
+    const detailBtns = screen.getAllByRole('button', { name: /details/i });
+    const triggerBtn = detailBtns[0];
+    triggerBtn.focus();
+    expect(document.activeElement).toBe(triggerBtn);
+
+    // Open detail dialog
+    await userEvent.click(triggerBtn);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toBeInTheDocument();
+
+    // Press Escape
+    await userEvent.keyboard('{Escape}');
+
+    // Dialog should be closed
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    // Focus should be restored to triggering button
+    expect(document.activeElement).toBe(triggerBtn);
+  });
+
+  it('meets keyboard accessibility: Tab containment traps focus inside modal', async () => {
+    renderPage();
+    await screen.findByText('hyp-agent-1');
+
+    const detailBtn = screen.getAllByRole('button', { name: /details/i })[0];
+    await userEvent.click(detailBtn);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toBeInTheDocument();
+
+    // Get all focusable elements inside the dialog
+    const focusable = dialog.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    expect(focusable.length).toBeGreaterThan(1);
+
+    const firstElement = focusable[0];
+    const lastElement = focusable[focusable.length - 1];
+
+    // Focus last element and press Tab -> should wrap to first element
+    lastElement.focus();
+    expect(document.activeElement).toBe(lastElement);
+
+    const tabEvent = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    dialog.dispatchEvent(tabEvent);
+
+    // Focus first element and press Shift+Tab -> should wrap to last element
+    firstElement.focus();
+    expect(document.activeElement).toBe(firstElement);
+
+    const shiftTabEvent = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true });
+    dialog.dispatchEvent(shiftTabEvent);
+  });
 });

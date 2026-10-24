@@ -146,13 +146,14 @@ export function HypothesesPage() {
 
       switch (sortBy) {
         case 'rank': {
-          const rankA = a.scientific_ranking?.within_cohort_rank ?? a.scientific_ranking?.rank;
-          const rankB = b.scientific_ranking?.within_cohort_rank ?? b.scientific_ranking?.rank;
+          const rankA = (a.scientific_ranking || a.ranking)?.within_cohort_rank ?? (a.scientific_ranking || a.ranking)?.rank;
+          const rankB = (b.scientific_ranking || b.ranking)?.within_cohort_rank ?? (b.scientific_ranking || b.ranking)?.rank;
           if (rankA === null || rankA === undefined) return 1;
           if (rankB === null || rankB === undefined) return -1;
           comparison = rankA - rankB;
           break;
         }
+
         case 'held_out_mae': {
           const valA = a.latest_evaluation?.held_out_metrics?.mae;
           const valB = b.latest_evaluation?.held_out_metrics?.mae;
@@ -445,7 +446,7 @@ export function HypothesesPage() {
                     {filteredAndSortedHypotheses.map((hypothesis) => {
                       const revision = hypothesis.latest_revision;
                       const evaluation = hypothesis.latest_evaluation;
-                      const ranking = hypothesis.scientific_ranking;
+                      const ranking = hypothesis.scientific_ranking || hypothesis.ranking;
                       const isSelected = selectedHypothesisIds.has(hypothesis.hypothesis_id);
                       const isReevaluating = reevaluatingIds.has(hypothesis.hypothesis_id);
                       const isResearcher = hypothesis.origin === 'researcher' || revision?.creation_source === 'researcher';

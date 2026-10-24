@@ -548,30 +548,37 @@ def get_hypothesis_evidence(hypothesis_id: str):
                     "hypothesis_id": hypothesis_id,
                     "revision_id": latest_rev.revision_id,
                     "evaluation_id": latest_ev.evaluation_id if latest_ev else None,
+                    "dataset_snapshot_id": latest_ev.dataset_snapshot_id if latest_ev else None,
                     "records": [],
+                    "observations": [],
                     "summary": {
                         "supporting_count": 0,
                         "contradicting_count": 0,
                         "indeterminate_count": 0,
                         "total_evaluated": 0,
+                        "total_observations": 0,
                         "unverified_membership_count": 0,
                         "supporting_observation_ids": [],
                         "contradicting_observation_ids": [],
                         "indeterminate_observation_ids": [],
                         "plausibility_status": "unevaluated",
+                        "evaluation_status": latest_ev.status if latest_ev else "unevaluated",
                     },
                     "note": "No observations recorded for this run.",
                 }), 200
 
-            training_ids: List[str] = []
-            held_out_ids: List[str] = []
+            obs_input_map: Dict[str, Any] = {}
             domain_obs: List[Observation] = []
+            run_training_ids: List[str] = []
+            run_held_out_ids: List[str] = []
+
             for o in raw_obs:
+                obs_input_map[o.observation_id] = o.input_values or {}
                 status_enum = ObservationStatus.SUCCESS if o.status == "success" else ObservationStatus.ORACLE_FAILURE
                 if o.is_held_out:
-                    held_out_ids.append(o.observation_id)
+                    run_held_out_ids.append(o.observation_id)
                 else:
-                    training_ids.append(o.observation_id)
+                    run_training_ids.append(o.observation_id)
                 domain_obs.append(
                     Observation(
                         observation_id=o.observation_id,
@@ -584,11 +591,45 @@ def get_hypothesis_evidence(hypothesis_id: str):
                     )
                 )
 
-            # Build domain evaluation result
-            eval_status = EvaluationStatus.COMPLETED if (latest_ev and latest_ev.status == "completed") else EvaluationStatus.PENDING
+            # Reconstruct partition membership from evaluation snapshot manifest (Finding Issue #17)
+            ev_training_ids: List[str] = []
+            ev_held_out_ids: List[str] = []
+            snapshot_id: Optional[str] = None
+
+            if latest_ev:
+                snapshot_id = latest_ev.dataset_snapshot_id
+                if latest_ev.dataset_snapshot and isinstance(latest_ev.dataset_snapshot, dict):
+                    manifest_obs = latest_ev.dataset_snapshot.get("observations") or []
+                    for so in manifest_obs:
+                        oid = so.get("observation_id")
+                        if oid:
+                            if so.get("is_held_out"):
+                                ev_held_out_ids.append(oid)
+                            else:
+                                ev_training_ids.append(oid)
+                else:
+                    ev_training_ids = list(run_training_ids)
+                    ev_held_out_ids = list(run_held_out_ids)
+
+            # Map evaluation status explicitly: completed, failed, pending, cancelled
+            if latest_ev:
+                if latest_ev.status == "completed":
+                    eval_status = EvaluationStatus.COMPLETED
+                elif latest_ev.status == "failed":
+                    eval_status = EvaluationStatus.FAILED
+                elif latest_ev.status == "cancelled":
+                    eval_status = EvaluationStatus.CANCELLED
+                else:
+                    eval_status = EvaluationStatus.PENDING
+            else:
+                eval_status = EvaluationStatus.PENDING
+
             eval_err = None
-            if latest_ev and latest_ev.error_message:
-                eval_err = StructuredError(code="EVALUATION_FAILED", message=latest_ev.error_message)
+            if latest_ev:
+                if latest_ev.error_message:
+                    eval_err = StructuredError(code="EVALUATION_FAILED", message=latest_ev.error_message)
+                elif latest_ev.status == "failed":
+                    eval_err = StructuredError(code="EVALUATION_FAILED", message="Candidate evaluation failed.")
 
             eval_res = EvaluationResult(
                 evaluation_id=latest_ev.evaluation_id if latest_ev else "eval-pending",
@@ -596,8 +637,8 @@ def get_hypothesis_evidence(hypothesis_id: str):
                 status=eval_status,
                 metrics=latest_ev.metrics or {} if latest_ev else {},
                 held_out_metrics=latest_ev.held_out_metrics if latest_ev else None,
-                sample_count=latest_ev.sample_count or len(training_ids) if latest_ev else len(training_ids),
-                held_out_sample_count=len(held_out_ids) if (latest_ev and latest_ev.held_out_metrics) else None,
+                sample_count=latest_ev.sample_count or len(ev_training_ids) if latest_ev else len(run_training_ids),
+                held_out_sample_count=len(ev_held_out_ids) if (latest_ev and latest_ev.held_out_metrics) else None,
                 error=eval_err,
                 model_family=hyp.model_family,
                 fitted_specification=latest_rev.parameters or {},
@@ -609,9 +650,10 @@ def get_hypothesis_evidence(hypothesis_id: str):
                 dataset_ids={
                     "dataset_id": hyp.run_id,
                     "dataset_version": latest_ev.dataset_version if latest_ev else 1,
-                    "observation_ids": training_ids,
-                    "training_observation_ids": training_ids,
-                    "held_out_observation_ids": held_out_ids,
+                    "dataset_snapshot_id": snapshot_id,
+                    "observation_ids": ev_training_ids,
+                    "training_observation_ids": ev_training_ids,
+                    "held_out_observation_ids": ev_held_out_ids,
                 },
             )
 
@@ -631,12 +673,16 @@ def get_hypothesis_evidence(hypothesis_id: str):
                     "predicted_value": r.predicted_value,
                     "residual": r.residual,
                     "tolerance": r.tolerance,
+                    "tolerance_threshold": r.tolerance,
+                    "input_values": obs_input_map.get(r.observation_id, {}),
+                    "inputs": obs_input_map.get(r.observation_id, {}),
                     "is_held_out": r.is_held_out,
                     "dataset_id": r.dataset_id,
                     "evaluation_id": r.evaluation_id,
                     "dataset_version": r.dataset_version,
                     "timestamp": r.timestamp,
                     "membership_verified": r.membership_verified,
+                    "post_evaluation": not r.membership_verified,
                 }
                 for r in records
             ]
@@ -646,11 +692,13 @@ def get_hypothesis_evidence(hypothesis_id: str):
                 "contradicting_count": summary.contradicting_count,
                 "indeterminate_count": summary.indeterminate_count,
                 "total_evaluated": summary.total_evaluated,
+                "total_observations": summary.total_evaluated,
                 "unverified_membership_count": summary.unverified_membership_count,
                 "supporting_observation_ids": summary.supporting_observation_ids,
                 "contradicting_observation_ids": summary.contradicting_observation_ids,
                 "indeterminate_observation_ids": summary.indeterminate_observation_ids,
                 "plausibility_status": plausibility.value,
+                "evaluation_status": latest_ev.status if latest_ev else "unevaluated",
             }
 
     except Exception as exc:  # noqa: BLE001
@@ -661,7 +709,10 @@ def get_hypothesis_evidence(hypothesis_id: str):
         "hypothesis_id": hypothesis_id,
         "revision_id": latest_rev.revision_id,
         "evaluation_id": latest_ev.evaluation_id if latest_ev else None,
+        "dataset_snapshot_id": snapshot_id,
         "records": serialized_records,
+        "observations": serialized_records,
         "summary": serialized_summary,
         "count": len(serialized_records),
     }), 200
+

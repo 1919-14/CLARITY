@@ -988,12 +988,12 @@ class TestConcurrencyAndConflicts:
         )
         client.post(f"/api/v1/hypotheses/{h1.hypothesis_id}/reevaluate")
 
-        # Hyp 2: poor fit y = 0.5x
+        # Hyp 2: poor fit constant y = 3
         h2 = propose_hypothesis_service(
             db_session,
             run.run_id,
             "1d_polynomial",
-            "y = 0.5*x",
+            "y = 3",
         )
         client.post(f"/api/v1/hypotheses/{h2.hypothesis_id}/reevaluate")
 
@@ -1009,10 +1009,114 @@ class TestConcurrencyAndConflicts:
         h2_data = next(h for h in data["hypotheses"] if h["hypothesis_id"] == h2.hypothesis_id)
 
         assert h1_data["ranking"] is not None
+        assert h1_data["scientific_ranking"] is not None
         assert h1_data["ranking"]["within_cohort_rank"] == 1
+        assert h1_data["scientific_ranking"]["within_cohort_rank"] == 1
         assert h2_data["ranking"] is not None
+        assert h2_data["scientific_ranking"] is not None
         assert h2_data["ranking"]["within_cohort_rank"] == 2
+        assert h2_data["scientific_ranking"]["within_cohort_rank"] == 2
         # Invariant: pinning h2 does NOT make it rank #1 scientifically
         assert h2_data["is_pinned"] is True
         assert h1_data["is_pinned"] is False
+
+    def test_post_evaluation_observation_is_unverified_in_older_snapshot(self, client, db_session):
+        """Observations added after an evaluation cannot silently become verified members of an older snapshot."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        obs1 = ObservationModel(
+            observation_id="obs-snap-1",
+            run_id=run.run_id,
+            input_id="in-snap-1",
+            input_values={"x": 1.0},
+            output_values={"y": 3.0},
+            status="success",
+            sequence_number=1,
+            is_held_out=False,
+        )
+        repo.add_observation(obs1)
+        db_session.commit()
+
+        hyp = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 2*x + 1")
+        reeval_res = client.post(f"/api/v1/hypotheses/{hyp.hypothesis_id}/reevaluate")
+        assert reeval_res.status_code in {200, 202}
+
+        # Evidence before new observation
+        ev_res1 = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert ev_res1.status_code == 200
+        ev1 = ev_res1.get_json()
+        assert ev1["count"] == 1
+        assert ev1["summary"]["unverified_membership_count"] == 0
+        assert ev1["records"][0]["membership_verified"] is True
+        assert ev1["dataset_snapshot_id"] is not None
+
+        # Add a new observation post-evaluation
+        obs2 = ObservationModel(
+            observation_id="obs-post-eval-2",
+            run_id=run.run_id,
+            input_id="in-snap-2",
+            input_values={"x": 2.0},
+            output_values={"y": 5.0},
+            status="success",
+            sequence_number=2,
+            is_held_out=False,
+        )
+        repo.add_observation(obs2)
+        db_session.commit()
+
+        # Evidence after new observation: new observation must have membership_verified=False
+        ev_res2 = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert ev_res2.status_code == 200
+        ev2 = ev_res2.get_json()
+        assert ev2["count"] == 2
+        assert ev2["summary"]["unverified_membership_count"] == 1
+
+        rec1 = next(r for r in ev2["records"] if r["observation_id"] == "obs-snap-1")
+        rec2 = next(r for r in ev2["records"] if r["observation_id"] == "obs-post-eval-2")
+        assert rec1["membership_verified"] is True
+        assert rec1["post_evaluation"] is False
+        assert rec2["membership_verified"] is False
+        assert rec2["post_evaluation"] is True
+
+    def test_failed_evaluation_surfaced_as_failed_and_unevaluable(self, client, db_session):
+        """Failed evaluation is mapped to failed state and surfaces as unevaluable, not pending."""
+        run = _create_test_run(db_session)
+        repo = ClarityRepository(db_session)
+        obs = ObservationModel(
+            observation_id="obs-fail-1",
+            run_id=run.run_id,
+            input_id="in-fail-1",
+            input_values={"x": 1.0},
+            output_values={"y": 2.0},
+            status="success",
+            sequence_number=1,
+            is_held_out=False,
+        )
+        repo.add_observation(obs)
+        db_session.commit()
+
+        hyp = propose_hypothesis_service(db_session, run.run_id, "1d_polynomial", "y = 2*x")
+        rev_id = hyp.revisions[0].revision_id
+
+        # Insert an explicitly failed evaluation
+        eval_failed = EvaluationResultModel(
+            evaluation_id="eval-failed-1",
+            revision_id=rev_id,
+            run_id=run.run_id,
+            status="failed",
+            sample_count=1,
+            dataset_version=1,
+            metrics={},
+            held_out_metrics=None,
+            error_message="Matrix singularity during fit",
+        )
+        repo.record_evaluation(eval_failed)
+        db_session.commit()
+
+        res = client.get(f"/api/v1/hypotheses/{hyp.hypothesis_id}/evidence")
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["summary"]["evaluation_status"] == "failed"
+        assert data["summary"]["plausibility_status"] == "unevaluable"
+
 

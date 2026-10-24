@@ -838,6 +838,7 @@ def _attach_scientific_rankings(
 
         candidate_reprs: List[HypothesisRepresentation] = []
         evals_by_hyp: Dict[str, EvaluationResult] = {}
+        obs_map: Dict[str, List[Observation]] = {}
 
         for h in hypotheses:
             revisions = sorted(h.revisions, key=lambda r: r.revision_number) if h.revisions else []
@@ -859,16 +860,49 @@ def _attach_scientific_rankings(
             candidate_reprs.append(cand_repr)
 
             if latest_ev:
-                status_enum = EvaluationStatus.COMPLETED if latest_ev.status == "completed" else EvaluationStatus.FAILED
+                status_enum = (
+                    EvaluationStatus.COMPLETED
+                    if latest_ev.status == "completed"
+                    else (
+                        EvaluationStatus.FAILED
+                        if latest_ev.status == "failed"
+                        else EvaluationStatus.PENDING
+                    )
+                )
+
+                # Reconstruct partition membership from evaluation snapshot if present
+                ev_training_ids: List[str] = []
+                ev_held_out_ids: List[str] = []
+                snapshot_id: Optional[str] = latest_ev.dataset_snapshot_id
+
+                if latest_ev.dataset_snapshot and isinstance(latest_ev.dataset_snapshot, dict):
+                    manifest_obs = latest_ev.dataset_snapshot.get("observations") or []
+                    for so in manifest_obs:
+                        oid = so.get("observation_id")
+                        if oid:
+                            if so.get("is_held_out"):
+                                ev_held_out_ids.append(oid)
+                            else:
+                                ev_training_ids.append(oid)
+                else:
+                    ev_training_ids = list(training_ids)
+                    ev_held_out_ids = list(held_out_ids)
+
+                eval_err = (
+                    StructuredError(code="EVALUATION_FAILED", message=latest_ev.error_message)
+                    if (latest_ev.status == "failed" and latest_ev.error_message)
+                    else None
+                )
+
                 eval_res = EvaluationResult(
                     evaluation_id=latest_ev.evaluation_id,
                     hypothesis_id=h.hypothesis_id,
                     status=status_enum,
                     metrics=latest_ev.metrics or {},
                     held_out_metrics=latest_ev.held_out_metrics,
-                    sample_count=latest_ev.sample_count or len(training_ids),
-                    held_out_sample_count=len(held_out_ids) if latest_ev.held_out_metrics else None,
-                    error=None,
+                    sample_count=latest_ev.sample_count or len(ev_training_ids),
+                    held_out_sample_count=len(ev_held_out_ids) if latest_ev.held_out_metrics else None,
+                    error=eval_err,
                     model_family=h.model_family,
                     fitted_specification=latest_rev.parameters or {},
                     metric_version="1.0.0",
@@ -879,15 +913,23 @@ def _attach_scientific_rankings(
                     dataset_ids={
                         "dataset_id": run_id,
                         "dataset_version": latest_ev.dataset_version or 1,
-                        "observation_ids": training_ids,
-                        "training_observation_ids": training_ids,
-                        "held_out_observation_ids": held_out_ids,
+                        "dataset_snapshot_id": snapshot_id,
+                        "observation_ids": ev_training_ids,
+                        "training_observation_ids": ev_training_ids,
+                        "held_out_observation_ids": ev_held_out_ids,
                     },
                 )
                 evals_by_hyp[h.hypothesis_id] = eval_res
+                # Observations for this hypothesis strictly restricted to snapshot manifest if present
+                if latest_ev.dataset_snapshot and isinstance(latest_ev.dataset_snapshot, dict):
+                    allowed_ids = set(ev_training_ids) | set(ev_held_out_ids)
+                    obs_map[h.hypothesis_id] = [o for o in domain_obs if o.observation_id in allowed_ids]
+                else:
+                    obs_map[h.hypothesis_id] = domain_obs
+            else:
+                obs_map[h.hypothesis_id] = domain_obs
 
         ranker = HypothesisRanker(RankingPolicyConfig())
-        obs_map = {c.hypothesis_id: domain_obs for c in candidate_reprs}
         ranking_result = ranker.rank_candidates(
             candidates=candidate_reprs,
             evaluation_results=evals_by_hyp,
@@ -899,7 +941,7 @@ def _attach_scientific_rankings(
         for s in serialized:
             rc = ranked_map.get(s["hypothesis_id"])
             if rc:
-                s["ranking"] = {
+                ranking_data = {
                     "rank": rc.rank,
                     "within_cohort_rank": rc.within_cohort_rank,
                     "evaluation_tier": rc.evaluation_tier.value,
@@ -911,13 +953,19 @@ def _attach_scientific_rankings(
                     "complexity": rc.complexity,
                     "limitations": list(rc.limitations),
                 }
+                s["ranking"] = ranking_data
+                s["scientific_ranking"] = ranking_data
             else:
                 s["ranking"] = None
+                s["scientific_ranking"] = None
     except Exception as exc:
         log_safe_error("_attach_scientific_rankings error", exc)
         for s in serialized:
             if "ranking" not in s:
                 s["ranking"] = None
+            if "scientific_ranking" not in s:
+                s["scientific_ranking"] = None
+
 
 
 @runs_v1_bp.route("/runs/<run_id>/hypotheses", methods=["GET"])

@@ -1,5 +1,6 @@
 import { useEffect, useId, useState } from 'react';
 import { getHypothesisEvaluations, getHypothesisEvidence, getHypothesisRevisions } from '../../api/hypotheses.js';
+import { useModalFocusTrap } from '../../hooks/useModalFocusTrap.js';
 import { formatDateTime, formatDecimal, formatInteger, UNAVAILABLE } from '../../utils/formatting.js';
 import { EmptyState } from '../feedback/EmptyState.jsx';
 import { ErrorState } from '../feedback/ErrorState.jsx';
@@ -18,6 +19,7 @@ export function HypothesisDetailModal({
   reevaluating = false,
 }) {
   const titleId = useId();
+  const containerRef = useModalFocusTrap({ open, onClose, busy });
   const [activeTab, setActiveTab] = useState('overview'); // 'overview' | 'evidence' | 'revisions' | 'evaluations'
 
   // Async data for evidence, revisions, evaluations
@@ -76,7 +78,7 @@ export function HypothesisDetailModal({
 
   const rev = hypothesis.latest_revision;
   const evalRec = hypothesis.latest_evaluation;
-  const ranking = hypothesis.scientific_ranking;
+  const ranking = hypothesis.scientific_ranking || hypothesis.ranking;
 
   const trainingMae = evalRec?.metrics?.mae;
   const trainingRmse = evalRec?.metrics?.rmse;
@@ -85,8 +87,13 @@ export function HypothesisDetailModal({
   const heldOutRmse = evalRec?.held_out_metrics?.rmse;
   const heldOutR2 = evalRec?.held_out_metrics?.r2;
 
-  // Evidence observations
-  const observations = evidenceData?.observations || [];
+  // Evidence observations: supports records or observations
+  const observations = evidenceData?.records || evidenceData?.observations || [];
+  const totalEvidenceCount =
+    evidenceData?.summary?.total_observations ??
+    evidenceData?.summary?.total_evaluated ??
+    observations.length;
+
   const filteredObservations = observations.filter((obs) => {
     if (evidenceFilter === 'all') return true;
     return obs.classification === evidenceFilter;
@@ -100,12 +107,15 @@ export function HypothesisDetailModal({
       }}
     >
       <div
+        ref={containerRef}
+        tabIndex={-1}
         className="dialog dialog--large"
         style={{ width: 'min(100%, 54rem)', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
       >
+
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--space-3)' }}>
           <div>
             <p className="volume-label">Candidate Details & Evidence</p>
@@ -172,8 +182,9 @@ export function HypothesisDetailModal({
             className={`tab-button ${activeTab === 'evidence' ? 'tab-button--active' : ''}`}
             onClick={() => setActiveTab('evidence')}
           >
-            Evidence Observations {evidenceData ? `(${evidenceData.summary?.total_observations ?? 0})` : ''}
+            Evidence Observations {evidenceData ? `(${totalEvidenceCount})` : ''}
           </button>
+
           <button
             type="button"
             role="tab"
@@ -351,6 +362,11 @@ export function HypothesisDetailModal({
                       <span className="badge badge--neutral">
                         Indeterminate: {formatInteger(evidenceData.summary?.indeterminate_count)}
                       </span>
+                      {evidenceData.dataset_snapshot_id && (
+                        <span className="badge badge--neutral">
+                          Snapshot: {evidenceData.dataset_snapshot_id}
+                        </span>
+                      )}
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
@@ -399,20 +415,31 @@ export function HypothesisDetailModal({
                           {filteredObservations.map((obs) => {
                             const isSupporting = obs.classification === 'supporting';
                             const isContradicting = obs.classification === 'contradicting';
+                            const inputValues = obs.input_values ?? obs.inputs;
+                            const toleranceValue = obs.tolerance ?? obs.tolerance_threshold;
                             return (
                               <tr key={obs.observation_id}>
                                 <td><code className="id-text">{obs.observation_id}</code></td>
                                 <td>
-                                  {typeof obs.inputs === 'object' && obs.inputs !== null
-                                    ? JSON.stringify(obs.inputs)
-                                    : String(obs.inputs ?? UNAVAILABLE)}
+                                  {typeof inputValues === 'object' && inputValues !== null
+                                    ? JSON.stringify(inputValues)
+                                    : String(inputValues ?? UNAVAILABLE)}
                                 </td>
                                 <td><strong>{formatDecimal(obs.observed_value)}</strong></td>
                                 <td>{formatDecimal(obs.predicted_value)}</td>
                                 <td>{formatDecimal(obs.residual)}</td>
-                                <td className="muted">{formatDecimal(obs.tolerance_threshold)}</td>
+                                <td className="muted">{formatDecimal(toleranceValue)}</td>
                                 <td>
                                   <span className="badge badge--neutral">{obs.partition || 'unspecified'}</span>
+                                  {obs.membership_verified === false && (
+                                    <span
+                                      className="badge badge--warning"
+                                      style={{ marginLeft: '4px', fontSize: '0.6rem' }}
+                                      title="Observed after this evaluation was performed"
+                                    >
+                                      Post-eval
+                                    </span>
+                                  )}
                                 </td>
                                 <td>
                                   <span className={`status-badge status-badge--${isSupporting ? 'success' : isContradicting ? 'danger' : 'neutral'}`}>
@@ -422,6 +449,7 @@ export function HypothesisDetailModal({
                               </tr>
                             );
                           })}
+
                         </tbody>
                       </table>
                     </div>

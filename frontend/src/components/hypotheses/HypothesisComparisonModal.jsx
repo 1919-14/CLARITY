@@ -1,4 +1,5 @@
 import { useId } from 'react';
+import { useModalFocusTrap } from '../../hooks/useModalFocusTrap.js';
 import { formatDateTime, formatDecimal, UNAVAILABLE } from '../../utils/formatting.js';
 import { AlertIcon } from '../icons.jsx';
 
@@ -8,6 +9,7 @@ export function HypothesisComparisonModal({
   onClose,
 }) {
   const titleId = useId();
+  const containerRef = useModalFocusTrap({ open, onClose });
 
   if (!open || hypotheses.length < 2) return null;
 
@@ -16,7 +18,7 @@ export function HypothesisComparisonModal({
   // 2. Are they on different dataset versions / snapshots?
   const tiers = new Set(
     hypotheses.map(
-      (h) => h.scientific_ranking?.evaluation_tier || h.latest_evaluation?.tier || 'unknown',
+      (h) => (h.scientific_ranking || h.ranking)?.evaluation_tier || h.latest_evaluation?.tier || 'unknown',
     ),
   );
   const datasetVersions = new Set(
@@ -37,12 +39,15 @@ export function HypothesisComparisonModal({
       }}
     >
       <div
+        ref={containerRef}
+        tabIndex={-1}
         className="dialog dialog--large"
         style={{ width: 'min(100%, 64rem)', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
       >
+
         <p className="volume-label">Scientific Assessment</p>
         <h2 className="dialog__title" id={titleId}>
           Side-by-Side Candidate Comparison ({hypotheses.length})
@@ -132,7 +137,7 @@ export function HypothesisComparisonModal({
               <tr style={{ background: 'rgba(201, 169, 98, 0.05)' }}>
                 <th scope="row">Within-Cohort Rank</th>
                 {hypotheses.map((h) => {
-                  const rank = h.scientific_ranking?.within_cohort_rank;
+                  const rank = (h.scientific_ranking || h.ranking)?.within_cohort_rank;
                   return (
                     <td key={h.hypothesis_id}>
                       <strong>{rank !== null && rank !== undefined ? `#${rank}` : UNAVAILABLE}</strong>
@@ -144,7 +149,7 @@ export function HypothesisComparisonModal({
               <tr>
                 <th scope="row">Plausibility Status</th>
                 {hypotheses.map((h) => {
-                  const status = h.scientific_ranking?.plausibility_status;
+                  const status = (h.scientific_ranking || h.ranking)?.plausibility_status;
                   return (
                     <td key={h.hypothesis_id}>
                       {status ? (
@@ -163,9 +168,10 @@ export function HypothesisComparisonModal({
                 <th scope="row">Evaluation Tier</th>
                 {hypotheses.map((h) => (
                   <td key={h.hypothesis_id}>
-                    <code>{h.scientific_ranking?.evaluation_tier || UNAVAILABLE}</code>
+                    <code>{(h.scientific_ranking || h.ranking)?.evaluation_tier || UNAVAILABLE}</code>
                   </td>
                 ))}
+
               </tr>
 
               <tr>
