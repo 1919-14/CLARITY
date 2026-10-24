@@ -95,22 +95,13 @@ export function BenchmarksPage() {
     if (!item) return 'none';
     const status = item.status || item.evaluation_status || item.accuracy?.evaluation_status;
     if (status) return status;
-    if (item.executed_at && (item.hit_at_1 !== undefined || item.reciprocal_rank !== undefined)) {
-      return 'completed';
-    }
     return 'unknown';
   }
 
   function isEvaluationSuccessful(item) {
     if (!item) return false;
     const status = getEvaluationStatus(item);
-    if (status === 'failed' || status === 'unknown' || status === 'error' || status === 'none' || status === 'cancelled') {
-      return false;
-    }
-    if (status === 'completed' || status === 'target_reached') {
-      return true;
-    }
-    return false;
+    return status === 'completed' || status === 'target_reached';
   }
 
   // Combine historical measurements and run benchmarks to find latest attempted and latest successful

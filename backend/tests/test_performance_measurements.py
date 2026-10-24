@@ -1121,3 +1121,6 @@ class TestPerformanceMeasurementApi:
         assert list_resp.status_code == 200
         list_data = list_resp.get_json()
         assert list_data["count"] >= 1
+        for item in list_data["measurements"]:
+            assert "status" in item
+            assert item["status"] in ("completed", "failed", "unknown", "target_reached")

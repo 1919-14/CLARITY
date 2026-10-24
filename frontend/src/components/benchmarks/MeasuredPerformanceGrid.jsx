@@ -43,10 +43,17 @@ export function MeasuredPerformanceGrid({
   const rmseVal = accuracy?.held_out_rmse?.value ?? benchmarkResult?.held_out_rmse;
 
   // 4. Queries-to-success
-  const queriesExecuted = efficiency?.queries_executed ?? benchmarkResult?.queries_executed ?? benchmarkResult?.queries_to_target;
+  const queriesExecuted = efficiency?.queries_executed ?? benchmarkResult?.queries_executed;
   const queryBudget = efficiency?.query_budget ?? benchmarkResult?.query_budget ?? benchmarkResult?.max_query_budget;
   const queriesToTarget = efficiency?.queries_to_target ?? benchmarkResult?.queries_to_target;
-  const targetReached = efficiency?.target_reached ?? (queriesToTarget !== null && queriesToTarget !== undefined);
+  const targetReached =
+    typeof efficiency?.target_reached === 'boolean'
+      ? efficiency.target_reached
+      : typeof benchmarkResult?.target_reached === 'boolean'
+      ? benchmarkResult.target_reached
+      : queriesToTarget !== null && queriesToTarget !== undefined
+      ? true
+      : null;
   const successThreshold = efficiency?.success_threshold ?? benchmarkResult?.success_threshold;
 
   // 5. Complexity & Uncertainty
@@ -62,7 +69,7 @@ export function MeasuredPerformanceGrid({
   const localProcessingMs = runtime?.local_processing_ms;
 
   const evalStatus = measurement?.accuracy?.evaluation_status || benchmarkResult?.status || benchmarkResult?.evaluation_status;
-  const isEvaluated = Boolean((measurement || benchmarkResult) && evalStatus !== 'not_evaluated');
+  const isEvaluated = Boolean((measurement || benchmarkResult) && evalStatus !== 'not_evaluated' && evalStatus !== 'unknown');
   const isFailed = evalStatus === 'failed' || evalStatus === 'error';
 
   return (
@@ -201,13 +208,17 @@ export function MeasuredPerformanceGrid({
 
             <p className="muted" style={{ fontSize: '0.82rem', margin: 0 }}>
               Number of oracle queries required before a hypothesis satisfied the predefined scientific accuracy target.
-              {targetReached ? (
+              {targetReached === true ? (
                 <span style={{ color: 'var(--color-success)', display: 'block', marginTop: 'var(--space-1)' }}>
                   ✓ Target reached within query budget.
                 </span>
-              ) : (
+              ) : targetReached === false ? (
                 <span style={{ color: 'var(--color-warning)', display: 'block', marginTop: 'var(--space-1)' }}>
                   Target not reached within budget ceiling.
+                </span>
+              ) : (
+                <span className="muted" style={{ display: 'block', marginTop: 'var(--space-1)' }}>
+                  Target outcome unmeasured.
                 </span>
               )}
             </p>

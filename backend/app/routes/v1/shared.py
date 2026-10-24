@@ -203,6 +203,17 @@ def serialize_report(report: ReportModel) -> Dict[str, Any]:
 
 
 def serialize_benchmark(b: BenchmarkResultModel) -> Dict[str, Any]:
+    meta = b.execution_metadata or {}
+    status = meta.get("status") or meta.get("evaluation_status")
+    if not status:
+        if meta.get("error") or meta.get("failure_reason"):
+            status = "failed"
+        elif "metric_comparisons" in meta or "active_aggregates" in meta or "accuracy" in meta or "active_stats" in meta:
+            status = "completed"
+        elif b.queries_to_target is not None:
+            status = "completed"
+        else:
+            status = "unknown"
     return {
         "benchmark_id": b.benchmark_id,
         "run_id": b.run_id,
@@ -218,6 +229,7 @@ def serialize_benchmark(b: BenchmarkResultModel) -> Dict[str, Any]:
         "held_out_rmse": b.held_out_rmse,
         "baseline_type": b.baseline_type,
         "efficiency_gain": b.efficiency_gain,
+        "status": status,
         "executed_at": b.executed_at.isoformat() if b.executed_at else None,
     }
 

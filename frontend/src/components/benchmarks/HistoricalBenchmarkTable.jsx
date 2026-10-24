@@ -25,7 +25,7 @@ export function HistoricalBenchmarkTable({
     const sc = r.scenario_id || r.benchmark_name || '';
     if (scenarioFilter && sc !== scenarioFilter) return false;
 
-    const st = r.status || r.evaluation_status || r.accuracy?.evaluation_status || (r.has_measurements ? 'completed' : 'unknown');
+    const st = r.status || r.evaluation_status || r.accuracy?.evaluation_status || 'unknown';
     if (statusFilter !== 'all' && st !== statusFilter) return false;
 
     return true;
@@ -123,7 +123,7 @@ export function HistoricalBenchmarkTable({
                 const mrr = item.reciprocal_rank !== undefined ? item.reciprocal_rank : item.accuracy?.mrr?.value;
                 const mae = item.held_out_mae !== undefined ? item.held_out_mae : item.accuracy?.held_out_mae?.value;
                 const gain = item.efficiency_gain || item.efficiency_gain_ratio;
-                const status = item.status || item.evaluation_status || item.accuracy?.evaluation_status || (item.has_measurements ? 'completed' : 'unknown');
+                const status = item.status || item.evaluation_status || item.accuracy?.evaluation_status || 'unknown';
                 const executedAt = item.executed_at || item.timestamp;
 
                 return (

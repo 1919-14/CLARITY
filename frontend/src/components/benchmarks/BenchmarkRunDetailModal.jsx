@@ -36,7 +36,7 @@ export function BenchmarkRunDetailModal({
   const runId = runItem.run_id || UNAVAILABLE;
   const scenarioId = runItem.scenario_id || runItem.benchmark_name || 'unspecified';
   const timestamp = runItem.executed_at || runItem.timestamp;
-  const status = runItem.status || runItem.evaluation_status || runItem.accuracy?.evaluation_status || (runItem.has_measurements ? 'completed' : 'unknown');
+  const status = runItem.status || runItem.evaluation_status || runItem.accuracy?.evaluation_status || 'unknown';
 
   return (
     <div

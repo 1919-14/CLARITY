@@ -19,7 +19,7 @@ export function BenchmarkStatusBanner({
   isLoading = false,
 }) {
   const attemptedStatus = latestAttempted
-    ? latestAttempted.status || latestAttempted.evaluation_status || latestAttempted.accuracy?.evaluation_status || (latestAttempted.has_measurements ? 'completed' : 'unknown')
+    ? latestAttempted.status || latestAttempted.evaluation_status || latestAttempted.accuracy?.evaluation_status || 'unknown'
     : 'none';
   const isLatestFailed = attemptedStatus === 'failed' || attemptedStatus === 'error';
   const isLatestCompleted = attemptedStatus === 'completed' || attemptedStatus === 'target_reached';

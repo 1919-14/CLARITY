@@ -446,5 +446,108 @@ describe('Agent Performance & Scientific Benchmarks Page', () => {
     // Ensure '1.0.0' is NOT shown when unsupplied
     expect(screen.queryByText('1.0.0')).not.toBeInTheDocument();
   });
+
+  it('does not fall back queries_executed to queries_to_target and renders absent target outcome as unmeasured rather than failure', async () => {
+    // API payload where queries_to_target is known, but queries_executed and target_reached are not supplied
+    const benchmarkWithOnlyQueriesToTarget = {
+      benchmark_id: 'bm-queries-contract',
+      scenario_id: 'linear_polynomial',
+      run_id: 'run-alpha-42',
+      has_measurements: true,
+      status: 'completed',
+      hit_at_1: true,
+      reciprocal_rank: 1.0,
+      queries_to_target: 7,
+      // Note: queries_executed is absent
+      // Note: target_reached is absent
+      max_query_budget: 15,
+      executed_at: '2026-10-24T12:00:00Z',
+    };
+
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: [benchmarkWithOnlyQueriesToTarget],
+      count: 1,
+    });
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: [benchmarkWithOnlyQueriesToTarget],
+      count: 1,
+    });
+
+    renderPage('/benchmarks?run=run-alpha-42');
+
+    expect(await screen.findByText('Queries-to-Success')).toBeInTheDocument();
+    // queries_to_target should be 7
+    expect(screen.getByText('7')).toBeInTheDocument();
+    // queries_executed must NOT fall back to 7; it should display 'Executed: Unavailable'
+    expect(
+      screen.getAllByText((content, node) => Boolean(node?.textContent?.includes('Executed: Unavailable'))).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/Executed:\s*7/i)).not.toBeInTheDocument();
+
+    // Now test absent target outcome when queries_to_target is null and target_reached is absent
+    const unmeasuredTargetBenchmark = {
+      benchmark_id: 'bm-unmeasured-target',
+      scenario_id: 'linear_polynomial',
+      run_id: 'run-alpha-42',
+      has_measurements: true,
+      status: 'completed',
+      hit_at_1: false,
+      reciprocal_rank: 0.0,
+      queries_to_target: null,
+      target_reached: undefined,
+      max_query_budget: 15,
+      executed_at: '2026-10-24T12:00:00Z',
+    };
+
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: [unmeasuredTargetBenchmark],
+      count: 1,
+    });
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: [unmeasuredTargetBenchmark],
+      count: 1,
+    });
+
+    renderPage('/benchmarks?run=run-alpha-42');
+
+    // Must render "Target outcome unmeasured.", NOT "Target not reached within budget ceiling."
+    expect(await screen.findByText('Target outcome unmeasured.')).toBeInTheDocument();
+    expect(screen.queryByText(/Target not reached within budget ceiling/i)).not.toBeInTheDocument();
+  });
+
+  it('does not infer completed status when record has fields present but status is missing or unknown', async () => {
+    // Record with DB default fields (hit_at_1: false, reciprocal_rank: 0.0, executed_at present)
+    // but without an explicit completed status
+    const recordWithoutStatus = {
+      benchmark_id: 'bm-no-status',
+      scenario_id: 'linear_polynomial',
+      run_id: 'run-alpha-42',
+      hit_at_1: false,
+      reciprocal_rank: 0.0,
+      executed_at: '2026-10-24T12:00:00Z',
+      has_measurements: true,
+      // status is omitted/undefined
+    };
+
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: [recordWithoutStatus],
+      count: 1,
+    });
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: [recordWithoutStatus],
+      count: 1,
+    });
+
+    renderPage();
+
+    // Latest attempted status must be 'unknown', NOT 'completed'
+    expect(await screen.findByText('Latest Attempted Evaluation')).toBeInTheDocument();
+    const unknownBadges = screen.getAllByText('unknown');
+    expect(unknownBadges.length).toBeGreaterThan(0);
+    expect(unknownBadges[0]).toHaveClass('badge--neutral');
+
+    // Must NOT be selected as Latest Successful Evaluation
+    expect(screen.getByText(/No completed benchmark evaluations recorded yet/i)).toBeInTheDocument();
+  });
 });
 
