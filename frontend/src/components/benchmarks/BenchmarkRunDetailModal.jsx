@@ -8,6 +8,13 @@ import {
 } from '../../utils/formatting.js';
 import { CheckCircleIcon, CloseIcon, InfoIcon, ShieldIcon } from '../icons.jsx';
 
+function formatHitRate(val, digits = 2) {
+  if (val === true) return (1.0).toFixed(digits);
+  if (val === false) return (0.0).toFixed(digits);
+  if (typeof val === 'number') return formatDecimal(val, digits);
+  return UNAVAILABLE;
+}
+
 export function BenchmarkRunDetailModal({
   open,
   runItem,
@@ -29,7 +36,7 @@ export function BenchmarkRunDetailModal({
   const runId = runItem.run_id || UNAVAILABLE;
   const scenarioId = runItem.scenario_id || runItem.benchmark_name || 'unspecified';
   const timestamp = runItem.executed_at || runItem.timestamp;
-  const status = runItem.status || runItem.evaluation_status || 'completed';
+  const status = runItem.status || runItem.evaluation_status || runItem.accuracy?.evaluation_status || (runItem.has_measurements ? 'completed' : 'unknown');
 
   return (
     <div
@@ -52,7 +59,7 @@ export function BenchmarkRunDetailModal({
             <p className="volume-label">Benchmark Run Ledger & Provenance</p>
             <h2 className="dialog__title" id={titleId} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', margin: 0 }}>
               <code className="id-text" style={{ fontSize: '1.3rem' }}>{benchmarkId}</code>
-              <span className={`badge badge--${status === 'completed' || status === 'target_reached' ? 'success' : 'neutral'}`}>
+              <span className={`badge badge--${status === 'completed' || status === 'target_reached' ? 'success' : status === 'failed' ? 'danger' : 'neutral'}`}>
                 {status}
               </span>
             </h2>
@@ -82,7 +89,8 @@ export function BenchmarkRunDetailModal({
               <div>
                 <span className="stat__label">Scenario & Version</span>
                 <span className="stat__value" style={{ fontSize: '1rem', display: 'block' }}>
-                  <strong>{scenarioId}</strong> (v{runItem.scenario_version || '1.0.0'})
+                  <strong>{scenarioId}</strong>
+                  {runItem.scenario_version || runItem.version ? ` (v${runItem.scenario_version || runItem.version})` : ''}
                 </span>
               </div>
 
@@ -96,7 +104,9 @@ export function BenchmarkRunDetailModal({
               <div>
                 <span className="stat__label">Metric Definitions Version</span>
                 <span className="stat__value" style={{ fontSize: '0.9rem', display: 'block' }}>
-                  v{runItem.measurement_method_version || '1.0.0'}
+                  {runItem.metric_definition_version || runItem.measurement_method_version || accuracy.benchmark_version
+                    ? `v${runItem.metric_definition_version || runItem.measurement_method_version || accuracy.benchmark_version}`
+                    : UNAVAILABLE}
                 </span>
               </div>
             </div>
@@ -108,15 +118,15 @@ export function BenchmarkRunDetailModal({
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 'var(--space-3)', marginTop: 'var(--space-2)' }}>
               <div className="stat">
                 <span className="stat__label">Hit@1</span>
-                <span className="stat__value">{formatDecimal(accuracy.hit_at_1?.value ?? runItem.hit_at_1, 2)}</span>
+                <span className="stat__value">{formatHitRate(accuracy.hit_at_1?.value ?? runItem.hit_at_1, 2)}</span>
               </div>
               <div className="stat">
                 <span className="stat__label">Hit@3</span>
-                <span className="stat__value">{formatDecimal(accuracy.hit_at_3?.value ?? runItem.hit_at_3, 2)}</span>
+                <span className="stat__value">{formatHitRate(accuracy.hit_at_3?.value ?? runItem.hit_at_3, 2)}</span>
               </div>
               <div className="stat">
                 <span className="stat__label">Hit@5</span>
-                <span className="stat__value">{formatDecimal(accuracy.hit_at_5?.value ?? runItem.hit_at_5, 2)}</span>
+                <span className="stat__value">{formatHitRate(accuracy.hit_at_5?.value ?? runItem.hit_at_5, 2)}</span>
               </div>
               <div className="stat">
                 <span className="stat__label">MRR</span>

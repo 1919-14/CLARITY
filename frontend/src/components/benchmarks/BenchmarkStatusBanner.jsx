@@ -18,7 +18,11 @@ export function BenchmarkStatusBanner({
   onRefresh,
   isLoading = false,
 }) {
-  const isLatestFailed = latestAttempted && latestSuccessful && latestAttempted.benchmark_id !== latestSuccessful.benchmark_id;
+  const attemptedStatus = latestAttempted
+    ? latestAttempted.status || latestAttempted.evaluation_status || latestAttempted.accuracy?.evaluation_status || (latestAttempted.has_measurements ? 'completed' : 'unknown')
+    : 'none';
+  const isLatestFailed = attemptedStatus === 'failed' || attemptedStatus === 'error';
+  const isLatestCompleted = attemptedStatus === 'completed' || attemptedStatus === 'target_reached';
   const isNeverEvaluated = !latestSuccessful && !latestAttempted;
 
   return (
@@ -85,8 +89,8 @@ export function BenchmarkStatusBanner({
           </div>
           <div className="stat__value" style={{ fontSize: '1.25rem', margin: 'var(--space-1) 0' }}>
             {latestAttempted ? (
-              <span className={`badge badge--${isLatestFailed ? 'danger' : 'neutral'}`}>
-                {latestAttempted.scenario_id || latestAttempted.benchmark_name}
+              <span className={`badge badge--${isLatestFailed ? 'danger' : isLatestCompleted ? 'success' : 'neutral'}`}>
+                {latestAttempted.scenario_id || latestAttempted.benchmark_name || 'unspecified'}
               </span>
             ) : (
               <span className="badge badge--neutral">None</span>
@@ -95,9 +99,11 @@ export function BenchmarkStatusBanner({
           <div className="stat__hint muted" style={{ fontSize: '0.8rem' }}>
             {latestAttempted ? (
               <>
-                Status: <strong>{latestAttempted.status || (isLatestFailed ? 'Failed/Incomplete' : 'Completed')}</strong>
+                Status: <span className={`badge badge--${isLatestFailed ? 'danger' : isLatestCompleted ? 'success' : 'neutral'}`} style={{ fontSize: '0.72rem', padding: '0.1rem 0.4rem' }}>{attemptedStatus}</span>
                 <br />
-                {formatDateTime(latestAttempted.executed_at || latestAttempted.timestamp)}
+                {latestAttempted.executed_at || latestAttempted.timestamp
+                  ? formatDateTime(latestAttempted.executed_at || latestAttempted.timestamp)
+                  : UNAVAILABLE}
               </>
             ) : (
               'No evaluation attempts initiated'

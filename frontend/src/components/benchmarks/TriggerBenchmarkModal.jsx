@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap.js';
 import { Field } from '../forms/Field.jsx';
 import { CloseIcon, PlayIcon } from '../icons.jsx';
@@ -14,10 +14,16 @@ export function TriggerBenchmarkModal({
   const titleId = useId();
   const containerRef = useModalFocusTrap({ open, onClose, busy });
 
-  const [scenarioId, setScenarioId] = useState(scenarios[0]?.scenario_id || 'polynomial_constant_benchmark');
+  const [scenarioId, setScenarioId] = useState(scenarios[0]?.scenario_id || '');
   const [seeds, setSeeds] = useState('42');
   const [maxBudget, setMaxBudget] = useState('10');
   const [clientErrors, setClientErrors] = useState({});
+
+  useEffect(() => {
+    if (!scenarioId && scenarios.length > 0) {
+      setScenarioId(scenarios[0].scenario_id);
+    }
+  }, [scenarios, scenarioId]);
 
   if (!open) return null;
 
@@ -113,8 +119,9 @@ export function TriggerBenchmarkModal({
               className="select"
               value={scenarioId}
               onChange={(e) => setScenarioId(e.target.value)}
-              disabled={busy}
+              disabled={busy || scenarios.length === 0}
             >
+              {scenarios.length === 0 && <option value="">No scenarios available</option>}
               {scenarios.map((s) => (
                 <option key={s.scenario_id} value={s.scenario_id}>
                   {s.scenario_id} ({s.challenge_type})

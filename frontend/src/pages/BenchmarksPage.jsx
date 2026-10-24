@@ -30,6 +30,13 @@ import {
   UNAVAILABLE,
 } from '../utils/formatting.js';
 
+function formatHitRate(val, digits = 2) {
+  if (val === true) return (1.0).toFixed(digits);
+  if (val === false) return (0.0).toFixed(digits);
+  if (typeof val === 'number') return formatDecimal(val, digits);
+  return UNAVAILABLE;
+}
+
 export function BenchmarksPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { runs, isLoading: runsLoading, error: runsError, reload: reloadRuns } = useRuns({ limit: 50 });
@@ -59,15 +66,7 @@ export function BenchmarksPage() {
 
   // 2. Measurements History Resource
   const measurementsLoader = useCallback(
-    ({ signal }) => {
-      if (typeof listPerformanceMeasurements !== 'function') {
-        return Promise.resolve({ measurements: [], count: 0 });
-      }
-      return listPerformanceMeasurements({ scenarioId: selectedScenario || null, limit: 50, signal }).catch(() => ({
-        measurements: [],
-        count: 0,
-      }));
-    },
+    ({ signal }) => listPerformanceMeasurements({ scenarioId: selectedScenario || null, limit: 50, signal }),
     [selectedScenario],
   );
   const {
@@ -91,12 +90,48 @@ export function BenchmarksPage() {
   const historicalMeasurements = measurementsData?.measurements ?? [];
   const runBenchmarks = resultData?.benchmarks ?? [];
 
-  // Determine latest successful and attempted evaluations
-  const latestSuccessful = historicalMeasurements.find((m) => m.has_measurements || m.hit_at_1 !== undefined) || runBenchmarks[0] || null;
-  const latestAttempted = historicalMeasurements[0] || runBenchmarks[0] || null;
+  // Helper to determine evaluation status from a benchmark or measurement record
+  function getEvaluationStatus(item) {
+    if (!item) return 'none';
+    const status = item.status || item.evaluation_status || item.accuracy?.evaluation_status;
+    if (status) return status;
+    if (item.executed_at && (item.hit_at_1 !== undefined || item.reciprocal_rank !== undefined)) {
+      return 'completed';
+    }
+    return 'unknown';
+  }
 
-  // Selected measurement / benchmark for current performance display
-  const activeBenchmarkResult = runBenchmarks[0] || historicalMeasurements[0] || null;
+  function isEvaluationSuccessful(item) {
+    if (!item) return false;
+    const status = getEvaluationStatus(item);
+    if (status === 'failed' || status === 'unknown' || status === 'error' || status === 'none' || status === 'cancelled') {
+      return false;
+    }
+    if (status === 'completed' || status === 'target_reached') {
+      return true;
+    }
+    return false;
+  }
+
+  // Combine historical measurements and run benchmarks to find latest attempted and latest successful
+  const allRuns = [...historicalMeasurements, ...runBenchmarks];
+  const sortedRuns = [...allRuns].sort((a, b) => {
+    const timeA = new Date(a.executed_at || a.timestamp || 0).getTime();
+    const timeB = new Date(b.executed_at || b.timestamp || 0).getTime();
+    return timeB - timeA;
+  });
+
+  const latestAttempted = sortedRuns[0] || null;
+  const latestSuccessful = sortedRuns.find(isEvaluationSuccessful) || null;
+
+  // Selected measurement / benchmark for current performance display:
+  // Prefer the run-specific benchmark if available, or latest successful, or latest attempted
+  const activeBenchmarkResult =
+    runBenchmarks.find(isEvaluationSuccessful) ||
+    runBenchmarks[0] ||
+    latestSuccessful ||
+    latestAttempted ||
+    null;
 
   const changeRun = (nextRunId) => {
     setSelectedRunId(nextRunId);
@@ -180,7 +215,7 @@ export function BenchmarksPage() {
       <ActiveBaselineComparison
         comparisonReport={liveComparison?.report || null}
         comparisonSummary={liveComparison || (activeBenchmarkResult?.baseline_type ? activeBenchmarkResult : null)}
-        scenarioName={selectedScenario || activeBenchmarkResult?.scenario_id || 'linear_polynomial'}
+        scenarioName={selectedScenario || activeBenchmarkResult?.scenario_id || activeBenchmarkResult?.benchmark_name || null}
       />
 
       {/* 4. Metric Definitions and Technical Interpretation Guide */}
@@ -190,6 +225,9 @@ export function BenchmarksPage() {
       <HistoricalBenchmarkTable
         runs={historicalMeasurements}
         scenarios={scenarios}
+        isLoading={measurementsLoading}
+        error={measurementsError}
+        onRetry={reloadMeasurements}
         onInspectRun={(item) => setInspectedRun(item)}
       />
 
@@ -326,8 +364,8 @@ export function BenchmarksPage() {
                     </td>
                     <td data-label="Scenario">{result.benchmark_name}</td>
                     <td data-label="Hit@1 / Hit@3 / Hit@5">
-                      {formatDecimal(result.hit_at_1, 2)} / {formatDecimal(result.hit_at_3, 2)} /{' '}
-                      {formatDecimal(result.hit_at_5, 2)}
+                      {formatHitRate(result.hit_at_1)} / {formatHitRate(result.hit_at_3)} /{' '}
+                      {formatHitRate(result.hit_at_5)}
                     </td>
                     <td data-label="Reciprocal rank">{formatDecimal(result.reciprocal_rank)}</td>
                     <td data-label="Held-out error">

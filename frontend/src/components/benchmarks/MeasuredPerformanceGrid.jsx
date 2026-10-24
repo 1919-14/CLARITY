@@ -25,9 +25,12 @@ export function MeasuredPerformanceGrid({
   const cost = measurement?.cost;
 
   // 1. Hit@K
-  const hit1 = accuracy?.hit_at_1?.value ?? benchmarkResult?.hit_at_1;
-  const hit3 = accuracy?.hit_at_3?.value ?? benchmarkResult?.hit_at_3;
-  const hit5 = accuracy?.hit_at_5?.value ?? benchmarkResult?.hit_at_5;
+  const rawHit1 = accuracy?.hit_at_1?.value ?? benchmarkResult?.hit_at_1;
+  const rawHit3 = accuracy?.hit_at_3?.value ?? benchmarkResult?.hit_at_3;
+  const rawHit5 = accuracy?.hit_at_5?.value ?? benchmarkResult?.hit_at_5;
+  const hit1 = rawHit1 === true ? 1.0 : rawHit1 === false ? 0.0 : rawHit1;
+  const hit3 = rawHit3 === true ? 1.0 : rawHit3 === false ? 0.0 : rawHit3;
+  const hit5 = rawHit5 === true ? 1.0 : rawHit5 === false ? 0.0 : rawHit5;
   const selectedHitVal = selectedK === '1' ? hit1 : selectedK === '3' ? hit3 : hit5;
   const hitSampleCount = accuracy?.hit_at_1?.sample_count ?? benchmarkResult?.sample_count ?? benchmarkResult?.evaluated_case_count ?? 0;
 
@@ -58,7 +61,9 @@ export function MeasuredPerformanceGrid({
   const wallClockMs = runtime?.total_wall_clock_ms ?? benchmarkResult?.duration_ms;
   const localProcessingMs = runtime?.local_processing_ms;
 
-  const isEvaluated = Boolean(measurement || benchmarkResult);
+  const evalStatus = measurement?.accuracy?.evaluation_status || benchmarkResult?.status || benchmarkResult?.evaluation_status;
+  const isEvaluated = Boolean((measurement || benchmarkResult) && evalStatus !== 'not_evaluated');
+  const isFailed = evalStatus === 'failed' || evalStatus === 'error';
 
   return (
     <section className="panel" aria-labelledby="measured-performance-heading">
@@ -67,9 +72,11 @@ export function MeasuredPerformanceGrid({
           <p className="volume-label">Empirical Discovery Metrics</p>
           <h2 id="measured-performance-heading" className="panel__title">Current Measured Performance</h2>
         </div>
-        {!isEvaluated && (
+        {isFailed ? (
+          <span className="badge badge--danger">Evaluation failed</span>
+        ) : !isEvaluated ? (
           <span className="badge badge--neutral">Not evaluated</span>
-        )}
+        ) : null}
       </div>
 
       <p className="panel-lead muted" style={{ fontSize: '0.9rem', marginBottom: 'var(--space-4)' }}>
@@ -207,7 +214,7 @@ export function MeasuredPerformanceGrid({
           </div>
 
           <div style={{ borderTop: 'var(--border-hairline)', paddingTop: 'var(--space-2)', marginTop: 'var(--space-3)', fontSize: '0.78rem' }} className="muted">
-            Success Threshold: <strong>{successThreshold !== undefined ? `MAE ≤ ${successThreshold}` : 'MAE ≤ 0.05'}</strong> · Executed: <strong>{queriesExecuted ?? UNAVAILABLE}</strong>
+            Success Threshold: <strong>{successThreshold !== undefined && successThreshold !== null ? `MAE ≤ ${successThreshold}` : UNAVAILABLE}</strong> · Executed: <strong>{queriesExecuted ?? UNAVAILABLE}</strong>
           </div>
         </div>
 

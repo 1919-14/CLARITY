@@ -319,4 +319,132 @@ describe('Agent Performance & Scientific Benchmarks Page', () => {
     expect(await screen.findByText('Scenarios could not be retrieved')).toBeInTheDocument();
     expect(screen.getByText(/Backend connection refused/i)).toBeInTheDocument();
   });
+
+  it('renders ErrorState in HistoricalBenchmarkTable when measurements request fails', async () => {
+    listPerformanceMeasurements.mockRejectedValue(new Error('500 Internal Server Error: database connection timeout'));
+    renderPage();
+
+    expect(await screen.findByText(/Historical benchmark runs could not be loaded/i)).toBeInTheDocument();
+    expect(screen.getByText(/500 Internal Server Error/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Try again|Retry/i })).toBeInTheDocument();
+    // It must NOT show the empty state
+    expect(screen.queryByText(/No historical benchmark runs/i)).not.toBeInTheDocument();
+  });
+
+  it('correctly handles actual backend response shape with boolean hit_at_1/3/5 values', async () => {
+    // Real BenchmarkResultModel shape returned by backend serialize_benchmark
+    const realBackendBenchmark = {
+      benchmark_id: 'bm-real-backend-001',
+      run_id: 'run-alpha-42',
+      benchmark_name: 'polynomial_constant_benchmark',
+      hit_at_1: true,
+      hit_at_3: true,
+      hit_at_5: false,
+      reciprocal_rank: 1.0,
+      held_out_mae: 0.0123,
+      held_out_rmse: 0.0245,
+      queries_to_target: 4,
+      baseline_type: 'random_uniform',
+      efficiency_gain: 0.65,
+      executed_at: '2026-10-24T18:00:00Z',
+      has_measurements: true,
+      status: 'completed',
+    };
+
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: [realBackendBenchmark],
+      count: 1,
+    });
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: [realBackendBenchmark],
+      count: 1,
+    });
+
+    renderPage('/benchmarks?run=run-alpha-42');
+
+    // Boolean hit_at_1: true must format to 1.000, NOT 'Unavailable'
+    expect(await screen.findByText('Hit@K Discovery Recall')).toBeInTheDocument();
+    expect(screen.getByText('1.000')).toBeInTheDocument();
+
+    // In the ledger
+    expect(screen.getAllByText('polynomial_constant_benchmark').length).toBeGreaterThan(0);
+    // Boolean hit_at_1 should display in ledger as 1.00 or 1.000
+    expect(screen.getAllByText('1.00').length).toBeGreaterThan(0);
+  });
+
+  it('never displays failed or unknown evaluations as completed or successful', async () => {
+    const failedOnlyList = [
+      {
+        benchmark_id: 'bm-only-failed',
+        scenario_id: 'linear_polynomial',
+        run_id: 'run-alpha-42',
+        has_measurements: false,
+        status: 'failed',
+        executed_at: '2026-10-24T15:00:00Z',
+      },
+    ];
+
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: failedOnlyList,
+      count: 1,
+    });
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: failedOnlyList,
+      count: 1,
+    });
+
+    renderPage();
+
+    // Banner should show latest attempted status as failed with danger badge
+    expect(await screen.findByText('Latest Attempted Evaluation')).toBeInTheDocument();
+    const statusBadges = screen.getAllByText('failed');
+    expect(statusBadges.length).toBeGreaterThan(0);
+    expect(statusBadges[0]).toHaveClass('badge--danger');
+
+    // "Latest Successful Evaluation" must NOT display bm-only-failed as successful
+    expect(screen.getByText(/No completed benchmark evaluations recorded yet/i)).toBeInTheDocument();
+  });
+
+  it('renders Unavailable when provenance metadata is not supplied by the API', async () => {
+    const bareMeasurement = {
+      benchmark_id: 'bm-bare-001',
+      scenario_id: 'linear_polynomial',
+      run_id: 'run-alpha-42',
+      has_measurements: true,
+      status: 'completed',
+      hit_at_1: 1.0,
+      executed_at: '2026-10-24T12:00:00Z',
+      // None of the versions or thresholds are provided:
+      metric_definition_version: undefined,
+      dataset_version: undefined,
+      execution_mode: undefined,
+      success_threshold: undefined,
+    };
+
+    listPerformanceMeasurements.mockResolvedValue({
+      measurements: [bareMeasurement],
+      count: 1,
+    });
+    getRunBenchmarks.mockResolvedValue({
+      benchmarks: [bareMeasurement],
+      count: 1,
+    });
+
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText('Historical Benchmark Runs')).toBeInTheDocument();
+
+    // Inspect the run
+    const inspectBtn = screen.getByRole('button', { name: /Inspect/i });
+    await user.click(inspectBtn);
+
+    // In modal: versions should be 'Unavailable', not hardcoded '1.0.0'
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    const unavailables = screen.getAllByText('Unavailable');
+    expect(unavailables.length).toBeGreaterThan(0);
+    // Ensure '1.0.0' is NOT shown when unsupplied
+    expect(screen.queryByText('1.0.0')).not.toBeInTheDocument();
+  });
 });
+

@@ -6,11 +6,16 @@ import {
   UNAVAILABLE,
 } from '../../utils/formatting.js';
 import { EmptyState } from '../feedback/EmptyState.jsx';
+import { ErrorState } from '../feedback/ErrorState.jsx';
+import { LoadingState } from '../feedback/LoadingState.jsx';
 import { EyeIcon } from '../icons.jsx';
 
 export function HistoricalBenchmarkTable({
   runs = [],
   scenarios = [],
+  isLoading = false,
+  error = null,
+  onRetry,
   onInspectRun,
 }) {
   const [scenarioFilter, setScenarioFilter] = useState('');
@@ -20,7 +25,7 @@ export function HistoricalBenchmarkTable({
     const sc = r.scenario_id || r.benchmark_name || '';
     if (scenarioFilter && sc !== scenarioFilter) return false;
 
-    const st = r.status || r.evaluation_status || 'completed';
+    const st = r.status || r.evaluation_status || r.accuracy?.evaluation_status || (r.has_measurements ? 'completed' : 'unknown');
     if (statusFilter !== 'all' && st !== statusFilter) return false;
 
     return true;
@@ -68,12 +73,26 @@ export function HistoricalBenchmarkTable({
             <option value="all">All Statuses</option>
             <option value="completed">Completed only</option>
             <option value="failed">Failed only</option>
-            <option value="in_progress">In-progress only</option>
+            <option value="unknown">Unknown only</option>
           </select>
         </div>
       </div>
 
-      {filteredRuns.length === 0 ? (
+      {isLoading ? (
+        <LoadingState label="Loading historical benchmark runs…" compact />
+      ) : error ? (
+        <ErrorState
+          title="Historical benchmark runs could not be loaded"
+          error={error}
+          onRetry={onRetry}
+          compact
+        />
+      ) : runs.length === 0 ? (
+        <EmptyState
+          title="No historical benchmark runs"
+          message="No benchmark evaluations have been recorded yet. Absence of a record is not a zero score."
+        />
+      ) : filteredRuns.length === 0 ? (
         <EmptyState
           title="No historical benchmark runs match"
           message="No benchmark executions recorded for the selected scenario or status filter. Empirical runs appear here as soon as evaluations occur."
@@ -99,11 +118,12 @@ export function HistoricalBenchmarkTable({
               {filteredRuns.map((item) => {
                 const bId = item.benchmark_id || item.measurement_id || 'unspecified';
                 const scenario = item.scenario_id || item.benchmark_name;
-                const hit1 = item.hit_at_1 !== undefined ? item.hit_at_1 : item.accuracy?.hit_at_1?.value;
+                const rawHit1 = item.hit_at_1 !== undefined ? item.hit_at_1 : item.accuracy?.hit_at_1?.value;
+                const hit1 = rawHit1 === true ? 1.0 : rawHit1 === false ? 0.0 : rawHit1;
                 const mrr = item.reciprocal_rank !== undefined ? item.reciprocal_rank : item.accuracy?.mrr?.value;
                 const mae = item.held_out_mae !== undefined ? item.held_out_mae : item.accuracy?.held_out_mae?.value;
                 const gain = item.efficiency_gain || item.efficiency_gain_ratio;
-                const status = item.status || item.evaluation_status || 'completed';
+                const status = item.status || item.evaluation_status || item.accuracy?.evaluation_status || (item.has_measurements ? 'completed' : 'unknown');
                 const executedAt = item.executed_at || item.timestamp;
 
                 return (
