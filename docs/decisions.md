@@ -397,6 +397,55 @@ contract, null cost serialization, 409 exhaustion persistence). Full backend
 suite, Alembic upgrade/downgrade smoke test, and frontend lint/build remain
 green. See [budget-manager.md](budget-manager.md).
 
+## D-025 — Uploaded black boxes execute in-process and are probed, not inspected
+
+**Date:** 2026-10-25
+
+**Status:** Accepted
+
+**Context:** Researchers need to point CLARITY at their own simulator or trained
+model rather than the built-in polynomial oracle, so that the discovery loop can
+distil the equation their artifact's responses support. The artifacts arrive as
+Python modules, pickled estimators and ONNX graphs.
+
+**Decision:** A `.py`, `.joblib`/`.pkl`/`.pickle` or `.onnx` artifact is uploaded
+once, stored under `CLARITY_ORACLES_DIR`, and registered as a reusable oracle
+after three probe calls across the researcher's declared bounds. Registered
+artifacts are bound to runs by `oracle_id`; a bound run uses the artifact's
+bounds, variable name and entrypoint, widens candidate generation to degree 3,
+and records only what the artifact answered. Artifacts load **inside the backend
+process** — uploads are trusted code, with no sandbox, subprocess or per-query
+timeout. A run whose artifact cannot be loaded fails; it never falls back to the
+built-in simulator. A bound artifact cannot be deleted while a run references it.
+
+**Rationale:** In-process loading keeps every artifact kind on one adapter
+surface (`build_predictor`) and lets the existing `OracleInterface` carry the
+whole discovery loop unchanged. Probing on registration gives the researcher
+immediate evidence that their declaration matches their artifact, and keeps the
+stored probe honest. Bounds are researcher-owned: widening them silently would
+invent a scientific domain.
+
+**Trade-off:** Uploading an artifact is equivalent to letting it run arbitrary
+code with the backend's privileges; deployments that accept uploads must gate
+the endpoint and keep storage outside the repository. A hung artifact can stall
+the backend until the call returns, and no timeout protects it. Degree 3 costs
+one more coefficient per candidate than the historical quadratic search.
+
+**Rejected alternatives:** Sandboxing or a per-query subprocess (a much larger
+change than the feature needs, and pickled models still require importing code);
+silently substituting the built-in simulator when loading fails (would attribute
+fabricated observations to the researcher's artifact); letting CLARITY choose or
+widen the probe bounds (would fold an assumption into the observations); storing
+artifacts in the repository (uploaded code would be committed); claiming the
+recovered equation is the artifact's true formula (it is a ranking result over
+observed responses).
+
+**Validation:** `backend/tests/test_oracle_library.py` (contract validation, all
+three adapters including a real ONNX graph, registration probe, delete rules,
+and a bound run whose observations are checked against the artifact's formula);
+`backend/tests/test_oracle_library.py::TestRunOracleBinding` exercises the live
+start endpoint. See [oracle-uploads.md](oracle-uploads.md).
+
 ## Open decisions
 
 1. ~~First hypothesis representation/model family.~~ Resolved by D-013 (polynomial family) and Issue #5's extended `HypothesisRepresentation`.

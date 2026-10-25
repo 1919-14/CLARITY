@@ -53,6 +53,7 @@
     | `max_evaluations` | int | No | Maximum candidate evaluations (> 0) |
     | `max_runtime_seconds` | int | No | Timeout limit in seconds (> 0) |
     | `spend_ceiling_usd` | float | No | Spend limit in USD (>= 0.0) |
+    | `oracle_id` | string | No | Uploaded black box to query; omit for the built-in simulator |
     | `run_id` | string | No | Optional custom UUID run identifier |
   - Response (201 Created):
     ```json
@@ -336,6 +337,10 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
 | `POST` | `/api/v1/hypotheses/{hypothesis_id}/reevaluate` | Execute re-evaluation via EvaluationPipeline or enqueue (returns 200 or 202) | 200, 202, 404, 422, 500 |
 | `GET` | `/api/v1/hypotheses/{hypothesis_id}/evaluations` | Historical evaluation runs for current revision | 200, 404, 500 |
 | `GET` | `/api/v1/observations/{observation_id}` | Single observation details (no ground truth leakage) | 200, 404, 500 |
+| `GET` | `/api/v1/oracles` | List uploaded black boxes with their run counts | 200, 500 |
+| `POST` | `/api/v1/oracles` | Register an uploaded artifact (multipart/form-data) | 201, 400, 422, 500 |
+| `GET` | `/api/v1/oracles/{oracle_id}` | Retrieve one uploaded artifact and its run count | 200, 404, 500 |
+| `DELETE` | `/api/v1/oracles/{oracle_id}` | Delete an artifact no run references | 200, 404, 409, 422, 500 |
 
 ### 3.3 New Resource Endpoints in v1
 
@@ -471,6 +476,80 @@ An OpenAPI 3.0.3 machine-readable schema is provided in [docs/openapi_v1.yaml](o
       }
     }
     ```
+
+#### 3.3.3 Uploaded Black Boxes (Oracle Library)
+
+A researcher-supplied simulator or model is registered once and bound to any
+number of runs. CLARITY probes only its inputs and outputs; internals are never
+inspected. Full behavioural notes: [oracle-uploads.md](oracle-uploads.md).
+
+* **`POST /api/v1/oracles`** (`multipart/form-data`)
+  - Fields: `file` (required), `kind`, `name`, `entrypoint` (required for `.py`),
+    `input_name`, `output_name`, `min_value`, `max_value`, `actor`.
+  - Supported extensions: `.py`, `.joblib`, `.pkl`, `.pickle`, `.onnx`; 25 MiB limit.
+  - Response (201 Created):
+    ```json
+    {
+      "oracle": {
+        "oracle_id": "oracle-307db2ae0999",
+        "name": "Reactor pressure simulator",
+        "kind": "python_function",
+        "kind_label": "Python function",
+        "original_filename": "simulate.py",
+        "sha256": "7c236da0…",
+        "size_bytes": 42,
+        "entrypoint": "simulate",
+        "input_name": "x",
+        "output_name": "y",
+        "min_value": -2.0,
+        "max_value": 2.0,
+        "probe": {
+          "samples": [{"x": -2.0, "y": -5.0, "error": null}],
+          "ok_count": 3,
+          "failed_count": 0
+        },
+        "created_by": "researcher",
+        "created_at": "2026-10-25T08:56:28.041083+00:00",
+        "run_count": 0
+      }
+    }
+    ```
+  - Errors: missing or unreadable `file` → `400`; a contract that cannot be
+    built or an artifact that answers no probe input → `422` with the observed
+    probe in `details.probe`.
+
+* **`GET /api/v1/oracles`** — `{ "oracles": [...], "count": n }`, newest first.
+* **`GET /api/v1/oracles/{oracle_id}`** — one artifact; unknown id → `404`.
+* **`DELETE /api/v1/oracles/{oracle_id}`** — removes the row and the stored file;
+  `409` while any run references the artifact, so history stays reproducible.
+
+Binding a run: `POST /api/v1/runs` with an optional `oracle_id`. An unknown id is
+rejected with `422` (`details[0].field == "oracle_id"`) and no run is created.
+`GET /api/v1/runs/{run_id}` then returns an `oracle` summary next to `oracle_id`:
+
+```json
+{
+  "run": {
+    "run_id": "run-9f2c1d",
+    "oracle_id": "oracle-307db2ae0999",
+    "oracle": {
+      "oracle_id": "oracle-307db2ae0999",
+      "name": "Reactor pressure simulator",
+      "kind": "python_function",
+      "kind_label": "Python function",
+      "entrypoint": "simulate",
+      "input_name": "x",
+      "output_name": "y",
+      "min_value": -2.0,
+      "max_value": 2.0
+    }
+  }
+}
+```
+
+Uploaded artifacts execute inside the backend process, so uploads are trusted
+code: there is no sandbox or per-query timeout. A run whose artifact cannot be
+loaded fails rather than silently falling back to the built-in simulator.
 
 ### 3.4 Per-Run Budget Contract (`GET /api/v1/runs/{run_id}/budget`)
 

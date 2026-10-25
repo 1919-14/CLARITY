@@ -125,6 +125,10 @@ export async function apiRequest(path, options = {}) {
     ),
   } = options;
 
+  // Multipart uploads (artifact files) carry their own boundary in the body, so
+  // the client must not serialize them as JSON or set a Content-Type.
+  const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
+
   const controller = new AbortController();
   let timedOut = false;
   let callerAborted = false;
@@ -153,9 +157,9 @@ export async function apiRequest(path, options = {}) {
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...(body !== undefined && !isFormData ? { 'Content-Type': 'application/json' } : {}),
       },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      ...(body !== undefined ? { body: isFormData ? body : JSON.stringify(body) } : {}),
     });
   } catch (error) {
     if (timedOut) {
@@ -220,4 +224,7 @@ export const apiPost = (path, body = undefined, options = {}) =>
 
 export const apiPatch = (path, body = undefined, options = {}) =>
   apiRequest(path, { ...options, method: 'PATCH', body });
+
+export const apiDelete = (path, options = {}) =>
+  apiRequest(path, { ...options, method: 'DELETE' });
 

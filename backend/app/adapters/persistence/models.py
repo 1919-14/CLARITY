@@ -95,6 +95,14 @@ class RunModel(Base):
     budget_config_json = Column(JSON, nullable=True)
     deadline_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Researcher-supplied black box (simulator or trained model), if any. Null
+    # means the run uses the built-in local simulator.
+    oracle_id = Column(
+        String(64),
+        ForeignKey("oracle_artifacts.oracle_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -117,10 +125,46 @@ class RunModel(Base):
     audit_events = relationship("AuditEventModel", back_populates="run", passive_deletes=True)
     reports = relationship("ReportModel", back_populates="run", passive_deletes=True)
     benchmark_results = relationship("BenchmarkResultModel", back_populates="run", passive_deletes=True)
+    oracle = relationship("OracleArtifactModel", back_populates="runs")
 
     __table_args__ = (
         Index("idx_runs_status", "status"),
         Index("idx_runs_created_at", "created_at"),
+    )
+
+
+class OracleArtifactModel(Base):
+    """A researcher-supplied black box: a Python callable, a pickled model, or ONNX.
+
+    The binary lives on disk (``storage_path``, relative to the configured oracle
+    storage directory); this row is its provenance: what was uploaded, under which
+    declared contract, and what the registration probe observed. The artifact's
+    internals are never stored or inferred.
+    """
+
+    __tablename__ = "oracle_artifacts"
+
+    oracle_id = Column(String(64), primary_key=True)
+    name = Column(String(255), nullable=False)
+    kind = Column(String(32), nullable=False)  # python_function, joblib_model, onnx_model
+    original_filename = Column(String(255), nullable=False)
+    stored_filename = Column(String(255), nullable=False)
+    storage_path = Column(String(512), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    entrypoint = Column(String(128), nullable=True)
+    input_name = Column(String(64), nullable=False, default="x")
+    output_name = Column(String(64), nullable=False, default="y")
+    min_value = Column(Float, nullable=False)
+    max_value = Column(Float, nullable=False)
+    probe_json = Column(JSON, nullable=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    runs = relationship("RunModel", back_populates="oracle")
+
+    __table_args__ = (
+        Index("idx_oracle_artifacts_created_at", "created_at"),
     )
 
 

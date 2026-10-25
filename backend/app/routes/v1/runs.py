@@ -81,7 +81,11 @@ from ...domain.usage_contracts import (
     AuditEventConflictError,
     TaskRunConflictError,
 )
-from ...services.run_execution import RunBudgetUnavailable, execute_persisted_run
+from ...services.run_execution import (
+    RunBudgetUnavailable,
+    RunOracleUnavailable,
+    execute_persisted_run,
+)
 from ...services.run_service import (
     RunConflictError,
     create_run_service,
@@ -133,6 +137,29 @@ def _lifecycle_manager() -> RunLifecycleManager:
 def _get_db():
     db_uri = current_app.config.get("SQLALCHEMY_DATABASE_URI")
     return get_db_manager(db_uri)
+
+
+def _serialize_run_oracle(artifact) -> Optional[Dict[str, Any]]:
+    """Allowlisted summary of the uploaded black box a run is bound to."""
+    if artifact is None:
+        return None
+    from ...domain.oracle_contracts import KIND_LABELS, OracleKind
+
+    try:
+        kind_label = KIND_LABELS.get(OracleKind(artifact.kind), artifact.kind)
+    except ValueError:
+        kind_label = artifact.kind
+    return {
+        "oracle_id": artifact.oracle_id,
+        "name": artifact.name,
+        "kind": artifact.kind,
+        "kind_label": kind_label,
+        "entrypoint": artifact.entrypoint,
+        "input_name": artifact.input_name,
+        "output_name": artifact.output_name,
+        "min_value": artifact.min_value,
+        "max_value": artifact.max_value,
+    }
 
 
 def _request_correlation_id() -> Optional[str]:
@@ -255,6 +282,13 @@ def create_run():
             details=exc.details,
         )
 
+    # --- Optional uploaded black-box oracle ---
+    oracle_id = data.get("oracle_id")
+    if oracle_id is not None:
+        if not isinstance(oracle_id, str) or not oracle_id.strip():
+            return error_response("Field 'oracle_id' must be a non-empty string when provided.", 400)
+        oracle_id = oracle_id.strip()
+
     # --- Optional caller-provided run_id ---
     run_id = data.get("run_id")
     if run_id is not None:
@@ -267,6 +301,23 @@ def create_run():
     db = _get_db()
     try:
         with db.session_scope() as session:
+            repo = ClarityRepository(session)
+            oracle_artifact = None
+            if oracle_id:
+                oracle_artifact = repo.get_oracle_artifact(oracle_id)
+                if oracle_artifact is None:
+                    return error_response(
+                        f"Oracle '{oracle_id}' does not exist.",
+                        422,
+                        details=[
+                            {
+                                "field": "oracle_id",
+                                "code": "NOT_FOUND",
+                                "message": "Register the artifact before binding it to a run.",
+                            }
+                        ],
+                    )
+
             run = create_run_service(
                 session=session,
                 name=name.strip(),
@@ -275,6 +326,7 @@ def create_run():
                 sampling_strategy=sampling_strategy.strip(),
                 run_id=run_id,
                 budget=budget_config,
+                oracle_id=oracle_id,
             )
 
             # Register the newly persisted run with the lifecycle manager. The
@@ -296,6 +348,8 @@ def create_run():
                 raise
 
             serialized = serialize_run(run)
+            if oracle_artifact is not None:
+                serialized["oracle"] = _serialize_run_oracle(oracle_artifact)
     except RunConflictError as exc:
         return error_response(str(exc), 409)
     except Exception as exc:  # noqa: BLE001
@@ -355,6 +409,10 @@ def get_run(run_id: str):
             if not run:
                 return error_response(f"Run '{run_id}' not found.", 404)
             serialized = serialize_run(run)
+            if getattr(run, "oracle_id", None):
+                serialized["oracle"] = _serialize_run_oracle(
+                    repo.get_oracle_artifact(run.oracle_id)
+                )
     except Exception as exc:  # noqa: BLE001
         log_safe_error("get_run db error", exc)
         return error_response("An internal error occurred while retrieving the run.", 500)
@@ -478,6 +536,7 @@ def start_run(run_id: str):
                 db,
                 engine_factory,
                 orchestrator=current_app.config.get("RUN_ORCHESTRATOR"),
+                oracle_storage_dir=current_app.config.get("ORACLE_STORAGE_DIR"),
             )
             execution = {
                 "dispatched": True,
@@ -489,6 +548,10 @@ def start_run(run_id: str):
             # Fail closed: report the run cannot execute budgeted work rather
             # than letting it proceed unbudgeted.
             return error_response(str(exc), 503, error="Service Unavailable")
+        except RunOracleUnavailable as exc:
+            # The attached artifact cannot be resolved; never substitute a
+            # different black box for the one the researcher declared.
+            return error_response(str(exc), 409, error="Conflict")
         except Exception as exc:  # noqa: BLE001
             log_safe_error("start_run execution error", exc)
             return error_response(

@@ -8,48 +8,10 @@ load_dotenv()
 env_name = os.environ.get("FLASK_ENV", "development")
 app = create_app(env_name)
 
-# Default DiscoveryEngine factory for development runs
-from app.adapters.oracle.local_simulator import PolynomialLocalOracle
-from app.domain.candidate_generator import HypothesisGenerationConfig
-from app.domain.discovery_contracts import DiscoveryRunConfig
-from app.adapters.llm import build_llm_scientist_from_environment
-from app.domain.discovery_engine import DiscoveryEngine
-from app.domain.experiment_generator import NumericalDomainBounds
-from app.domain.ranking_contracts import RankingPolicyConfig
-
-
-def default_engine_factory(plan):
-    oracle = PolynomialLocalOracle()
-    # Build optional LLM scientist from environment if LLM_SCIENTIST_ENABLED=true
-    scientist = build_llm_scientist_from_environment()
-    # On local execution mode the backend does not enforce budget limits.
-    # Set max_query_budget to unlimited so query capacity never stops the run by budget exhaustion.
-    # The run stops when max_iterations is reached (finishing as COMPLETED, not budget_exhausted)
-    # or when stopping criteria are met.
-    _LOCAL_UNLIMITED = 100_000
-    target_iterations = plan.budget.max_oracle_queries or 10
-    config = DiscoveryRunConfig(
-        max_query_budget=_LOCAL_UNLIMITED,
-        max_iterations=target_iterations,
-        domain_bounds=NumericalDomainBounds(
-            variable_name="x", min_val=-2.0, max_val=2.0, domain_name="1d_polynomial"
-        ),
-        hypothesis_config=HypothesisGenerationConfig(
-            min_degree=0, max_degree=2, candidate_count=4, seed=42
-        ),
-        ranking_policy=RankingPolicyConfig(
-            min_samples_for_plausibility=2, performance_acceptance_threshold=1e9
-        ),
-        experiment_pool_size=4,
-    )
-    return DiscoveryEngine(
-        oracle,
-        config,
-        run_id=plan.run_id,
-        budget=plan.budget_manager,
-        scientist=scientist,
-    )
-
+# Default DiscoveryEngine factory for development runs. It builds the built-in
+# polynomial simulator unless the run is bound to an uploaded black box, in which
+# case the artifact's declared contract drives the oracle and search bounds.
+from app.services.engine_factory import default_engine_factory
 
 app.config["RUN_ENGINE_FACTORY"] = default_engine_factory
 

@@ -60,6 +60,7 @@ def create_app(config_name=None):
         hypotheses_v1_bp,
         observations_v1_bp,
         benchmarks_v1_bp,
+        oracles_v1_bp,
     )
 
     app.register_blueprint(health_v1_bp, url_prefix="/api/v1")
@@ -67,6 +68,7 @@ def create_app(config_name=None):
     app.register_blueprint(hypotheses_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(observations_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(benchmarks_v1_bp, url_prefix="/api/v1")
+    app.register_blueprint(oracles_v1_bp, url_prefix="/api/v1")
 
     # Error handlers returning consistent JSON payloads
     @app.errorhandler(404)

@@ -171,6 +171,38 @@ describe('RunDetailsView', () => {
     expect(screen.getByText(/no persisted run with id/i)).toBeInTheDocument();
   });
 
+  it('names the uploaded black box a run is bound to', async () => {
+    mockRunningRun({
+      oracle_id: 'oracle-abc123',
+      oracle: {
+        oracle_id: 'oracle-abc123',
+        name: 'Reactor pressure simulator',
+        kind: 'python_function',
+        kind_label: 'Python function',
+        entrypoint: 'simulate',
+        input_name: 'x',
+        output_name: 'y',
+        min_value: -2,
+        max_value: 2,
+      },
+    });
+    renderRun();
+
+    expect(
+      await screen.findByRole('heading', { name: 'Reactor pressure simulator' }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('oracle-abc123')).toBeInTheDocument();
+    expect(screen.getByText(/came from this artifact's responses/i)).toBeInTheDocument();
+  });
+
+  it('shows no black box for a run using the built-in simulator', async () => {
+    mockRunningRun();
+    renderRun();
+
+    await screen.findByRole('heading', { name: 'Nocturnal growth response' });
+    expect(screen.queryByText(/came from this artifact's responses/i)).not.toBeInTheDocument();
+  });
+
   it('renders an unknown future lifecycle state without crashing', async () => {
     getRun.mockResolvedValue({ run: makeRun({ run_id: RUN_ID, status: 'teleported' }) });
     getRunStatus.mockResolvedValue({

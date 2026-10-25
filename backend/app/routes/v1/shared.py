@@ -74,6 +74,8 @@ def serialize_run(run: RunModel) -> Dict[str, Any]:
         "max_concurrent_remote_tasks": run.max_concurrent_remote_tasks,
         "max_generated_hypotheses": run.max_generated_hypotheses,
         "budget": resolve_budget_config(run).to_dict(),
+        # Null means the built-in local simulator is used for this run.
+        "oracle_id": getattr(run, "oracle_id", None),
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,

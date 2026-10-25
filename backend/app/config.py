@@ -43,6 +43,11 @@ class Config:
     CORS_ORIGINS = [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
 
 
+    # Uploaded black-box artifacts (researcher-supplied simulators and models).
+    # Artifacts execute in-process, so this directory holds trusted code: keep it
+    # outside the repository in deployments that accept uploads.
+    ORACLE_STORAGE_DIR = os.environ.get("CLARITY_ORACLES_DIR") or None
+
     # Database configuration
     SQLALCHEMY_DATABASE_URI = normalize_database_url(
         os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)

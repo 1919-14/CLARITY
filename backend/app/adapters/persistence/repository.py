@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_ as sa_and, or_ as sa_or, select, desc, func
 
 from .models import (
+    OracleArtifactModel,
     RunModel,
     HypothesisModel,
     HypothesisRevisionModel,
@@ -708,6 +709,33 @@ class ClarityRepository:
             .order_by(desc(BenchmarkResultModel.executed_at))
         )
         return list(self.session.scalars(stmt).all())
+
+    # =========================================================================
+    # Uploaded oracle artifacts
+    # =========================================================================
+    def create_oracle_artifact(self, artifact: OracleArtifactModel) -> OracleArtifactModel:
+        self.session.add(artifact)
+        self.session.flush()
+        return artifact
+
+    def get_oracle_artifact(self, oracle_id: str) -> Optional[OracleArtifactModel]:
+        return self.session.get(OracleArtifactModel, oracle_id)
+
+    def list_oracle_artifacts(self) -> List[OracleArtifactModel]:
+        stmt = select(OracleArtifactModel).order_by(desc(OracleArtifactModel.created_at))
+        return list(self.session.scalars(stmt).all())
+
+    def count_runs_using_oracle(self, oracle_id: str) -> int:
+        stmt = select(func.count()).select_from(RunModel).where(RunModel.oracle_id == oracle_id)
+        return int(self.session.scalar(stmt) or 0)
+
+    def delete_oracle_artifact(self, oracle_id: str) -> bool:
+        artifact = self.get_oracle_artifact(oracle_id)
+        if artifact is None:
+            return False
+        self.session.delete(artifact)
+        self.session.flush()
+        return True
 
     def save_report(self, report: ReportModel) -> ReportModel:
         self.session.add(report)

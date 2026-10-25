@@ -1,23 +1,30 @@
-import { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
+import { listOracles } from '../api/oracles.js';
 import { createRun } from '../api/runs.js';
 import { ErrorState } from '../components/feedback/ErrorState.jsx';
 import { Notice } from '../components/feedback/Notice.jsx';
 import { Field } from '../components/forms/Field.jsx';
 import { ArrowLeftIcon, PlusIcon } from '../components/icons.jsx';
 import { OrnamentDivider, PageHeader } from '../components/layout/PageHeader.jsx';
+import { useResource } from '../hooks/useResource.js';
 import {
   DEFAULT_RUN_FORM,
   EXECUTION_MODES,
   LIMITS,
   validateRunForm,
 } from '../utils/validation.js';
-import { formatSeconds } from '../utils/formatting.js';
+import { formatDecimal, formatInteger, formatSeconds } from '../utils/formatting.js';
 
 export function CreateRunPage() {
   const navigate = useNavigate();
-  const [values, setValues] = useState({ ...DEFAULT_RUN_FORM });
+  const [searchParams] = useSearchParams();
+  const preselectedOracle = searchParams.get('oracle') || '';
+  const [values, setValues] = useState({
+    ...DEFAULT_RUN_FORM,
+    oracleId: preselectedOracle,
+  });
   const [errors, setErrors] = useState({});
   const [warnings, setWarnings] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -26,6 +33,15 @@ export function CreateRunPage() {
   const [attempted, setAttempted] = useState(false);
   const controllerRef = useRef(null);
   const summaryRef = useRef(null);
+
+  const oracleLoader = useCallback(({ signal }) => listOracles({ signal }), []);
+  const {
+    data: oracleData,
+    isLoading: oraclesLoading,
+    error: oraclesError,
+  } = useResource(oracleLoader);
+  const oracles = oracleData?.oracles ?? [];
+  const selectedOracle = oracles.find((oracle) => oracle.oracle_id === values.oracleId) || null;
 
   useEffect(() => () => controllerRef.current?.abort(), []);
 
@@ -54,6 +70,12 @@ export function CreateRunPage() {
     if (!validation.payload) {
       summaryRef.current?.focus();
       return;
+    }
+
+    // The oracle is bound at creation time; omitting the id keeps the built-in
+    // polynomial simulator the backend's default.
+    if (values.oracleId) {
+      validation.payload = { ...validation.payload, oracle_id: values.oracleId };
     }
 
     setSubmitting(true);
@@ -93,7 +115,7 @@ export function CreateRunPage() {
       <PageHeader
         volume="Volume V · Configuration"
         title="Configure a discovery run"
-        description="Set the investigation name and the resources the backend may admit. Submitting creates a queued run; it does not start discovery by itself."
+        description="Name the investigation, choose the black box to query, and set the resources the backend may admit. Submitting creates a queued run; it does not start discovery by itself."
         actions={
           <Link to="/" className="button button--ghost">
             <ArrowLeftIcon size={16} />
@@ -229,8 +251,90 @@ export function CreateRunPage() {
           </Field>
         </section>
 
+        <section className="form-section" aria-labelledby="oracle-heading">
+          <p className="volume-label">II · Black box</p>
+          <h2 id="oracle-heading" className="section-heading">What CLARITY should query</h2>
+          <p className="form-section__intro">
+            Query the built-in polynomial simulator, or distil a black box you uploaded — a
+            simulation script, a pickled estimator or an ONNX model. An uploaded artifact is
+            queried through the same oracle interface as any other black box; its internals are
+            never inspected.
+          </p>
+
+          <Field
+            id="field-oracleId"
+            label="Oracle"
+            hint={
+              oraclesLoading
+                ? 'Listing registered artifacts…'
+                : 'Artifacts are registered once in the oracle library and can back many runs.'
+            }
+          >
+            <select
+              id="field-oracleId"
+              className="input"
+              value={values.oracleId}
+              onChange={update('oracleId')}
+            >
+              <option value="">Built-in polynomial simulator (default)</option>
+              {oracles.map((oracle) => (
+                <option key={oracle.oracle_id} value={oracle.oracle_id}>
+                  {oracle.name} — {oracle.kind_label} · {oracle.input_name} ∈ [
+                  {formatDecimal(oracle.min_value, 3)}, {formatDecimal(oracle.max_value, 3)}]
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          {selectedOracle ? (
+            <dl className="detail-list">
+              <div className="detail-list__row">
+                <dt>Artifact</dt>
+                <dd>
+                  <code className="id-text">{selectedOracle.oracle_id}</code> ·{' '}
+                  {selectedOracle.original_filename}
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Contract</dt>
+                <dd>
+                  {selectedOracle.entrypoint
+                    ? `${selectedOracle.entrypoint}(${selectedOracle.input_name}) → ${selectedOracle.output_name}`
+                    : `${selectedOracle.input_name} → ${selectedOracle.output_name}`}
+                  {' · '}
+                  {formatDecimal(selectedOracle.min_value, 3)} …{' '}
+                  {formatDecimal(selectedOracle.max_value, 3)}
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Runs using it</dt>
+                <dd>{formatInteger(selectedOracle.run_count)}</dd>
+              </div>
+            </dl>
+          ) : null}
+
+          {oraclesError ? (
+            <Notice tone="warning" title="The oracle library could not be listed">
+              <p>
+                The run would use the built-in simulator unless an artifact is selected. Open{' '}
+                <Link className="text-link" to="/oracles">
+                  the oracle library
+                </Link>{' '}
+                to check that the backend is reachable.
+              </p>
+            </Notice>
+          ) : null}
+
+          <p className="panel-note">
+            <Link className="text-link" to="/oracles">
+              Register or manage black boxes
+            </Link>{' '}
+            · Uploaded artifacts run inside the backend, so upload only code you trust.
+          </p>
+        </section>
+
         <section className="form-section" aria-labelledby="budget-heading">
-          <p className="volume-label">II · Resources</p>
+          <p className="volume-label">III · Resources</p>
           <h2 id="budget-heading" className="section-heading">Application-enforced limits</h2>
           <p className="form-section__intro">
             Defaults come from the backend contract: 10 oracle queries, 100 candidate evaluations,

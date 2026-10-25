@@ -2,6 +2,7 @@ import { Link, NavLink, Outlet } from 'react-router-dom';
 
 import { API_BASE_URL } from '../../api/client.js';
 import {
+  BlackBoxIcon,
   BookIcon,
   ChartIcon,
   FlaskIcon,
@@ -12,6 +13,7 @@ import {
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: BookIcon, end: true },
   { to: '/hypotheses', label: 'Hypotheses', icon: FlaskIcon },
+  { to: '/oracles', label: 'Oracles', icon: BlackBoxIcon },
   { to: '/reports', label: 'Reports', icon: ScrollIcon },
   { to: '/benchmarks', label: 'Benchmarks', icon: ChartIcon },
 ];

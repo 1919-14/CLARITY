@@ -44,6 +44,7 @@ def create_run_service(
     spend_ceiling_usd: Optional[float] = None,
     run_id: Optional[str] = None,
     budget: Optional[RunBudgetConfig] = None,
+    oracle_id: Optional[str] = None,
 ) -> RunModel:
     """Create a new discovery run, its validated budget, zero usage, and audit trail.
 
@@ -83,6 +84,7 @@ def create_run_service(
         max_concurrent_remote_tasks=budget.max_concurrent_remote_tasks,
         max_generated_hypotheses=budget.max_generated_hypotheses,
         budget_config_json=budget.to_dict(),
+        oracle_id=oracle_id,
     )
     repo.create_run(run)
 

@@ -66,6 +66,14 @@ export const RefreshIcon = (props) => (
   </Svg>
 );
 
+export const BlackBoxIcon = (props) => (
+  <Svg {...props}>
+    <rect x="3.5" y="3.5" width="17" height="17" rx="2" />
+    <path d="M9.6 9.2a2.4 2.4 0 1 1 3.3 2.2c-.6.3-.9.8-.9 1.5v.5" />
+    <path d="M12 16.4h.01" />
+  </Svg>
+);
+
 export const DownloadIcon = (props) => (
   <Svg {...props}>
     <path d="M12 3v12" />

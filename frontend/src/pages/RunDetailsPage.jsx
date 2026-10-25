@@ -17,6 +17,7 @@ import { DEFAULT_POLL_INTERVAL_MS, useRunStatus } from '../hooks/useRunStatus.js
 import {
   executionModeLabel,
   formatDateTime,
+  formatDecimal,
   formatSeconds,
   formatTime,
   phaseLabel,
@@ -370,9 +371,54 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
         </div>
       </section>
 
+      {run.oracle ? (
+        <section className="panel" aria-labelledby="oracle-heading">
+          <p className="volume-label">II · Black box</p>
+          <h2 id="oracle-heading" className="panel__title">
+            {run.oracle.name || 'Uploaded artifact'}
+          </h2>
+          <p className="panel__subtitle">
+            {run.oracle.kind_label || run.oracle.kind} · bound at run creation
+          </p>
+          <dl className="detail-list">
+            <div className="detail-list__row">
+              <dt>Artifact</dt>
+              <dd>
+                <code className="id-text">{run.oracle.oracle_id}</code>
+              </dd>
+            </div>
+            <div className="detail-list__row">
+              <dt>Contract</dt>
+              <dd>
+                {run.oracle.entrypoint
+                  ? `${run.oracle.entrypoint}(${run.oracle.input_name}) → ${run.oracle.output_name}`
+                  : `${run.oracle.input_name} → ${run.oracle.output_name}`}
+                {' · '}
+                {formatDecimal(run.oracle.min_value, 3)} …{' '}
+                {formatDecimal(run.oracle.max_value, 3)}
+              </dd>
+            </div>
+            <div className="detail-list__row">
+              <dt>Provenance</dt>
+              <dd>
+                Every observation in this run came from this artifact&apos;s responses.
+                CLARITY never inspected its internals, and the report makes no claim about
+                a ground-truth formula for it.
+              </dd>
+            </div>
+          </dl>
+          <p className="panel-note">
+            <Link className="text-link" to="/oracles">
+              Open the oracle library
+            </Link>{' '}
+            to inspect the registration probe or reuse this artifact in another run.
+          </p>
+        </section>
+      ) : null}
+
       {run.stop_reason || progress?.stop_reason || progress?.failure_details ? (
         <section className="panel" aria-labelledby="failure-heading">
-          <p className="volume-label">II · Outcome</p>
+          <p className="volume-label">III · Outcome</p>
           <h2 id="failure-heading" className="panel__title">
             {run.status === 'failed' ? 'Failure record' : 'Stop record'}
           </h2>
@@ -387,13 +433,13 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
       ) : null}
 
       <section className="panel" aria-labelledby="resources-heading">
-        <p className="volume-label">III · Accounting</p>
+        <p className="volume-label">IV · Accounting</p>
         <h2 id="resources-heading" className="panel__title">Resources and spending</h2>
         <BudgetPanel budget={budget} />
       </section>
 
       <section className="panel" aria-labelledby="outputs-heading">
-        <p className="volume-label">IV · Outputs</p>
+        <p className="volume-label">V · Outputs</p>
         <h2 id="outputs-heading" className="panel__title">Scientific workflows for this run</h2>
         <div className="workflow-grid">
           <Link className="workflow-card" to={`/hypotheses?run=${encodeURIComponent(run.run_id)}`}>

@@ -245,3 +245,7 @@ frontend/.env
 reports/
 backend/reports/
 
+
+# Uploaded black-box artifacts (research inputs, never committed)
+backend/oracle_uploads/
+oracle_uploads/

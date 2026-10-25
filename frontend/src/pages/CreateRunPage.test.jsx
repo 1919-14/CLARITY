@@ -14,6 +14,11 @@ vi.mock('../api/runs.js', () => ({
   cancelRun: vi.fn(),
 }));
 
+vi.mock('../api/oracles.js', () => ({
+  listOracles: vi.fn(),
+}));
+
+import { listOracles } from '../api/oracles.js';
 import { createRun } from '../api/runs.js';
 import { CreateRunPage } from './CreateRunPage.jsx';
 
@@ -43,6 +48,7 @@ async function fillName(name = 'Nocturnal growth response') {
 describe('CreateRunPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    listOracles.mockResolvedValue({ oracles: [] });
   });
 
   it('shows the backend defaults in the configuration form', () => {
@@ -109,6 +115,38 @@ describe('CreateRunPage', () => {
       },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+  });
+
+  it('binds the selected uploaded black box to the created run', async () => {
+    listOracles.mockResolvedValue({
+      oracles: [
+        {
+          oracle_id: 'oracle-abc123',
+          name: 'Reactor pressure simulator',
+          kind: 'python_function',
+          kind_label: 'Python function',
+          entrypoint: 'simulate',
+          input_name: 'x',
+          output_name: 'y',
+          min_value: -2,
+          max_value: 2,
+          run_count: 0,
+        },
+      ],
+    });
+    createRun.mockResolvedValue({ run: { run_id: 'run-bound-1' } });
+
+    renderPage();
+    const selector = screen.getByLabelText(/^oracle$/i);
+    await screen.findByRole('option', { name: /Reactor pressure simulator/ });
+    await userEvent.selectOptions(selector, 'oracle-abc123');
+    await fillName('Distil my simulator');
+    await userEvent.click(screen.getByRole('button', { name: /create discovery run/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /run details run-bound-1/i })).toBeInTheDocument();
+    });
+    expect(createRun.mock.calls[0][0].oracle_id).toBe('oracle-abc123');
   });
 
   it('prevents duplicate submissions while the request is pending', async () => {

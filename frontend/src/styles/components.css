@@ -723,6 +723,83 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* File input — theme-aligned brass button and dark-academic typography */
+.input--file,
+input[type='file'].input {
+  display: flex;
+  align-items: center;
+  padding: 5px var(--space-3);
+  cursor: pointer;
+  color: var(--color-fg-soft);
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  line-height: normal;
+}
+
+.input--file::file-selector-button,
+input[type='file'].input::file-selector-button,
+.input--file::-webkit-file-upload-button,
+input[type='file'].input::-webkit-file-upload-button {
+  margin-right: var(--space-3);
+  padding: 6px var(--space-4);
+  border: 1px solid var(--color-accent-deep);
+  border-radius: var(--radius);
+  background: var(--brass-gradient);
+  color: var(--color-accent-fg);
+  font-family: var(--font-display);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-shadow: var(--engraved-text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25), 0 2px 6px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  transition: filter var(--duration-fast) var(--ease),
+    box-shadow var(--duration-fast) var(--ease);
+}
+
+.input--file:hover::file-selector-button,
+input[type='file'].input:hover::file-selector-button,
+.input--file:hover::-webkit-file-upload-button,
+input[type='file'].input:hover::-webkit-file-upload-button {
+  filter: brightness(1.1);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25), 0 4px 12px rgba(201, 169, 98, 0.3);
+}
+
+.input--file:active::file-selector-button,
+input[type='file'].input:active::file-selector-button,
+.input--file:active::-webkit-file-upload-button,
+input[type='file'].input:active::-webkit-file-upload-button {
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.35);
+  filter: brightness(0.96);
+}
+
+.file-selection-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 0.88rem;
+  color: var(--color-fg-soft);
+}
+
+.file-selection-badge__name {
+  color: var(--color-accent);
+  font-family: var(--font-heading);
+  font-size: 1rem;
+}
+
+.file-selection-badge__meta {
+  color: var(--color-muted-fg);
+  font-size: 0.82rem;
+}
+
 .form-actions {
   display: flex;
   align-items: center;

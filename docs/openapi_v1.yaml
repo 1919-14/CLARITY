@@ -1146,6 +1146,189 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /oracles:
+    get:
+      summary: List uploaded black boxes
+      description: >-
+        Returns every registered artifact, newest first, with the number of runs
+        bound to it. Stored file paths and artifact bytes are never exposed.
+      operationId: listOraclesV1
+      responses:
+        '200':
+          description: Registered artifacts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [oracles, count]
+                properties:
+                  oracles:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OracleArtifact'
+                  count:
+                    type: integer
+                    example: 1
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Register an uploaded black box
+      description: >-
+        Accepts multipart/form-data with a 'file' part plus the declared
+        contract. The artifact is probed at three declared inputs; a contract
+        that cannot be built, or an artifact that answers no probe input, is
+        rejected with 422 and nothing is registered. Artifacts execute in the
+        backend process (trusted uploads; no sandbox).
+      operationId: createOracleV1
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: '.py, .joblib, .pkl, .pickle or .onnx (max 25 MiB)'
+                name:
+                  type: string
+                  description: Library label; defaults to the filename stem.
+                kind:
+                  type: string
+                  enum: [python_function, joblib_model, onnx_model]
+                  description: Optional; inferred from the extension and must agree with it.
+                entrypoint:
+                  type: string
+                  description: Function to call; required for Python artifacts.
+                input_name:
+                  type: string
+                  default: x
+                output_name:
+                  type: string
+                  default: y
+                min_value:
+                  type: number
+                  default: -10.0
+                max_value:
+                  type: number
+                  default: 10.0
+                actor:
+                  type: string
+                  description: Recorded as created_by; attribute only.
+      responses:
+        '201':
+          description: Artifact registered and probed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [oracle]
+                properties:
+                  oracle:
+                    $ref: '#/components/schemas/OracleArtifact'
+        '400':
+          description: Missing or unreadable file part
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: >-
+            Contract validation failed, or no probe input produced a usable
+            scalar response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /oracles/{oracle_id}:
+    get:
+      summary: Retrieve one uploaded black box
+      operationId: getOracleV1
+      parameters:
+        - name: oracle_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The artifact and its run count
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [oracle]
+                properties:
+                  oracle:
+                    $ref: '#/components/schemas/OracleArtifact'
+        '404':
+          description: Unknown oracle id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete an uploaded black box
+      description: >-
+        Removes the record and its stored file. Refused with 409 while any run
+        references the artifact, so historical runs stay reproducible.
+      operationId: deleteOracleV1
+      parameters:
+        - name: oracle_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Artifact deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  oracle:
+                    $ref: '#/components/schemas/OracleArtifact'
+                  message:
+                    type: string
+        '404':
+          description: Unknown oracle id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Artifact is still bound to at least one run
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   schemas:
     ErrorResponse:
@@ -1263,6 +1446,16 @@ components:
           example: 10
         budget:
           $ref: '#/components/schemas/RunBudgetConfig'
+        oracle_id:
+          type: string
+          nullable: true
+          description: Uploaded black box backing this run; null uses the built-in simulator.
+          example: oracle-307db2ae0999
+        oracle:
+          allOf:
+            - $ref: '#/components/schemas/OracleArtifact'
+          nullable: true
+          description: Present on create and detail responses when a black box is bound.
         created_at:
           type: string
           format: date-time
@@ -1335,10 +1528,107 @@ components:
           description: Legacy alias for budget.max_generated_hypotheses.
         budget:
           $ref: '#/components/schemas/RunBudgetConfig'
+        oracle_id:
+          type: string
+          description: |
+            Optional uploaded black box to query (see POST /oracles). Omitted uses
+            the built-in local simulator; an unknown id is rejected with 422 and no
+            run is created.
+          example: oracle-307db2ae0999
         run_id:
           type: string
           description: Optional caller-specified unique run identifier
           example: run-custom-001
+
+    OracleArtifact:
+      type: object
+      description: >-
+        A researcher-supplied black box. Records what was uploaded and what the
+        registration probe observed; never its internals or stored file path.
+      required:
+        - oracle_id
+        - name
+        - kind
+        - input_name
+        - output_name
+        - min_value
+        - max_value
+        - probe
+        - run_count
+      properties:
+        oracle_id:
+          type: string
+          example: oracle-307db2ae0999
+        name:
+          type: string
+          example: Reactor pressure simulator
+        kind:
+          type: string
+          enum: [python_function, joblib_model, onnx_model]
+        kind_label:
+          type: string
+          example: Python function
+        original_filename:
+          type: string
+          example: simulate.py
+        sha256:
+          type: string
+          example: 7c236da0f867e1e80eda88c3c9df817501c5c8e3f85233c2ba63edf7268103d6
+        size_bytes:
+          type: integer
+          example: 42
+        entrypoint:
+          type: string
+          nullable: true
+          example: simulate
+        input_name:
+          type: string
+          example: x
+        output_name:
+          type: string
+          example: y
+        min_value:
+          type: number
+          format: float
+          example: -2.0
+        max_value:
+          type: number
+          format: float
+          example: 2.0
+        probe:
+          type: object
+          description: What the registration probe actually observed.
+          properties:
+            samples:
+              type: array
+              items:
+                type: object
+                properties:
+                  x:
+                    type: number
+                  y:
+                    type: number
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+            ok_count:
+              type: integer
+              example: 3
+            failed_count:
+              type: integer
+              example: 0
+        created_by:
+          type: string
+          nullable: true
+          example: researcher
+        created_at:
+          type: string
+          format: date-time
+        run_count:
+          type: integer
+          description: Runs bound to this artifact; a non-zero count blocks deletion.
+          example: 0
 
     RunCancelRequest:
       type: object
