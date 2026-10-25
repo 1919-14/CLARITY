@@ -22,7 +22,7 @@ def default_engine_factory(plan):
     queries = plan.budget.max_oracle_queries or 10
     config = DiscoveryRunConfig(
         max_query_budget=queries,
-        max_iterations=min(10, queries),
+        max_iterations=queries,
         domain_bounds=NumericalDomainBounds(
             variable_name="x", min_val=-2.0, max_val=2.0, domain_name="1d_polynomial"
         ),

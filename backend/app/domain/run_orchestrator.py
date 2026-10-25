@@ -89,7 +89,11 @@ class RunOrchestrator:
             progress = self.lifecycle_manager.get_progress(run_id, session=session)
             if progress.status != RunLifecycleState.RUNNING:
                 self.lifecycle_manager.start_run(run_id, session=session)
+            if session:
+                session.commit()
         except Exception as exc:
+            if session:
+                session.rollback()
             logger.error("Failed to start run '%s': %s", run_id, exc)
             raise
         finally:
@@ -103,6 +107,11 @@ class RunOrchestrator:
                 self.lifecycle_manager.confirm_cancellation(
                     run_id, reason="Cancelled before execution started", session=session
                 )
+                if session:
+                    session.commit()
+            except Exception:
+                if session:
+                    session.rollback()
             finally:
                 if session:
                     session.close()
@@ -127,6 +136,11 @@ class RunOrchestrator:
                     self.lifecycle_manager.confirm_cancellation(
                         run_id, reason="Cancelled during discovery execution", session=session
                     )
+                    if session:
+                        session.commit()
+                except Exception:
+                    if session:
+                        session.rollback()
                 finally:
                     if session:
                         session.close()
@@ -138,6 +152,11 @@ class RunOrchestrator:
                 self.lifecycle_manager.fail_run(
                     run_id, error=exc, failure_code=fail_code, session=session
                 )
+                if session:
+                    session.commit()
+            except Exception:
+                if session:
+                    session.rollback()
             finally:
                 if session:
                     session.close()
@@ -159,6 +178,11 @@ class RunOrchestrator:
                 activity="Generating candidate hypotheses",
                 session=session,
             )
+            if session:
+                session.commit()
+        except Exception:
+            if session:
+                session.rollback()
         finally:
             if session:
                 session.close()
@@ -169,6 +193,11 @@ class RunOrchestrator:
                 self.lifecycle_manager.confirm_cancellation(
                     run_id, reason="Cancelled by user request", session=session
                 )
+                if session:
+                    session.commit()
+            except Exception:
+                if session:
+                    session.rollback()
             finally:
                 if session:
                     session.close()
@@ -187,6 +216,11 @@ class RunOrchestrator:
                     self.lifecycle_manager.confirm_cancellation(
                         run_id, reason="Cancelled during discovery execution", session=session
                     )
+                    if session:
+                        session.commit()
+                except Exception:
+                    if session:
+                        session.rollback()
                 finally:
                     if session:
                         session.close()
@@ -235,6 +269,12 @@ class RunOrchestrator:
                 self.lifecycle_manager.fail_run(
                     run_id, error=err_msg, failure_code="DISCOVERY_ENGINE_FAILURE", session=session
                 )
+            if session:
+                session.commit()
+        except Exception:
+            if session:
+                session.rollback()
+            raise
         finally:
             if session:
                 session.close()
