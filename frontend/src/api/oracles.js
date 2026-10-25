@@ -47,9 +47,17 @@ export function createOracle(file, fields = {}, { signal } = {}) {
   return apiPost('/oracles', form, { signal });
 }
 
-/** DELETE /oracles/<oracle_id> */
-export function deleteOracle(oracleId, { signal } = {}) {
-  return apiDelete(`/oracles/${enc(oracleId)}`, { signal });
+/** DELETE /oracles/<oracle_id>
+ *
+ * @param {string} oracleId
+ * @param {object} [opts]
+ * @param {boolean} [opts.force]  When true, bound runs are detached before
+ *   deletion (their oracle reference is cleared but the run record survives).
+ * @param {AbortSignal} [opts.signal]
+ */
+export function deleteOracle(oracleId, { force = false, signal } = {}) {
+  const qs = force ? '?force=true' : '';
+  return apiDelete(`/oracles/${enc(oracleId)}${qs}`, { signal });
 }
 
 /** Artifact kind inferred from a filename extension, or null when unsupported. */

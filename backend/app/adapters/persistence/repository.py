@@ -729,6 +729,25 @@ class ClarityRepository:
         stmt = select(func.count()).select_from(RunModel).where(RunModel.oracle_id == oracle_id)
         return int(self.session.scalar(stmt) or 0)
 
+    def clear_oracle_from_runs(self, oracle_id: str) -> int:
+        """NULL out oracle_id on every run that references this artifact.
+
+        Used by force-delete so run history records are preserved but the FK
+        constraint no longer blocks artifact removal.  Returns the number of
+        rows updated.
+        """
+        from sqlalchemy import update as sa_update
+
+        stmt = (
+            sa_update(RunModel)
+            .where(RunModel.oracle_id == oracle_id)
+            .values(oracle_id=None)
+            .execution_options(synchronize_session="fetch")
+        )
+        result = self.session.execute(stmt)
+        self.session.flush()
+        return result.rowcount
+
     def delete_oracle_artifact(self, oracle_id: str) -> bool:
         artifact = self.get_oracle_artifact(oracle_id)
         if artifact is None:

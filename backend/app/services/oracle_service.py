@@ -263,24 +263,36 @@ def list_oracles_service(session: Session) -> List[Tuple[OracleArtifactModel, in
 
 
 def delete_oracle_service(
-    session: Session, *, storage_dir: str, oracle_id: str
+    session: Session, *, storage_dir: str, oracle_id: str, force: bool = False
 ) -> OracleArtifactModel:
-    """Delete an artifact that no run references, including its stored bytes."""
+    """Delete an artifact and (optionally) any run references to it.
+
+    Normal delete (force=False): rejects with OracleInUseError when one or
+    more runs still reference the artifact, preserving reproducibility.
+
+    Force delete (force=True): NULLs out oracle_id on all bound runs first so
+    the FK constraint no longer blocks removal.  Run history records survive;
+    they just lose the artifact pointer.
+    """
     repo = ClarityRepository(session)
     artifact = repo.get_oracle_artifact(oracle_id)
     if artifact is None:
         raise OracleNotFoundError(f"Oracle '{oracle_id}' not found.")
     run_count = repo.count_runs_using_oracle(oracle_id)
     if run_count > 0:
-        raise OracleInUseError(
-            f"Oracle '{oracle_id}' is bound to {run_count} run(s) and its record cannot "
-            "be deleted. Historical runs stay reproducible."
-        )
+        if not force:
+            raise OracleInUseError(
+                f"Oracle '{oracle_id}' is bound to {run_count} run(s) and its record cannot "
+                "be deleted. Historical runs stay reproducible."
+            )
+        # Force path: detach all referencing runs before deleting the artifact.
+        repo.clear_oracle_from_runs(oracle_id)
 
     directory = os.path.dirname(_resolve_artifact_path(storage_dir, artifact.storage_path))
     repo.delete_oracle_artifact(oracle_id)
     shutil.rmtree(directory, ignore_errors=True)
     return artifact
+
 
 
 def serialize_oracle(artifact: OracleArtifactModel, run_count: int) -> Dict[str, Any]:

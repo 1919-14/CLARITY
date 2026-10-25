@@ -124,12 +124,18 @@ def get_oracle(oracle_id: str):
 
 @oracles_v1_bp.route("/oracles/<oracle_id>", methods=["DELETE"])
 def delete_oracle(oracle_id: str):
-    """DELETE /api/v1/oracles/<oracle_id> — delete an artifact no run references."""
+    """DELETE /api/v1/oracles/<oracle_id> — delete an artifact no run references.
+
+    Query parameters:
+      force=true  Detach any bound runs (set their oracle_id to NULL) before
+                  deleting the artifact.  Run history records are preserved.
+    """
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
     db = _get_db()
     try:
         with db.session_scope() as session:
             artifact = delete_oracle_service(
-                session, storage_dir=_storage_dir(), oracle_id=oracle_id
+                session, storage_dir=_storage_dir(), oracle_id=oracle_id, force=force
             )
             payload = serialize_oracle(artifact, 0)
     except OracleNotFoundError as exc:
@@ -143,3 +149,4 @@ def delete_oracle(oracle_id: str):
         return error_response("An internal error occurred while deleting the oracle.", 500)
 
     return jsonify({"oracle": payload, "message": "Oracle deleted."}), 200
+

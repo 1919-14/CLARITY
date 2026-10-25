@@ -369,3 +369,21 @@ class TestRunOracleBinding:
 
         assert response.status_code == 409
         assert "bound to 1 run" in response.get_json()["message"]
+
+    def test_force_delete_removes_artifact_even_when_runs_are_bound(self, client):
+        oracle_id = upload_oracle(client, entrypoint="simulate").get_json()["oracle"][
+            "oracle_id"
+        ]
+        run_id = client.post(
+            "/api/v1/runs", json={"name": "Bound run", "oracle_id": oracle_id}
+        ).get_json()["run"]["run_id"]
+
+        response = client.delete(f"/api/v1/oracles/{oracle_id}?force=true")
+
+        assert response.status_code == 200
+        assert response.get_json()["message"] == "Oracle deleted."
+        # Artifact is gone
+        assert client.get(f"/api/v1/oracles/{oracle_id}").status_code == 404
+        # Run record still exists but oracle_id is now cleared
+        run = client.get(f"/api/v1/runs/{run_id}").get_json()["run"]
+        assert run["oracle_id"] is None

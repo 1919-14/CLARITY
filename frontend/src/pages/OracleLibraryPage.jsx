@@ -295,6 +295,7 @@ export function OracleLibraryPage() {
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(null);
+  const [forceNeeded, setForceNeeded] = useState(false);
 
   const handleUploaded = (oracle) => {
     setLastRegistered(oracle);
@@ -310,7 +311,30 @@ export function OracleLibraryPage() {
       setDeleteTarget(null);
       reload();
     } catch (deleteFailure) {
-      if (!deleteFailure?.isAborted) setDeleteError(deleteFailure);
+      if (!deleteFailure?.isAborted) {
+        if (deleteFailure?.status === 409) {
+          // Artifact is still bound to one or more runs — offer force-delete.
+          setForceNeeded(true);
+        } else {
+          setDeleteError(deleteFailure);
+        }
+      }
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleForceDelete = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    setForceNeeded(false);
+    try {
+      await deleteOracle(deleteTarget.oracle_id, { force: true });
+      setDeleteTarget(null);
+      reload();
+    } catch (forceFailure) {
+      if (!forceFailure?.isAborted) setDeleteError(forceFailure);
     } finally {
       setDeleting(false);
     }
@@ -448,7 +472,7 @@ export function OracleLibraryPage() {
       </section>
 
       <ConfirmDialog
-        open={Boolean(deleteTarget)}
+        open={Boolean(deleteTarget) && !forceNeeded}
         title="Delete this artifact?"
         description={
           deleteTarget
@@ -459,7 +483,23 @@ export function OracleLibraryPage() {
         tone="danger"
         busy={deleting}
         onConfirm={handleDelete}
-        onCancel={() => setDeleteTarget(null)}
+        onCancel={() => { setDeleteTarget(null); setDeleteError(null); }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deleteTarget) && forceNeeded}
+        title="Artifact is still used by runs — force delete?"
+        description={
+          deleteTarget
+            ? `${deleteTarget.name} is referenced by one or more existing runs. Force-deleting will permanently remove the artifact file and clear the reference from those runs. The run records themselves (observations, hypotheses, reports) will not be deleted. This cannot be undone.`
+            : ''
+        }
+        confirmLabel="Force delete artifact"
+        cancelLabel="Keep artifact"
+        tone="danger"
+        busy={deleting}
+        onConfirm={handleForceDelete}
+        onCancel={() => { setDeleteTarget(null); setForceNeeded(false); setDeleteError(null); }}
       />
     </div>
   );
