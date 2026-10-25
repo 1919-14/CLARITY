@@ -186,7 +186,7 @@ describe('CreateRunPage', () => {
 
   it('does not retry blindly when creation times out', async () => {
     createRun.mockRejectedValue(
-      new ApiError('The CLARITY backend did not respond within 15 seconds.', { kind: 'timeout' }),
+      new ApiError('The CLARITY backend did not respond within 60 seconds.', { kind: 'timeout' }),
     );
 
     renderPage();

@@ -19,7 +19,7 @@ const configuredBaseUrl =
 
 export const API_BASE_URL = String(configuredBaseUrl).replace(/\/+$/, '');
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 /**
  * Normalised API failure. `kind` is one of:
