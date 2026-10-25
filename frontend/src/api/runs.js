@@ -6,7 +6,7 @@
  * Nothing here invents fields the backend does not return.
  */
 
-import { apiGet, apiPost } from './client.js';
+import { apiGet, apiPost, apiRequest } from './client.js';
 
 const enc = (value) => encodeURIComponent(String(value));
 
@@ -69,6 +69,19 @@ export function getRunReport(runId, { signal } = {}) {
 /** POST /runs/<run_id>/report */
 export function generateRunReport(runId, { signal } = {}) {
   return apiPost(`/runs/${enc(runId)}/report`, undefined, { signal });
+}
+
+/**
+ * GET /runs/<run_id>/report/export?format=pdf|markdown|json
+ *
+ * Resolves to { blob, filename, contentType }. The document is rendered by the
+ * backend, so the browser only downloads what the server exported.
+ */
+export function exportRunReport(runId, format = 'pdf', { signal } = {}) {
+  return apiRequest(
+    `/runs/${enc(runId)}/report/export?format=${encodeURIComponent(format)}`,
+    { signal, responseType: 'blob' },
+  );
 }
 
 export {

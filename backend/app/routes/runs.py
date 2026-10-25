@@ -726,11 +726,13 @@ def generate_report_endpoint(run_id: str):
 
 @runs_bp.route("/runs/<run_id>/report/export", methods=["GET"])
 def export_report_endpoint(run_id: str):
-    """Export scientific report as JSON or Markdown."""
+    """Export scientific report as JSON, Markdown or PDF."""
     format_param = request.args.get("format", "").strip()
     if not format_param:
         accept_hdr = request.headers.get("Accept", "")
-        if "text/markdown" in accept_hdr:
+        if "application/pdf" in accept_hdr:
+            format_param = "pdf"
+        elif "text/markdown" in accept_hdr:
             format_param = "markdown"
         else:
             format_param = "json"
@@ -747,12 +749,20 @@ def export_report_endpoint(run_id: str):
         log_safe_error("export_report_endpoint db error", exc)
         return error_response("An internal error occurred while exporting the report.", 500)
 
-    ext = "md" if "markdown" in mime_type else "json"
+    if "pdf" in mime_type:
+        ext = "pdf"
+    elif "markdown" in mime_type:
+        ext = "md"
+    else:
+        ext = "json"
     filename = f"report_{run_id}.{ext}"
+    # A PDF is a document download; text exports stay inline so they can be read
+    # in the browser as well as saved.
+    disposition = "attachment" if ext == "pdf" else "inline"
     return Response(
         content,
         mimetype=mime_type,
-        headers={"Content-Disposition": f"inline; filename={filename}"},
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
     )
 
 

@@ -12,6 +12,7 @@ app = create_app(env_name)
 from app.adapters.oracle.local_simulator import PolynomialLocalOracle
 from app.domain.candidate_generator import HypothesisGenerationConfig
 from app.domain.discovery_contracts import DiscoveryRunConfig
+from app.adapters.llm import build_llm_scientist_from_environment
 from app.domain.discovery_engine import DiscoveryEngine
 from app.domain.experiment_generator import NumericalDomainBounds
 from app.domain.ranking_contracts import RankingPolicyConfig
@@ -19,10 +20,17 @@ from app.domain.ranking_contracts import RankingPolicyConfig
 
 def default_engine_factory(plan):
     oracle = PolynomialLocalOracle()
-    queries = plan.budget.max_oracle_queries or 10
+    # Build optional LLM scientist from environment if LLM_SCIENTIST_ENABLED=true
+    scientist = build_llm_scientist_from_environment()
+    # On local execution mode the backend does not enforce budget limits.
+    # Set max_query_budget to unlimited so query capacity never stops the run by budget exhaustion.
+    # The run stops when max_iterations is reached (finishing as COMPLETED, not budget_exhausted)
+    # or when stopping criteria are met.
+    _LOCAL_UNLIMITED = 100_000
+    target_iterations = plan.budget.max_oracle_queries or 10
     config = DiscoveryRunConfig(
-        max_query_budget=queries,
-        max_iterations=queries,
+        max_query_budget=_LOCAL_UNLIMITED,
+        max_iterations=target_iterations,
         domain_bounds=NumericalDomainBounds(
             variable_name="x", min_val=-2.0, max_val=2.0, domain_name="1d_polynomial"
         ),
@@ -39,6 +47,7 @@ def default_engine_factory(plan):
         config,
         run_id=plan.run_id,
         budget=plan.budget_manager,
+        scientist=scientist,
     )
 
 

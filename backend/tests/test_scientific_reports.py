@@ -46,6 +46,7 @@ from app.domain.report_contracts import (
 from app.domain.report_exporters import (
     export_report_as_json,
     export_report_as_markdown,
+    export_report_as_pdf,
 )
 import os
 from unittest.mock import patch
@@ -493,6 +494,12 @@ class TestReportExports:
         # Verify no confidence percentage claim was fabricated
         assert "% certain" not in md_str
         assert "% confidence" not in md_str
+
+        # 3. PDF Export
+        pdf_bytes = export_report_as_pdf(report)
+        assert pdf_bytes.startswith(b"%PDF-")
+        assert pdf_bytes.rstrip().endswith(b"%%EOF")
+        assert len(pdf_bytes) > 2000
 
 
 class TestReportHistoricalIntegrityAndIdempotency:
@@ -1206,3 +1213,45 @@ class TestReportSerializationRegression:
         md_text = export_resp.data.decode("utf-8")
         assert run.run_id in md_text
         assert "#" in md_text
+
+    # ------------------------------------------------------------------
+    # 7. REST API: GET /api/v1/runs/<run_id>/report/export?format=pdf
+    # ------------------------------------------------------------------
+    def test_export_report_endpoint_pdf_format(self, app, db_session):
+        """GET export endpoint with format=pdf returns a downloadable PDF."""
+        run = _populate_completed_run(db_session, "run-api-export-pdf-01")
+        db_session.flush()
+
+        with app.test_client() as client:
+            gen_resp = client.post(f"/api/v1/runs/{run.run_id}/report")
+            assert gen_resp.status_code == 201, gen_resp.data[:300]
+
+            export_resp = client.get(
+                f"/api/v1/runs/{run.run_id}/report/export?format=pdf"
+            )
+
+        assert export_resp.status_code == 200, (
+            f"Expected 200 from GET /report/export?format=pdf, got "
+            f"{export_resp.status_code}: {export_resp.data[:500]}"
+        )
+        assert export_resp.content_type == "application/pdf"
+        assert export_resp.data.startswith(b"%PDF-")
+        assert export_resp.data.rstrip().endswith(b"%%EOF")
+
+        disposition = export_resp.headers["Content-Disposition"]
+        assert disposition.startswith("attachment")
+        assert f"report_{run.run_id}.pdf" in disposition
+
+    def test_pdf_export_renders_a_report_without_ranked_hypotheses(self, app, db_session):
+        """A report with no ranked candidates still exports: absence is stated, not invented."""
+        run = create_run_service(db_session, name="Empty PDF Run")
+        db_session.flush()
+
+        with app.test_client() as client:
+            export_resp = client.get(
+                f"/api/v1/runs/{run.run_id}/report/export?format=pdf"
+            )
+
+        assert export_resp.status_code == 200, export_resp.data[:500]
+        assert export_resp.data.startswith(b"%PDF-")
+        assert export_resp.data.rstrip().endswith(b"%%EOF")

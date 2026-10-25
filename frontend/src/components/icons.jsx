@@ -66,6 +66,14 @@ export const RefreshIcon = (props) => (
   </Svg>
 );
 
+export const DownloadIcon = (props) => (
+  <Svg {...props}>
+    <path d="M12 3v12" />
+    <path d="m7 10 5 5 5-5" />
+    <path d="M4 17v3h16v-3" />
+  </Svg>
+);
+
 export const CopyIcon = (props) => (
   <Svg {...props}>
     <rect x="9" y="9" width="11" height="11" rx="2" />

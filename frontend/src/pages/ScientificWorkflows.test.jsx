@@ -15,11 +15,13 @@ vi.mock('../api/runs.js', () => ({
   listRunHypotheses: vi.fn(),
   getRunReport: vi.fn(),
   generateRunReport: vi.fn(),
+  exportRunReport: vi.fn(),
   listBenchmarkScenarios: vi.fn(),
   getRunBenchmarks: vi.fn(),
 }));
 
 import {
+  exportRunReport,
   generateRunReport,
   getRunBenchmarks,
   getRunReport,
@@ -124,6 +126,44 @@ describe('scientific workflow pages', () => {
       screen.getByText('Low Sample Count: Only 2 observations are available.'),
     ).toBeInTheDocument();
     expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
+  });
+
+  it('downloads the backend-rendered report as a PDF', async () => {
+    getRunReport.mockResolvedValue({ report });
+    const descriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
+    const downloads = [];
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => 'blob:report'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      writable: true,
+      value: vi.fn(),
+    });
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(function capture() {
+        downloads.push(this.download);
+      });
+    exportRunReport.mockResolvedValue({
+      blob: new Blob(['%PDF-1.4'], { type: 'application/pdf' }),
+      filename: `report_${RUN_ID}.pdf`,
+      contentType: 'application/pdf',
+    });
+
+    renderAt(`/reports?run=${RUN_ID}`, <ReportsPage />);
+
+    await userEvent.click(await screen.findByRole('button', { name: /^pdf$/i }));
+
+    await waitFor(() => {
+      expect(exportRunReport).toHaveBeenCalledWith(RUN_ID, 'pdf');
+    });
+    expect(downloads).toEqual([`report_${RUN_ID}.pdf`]);
+
+    clickSpy.mockRestore();
+    if (descriptor) Object.defineProperty(URL, 'createObjectURL', descriptor);
   });
 
   it('lists registered benchmark scenarios and reports missing results honestly', async () => {

@@ -68,6 +68,40 @@ function readTimeout(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
+function parseJsonBody(rawBody) {
+  if (!rawBody) return null;
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return null;
+  }
+}
+
+/** Build the normalised failure for a non-2xx response and its decoded body. */
+function failureFromResponse(response, payload) {
+  const message =
+    (payload && typeof payload.message === 'string' && payload.message) ||
+    (payload && typeof payload.error === 'string' && payload.error) ||
+    `The backend rejected the request (HTTP ${response.status}).`;
+  return new ApiError(message, {
+    status: response.status,
+    code: payload && typeof payload.error === 'string' ? payload.error : null,
+    details: payload && payload.details !== undefined ? payload.details : null,
+  });
+}
+
+/** Extract the server-suggested filename from a Content-Disposition header. */
+export function filenameFromDisposition(header) {
+  if (!header) return null;
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1].trim());
+  } catch {
+    return match[1].trim();
+  }
+}
+
 /**
  * Perform one API request.
  *
@@ -77,13 +111,15 @@ function readTimeout(value) {
  * @param {object} [options.body] JSON-serialisable payload
  * @param {AbortSignal} [options.signal] caller cancellation
  * @param {number} [options.timeoutMs]
- * @returns {Promise<any>} decoded JSON body
+ * @param {'json'|'blob'} [options.responseType] blob returns a download payload
+ * @returns {Promise<any>} decoded JSON body, or { blob, filename, contentType }
  */
 export async function apiRequest(path, options = {}) {
   const {
     method = 'GET',
     body,
     signal,
+    responseType = 'json',
     timeoutMs = readTimeout(
       typeof import.meta !== 'undefined' ? import.meta.env?.VITE_API_TIMEOUT_MS : undefined,
     ),
@@ -140,6 +176,21 @@ export async function apiRequest(path, options = {}) {
     if (signal) signal.removeEventListener('abort', onCallerAbort);
   }
 
+  // A binary response cannot be read twice, so failures are decoded separately
+  // from successful downloads.
+  if (responseType === 'blob') {
+    if (!response.ok) {
+      const rawBody = await response.text().catch(() => '');
+      throw failureFromResponse(response, parseJsonBody(rawBody));
+    }
+    const blob = await response.blob();
+    return {
+      blob,
+      filename: filenameFromDisposition(response.headers.get('Content-Disposition')),
+      contentType: response.headers.get('Content-Type') || '',
+    };
+  }
+
   const rawBody = await response.text().catch(() => '');
   let payload = null;
   if (rawBody) {
@@ -156,15 +207,7 @@ export async function apiRequest(path, options = {}) {
   }
 
   if (!response.ok) {
-    const message =
-      (payload && typeof payload.message === 'string' && payload.message) ||
-      (payload && typeof payload.error === 'string' && payload.error) ||
-      `The backend rejected the request (HTTP ${response.status}).`;
-    throw new ApiError(message, {
-      status: response.status,
-      code: payload && typeof payload.error === 'string' ? payload.error : null,
-      details: payload && payload.details !== undefined ? payload.details : null,
-    });
+    throw failureFromResponse(response, payload);
   }
 
   return payload;

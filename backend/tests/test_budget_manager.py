@@ -105,7 +105,7 @@ class Clock:
         self.now = self.now + timedelta(seconds=seconds)
 
 
-def make_run(db, *, run_id="run-budget-1", budget=None, execution_mode="local"):
+def make_run(db, *, run_id="run-budget-1", budget=None, execution_mode="nodus_remote"):
     with db.session_scope() as session:
         run = create_run_service(
             session=session,
@@ -1163,6 +1163,8 @@ class TestCostAccounting:
         )
         manager = make_manager(db, run_id)
         assert manager.reserve_oracle_query("local-work")
+        # Local runs bypass resource limits: second query succeeds despite max_oracle_queries=1
+        assert manager.reserve_oracle_query("local-work-2")
         assert manager.status().cost_enforcement is CostEnforcement.NOT_APPLICABLE
 
 

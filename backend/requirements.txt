@@ -5,6 +5,8 @@ pytest==8.2.2
 SQLAlchemy==2.0.31
 alembic==1.13.2
 PyMySQL==1.1.1
+# Print-ready PDF rendering for scientific report exports (Issue #23).
+reportlab==4.2.5
 # Optional LLM Scientist provider SDK (Issue #41). Imported lazily; deterministic
 # discovery works without LLM configuration.
 groq==0.5.0

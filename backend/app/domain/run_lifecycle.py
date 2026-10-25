@@ -824,7 +824,20 @@ class RunLifecycleManager:
     def _get_or_load_progress(self, run_id: str, session=None) -> RunProgress:
         """Internal helper to fetch progress from memory or reconstruct from DB."""
         if run_id in self._progress_registry:
-            return self._progress_registry[run_id]
+            prog = self._progress_registry[run_id]
+            if session and prog.status == RunLifecycleState.RUNNING:
+                try:
+                    from ..adapters.persistence.models import RunBudgetUsageModel
+                    usage = session.query(RunBudgetUsageModel).filter_by(run_id=run_id).first()
+                    if usage:
+                        prog.queries_used = usage.queries_completed
+                        prog.evaluations_completed = usage.evaluations_completed
+                        if usage.queries_completed > 0:
+                            prog.phase = RunPhase.ORACLE_QUERY
+                            prog.current_activity = f"Iterating discovery loop (query {usage.queries_completed})"
+                except Exception:
+                    pass
+            return prog
 
         if session:
             from ..adapters.persistence.repository import ClarityRepository

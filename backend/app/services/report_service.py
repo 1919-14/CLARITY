@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import json
 import os
 import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import uuid
 
 from sqlalchemy.orm import Session
@@ -54,6 +54,7 @@ from ..domain.report_contracts import (
 from ..domain.report_exporters import (
     export_report_as_json,
     export_report_as_markdown,
+    export_report_as_pdf,
 )
 from ..domain.report_generator import generate_scientific_report
 from ..domain.sanitization import sanitize_metadata
@@ -441,11 +442,11 @@ def export_report_service(
     run_id: str,
     format_type: str = "json",
     actor: str = "researcher",
-) -> Tuple[str, str]:
+) -> Tuple[Union[str, bytes], str]:
     """Export the scientific report for a run.
 
     Returns:
-      (content_string, mime_type)
+      (content, mime_type) — text for JSON/Markdown, bytes for PDF
     """
     repo = ClarityRepository(session)
     run = repo.get_run(run_id)
@@ -472,6 +473,9 @@ def export_report_service(
     if format_norm in ("markdown", "md", "text/markdown"):
         content = export_report_as_markdown(report_obj)
         mime = "text/markdown; charset=utf-8"
+    elif format_norm == "pdf":
+        content = export_report_as_pdf(report_obj)
+        mime = "application/pdf"
     else:
         content = export_report_as_json(report_obj)
         mime = "application/json"

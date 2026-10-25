@@ -189,6 +189,18 @@ class GroqProposalProvider(LLMProposalProvider):
                 timeout=float(self._config.timeout_seconds),
                 max_retries=0,  # retries are owned and bounded here
             )
+        except TypeError:
+            try:
+                import httpx
+                return Groq(
+                    api_key=credential,
+                    timeout=float(self._config.timeout_seconds),
+                    max_retries=0,
+                    http_client=httpx.Client(),
+                )
+            except Exception:
+                self._sdk_unavailable = True
+                return None
         except Exception:  # noqa: BLE001 - client construction failure
             self._sdk_unavailable = True
             return None

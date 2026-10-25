@@ -57,6 +57,16 @@ Machine-readable, indented JSON adhering to `REPORT_SCHEMA_VERSION = "1.0.0"`. S
 ### 3.2 Markdown Export (`format=markdown` or `Accept: text/markdown`)
 Publication-ready Markdown with GitHub-flavored alerts, formatted tables, clean formulas, and safe table escaping.
 
+### 3.3 PDF Export (`format=pdf` or `Accept: application/pdf`)
+A4, print-ready PDF rendered server-side with ReportLab (`reportlab==4.2.5`). The document follows the same section order as the Markdown export and adds:
+- the identical honesty rules: missing scores, datasets, or spend print as `Unavailable`, never as zero,
+- a flagging box for partial or prematurely terminated runs,
+- per-candidate blocks with within-cohort rank, evaluation tier, dataset, complexity, ranking rationale, and recorded limitations,
+- observation-level evidence tables (first five per classification, with a note pointing to the JSON export for the full record),
+- page footers carrying the report ID and page number.
+
+The PDF is produced from the stored report record, so it is never assembled in the browser.
+
 ---
 
 ## 4. REST API Endpoints
@@ -92,3 +102,11 @@ GET /api/v1/runs/{run_id}/report/export?format=json
 ```
 - Headers: `Content-Type: application/json`
 - Returns formatted JSON document.
+
+```http
+GET /api/v1/runs/{run_id}/report/export?format=pdf
+```
+- Headers: `Content-Type: application/pdf`, `Content-Disposition: attachment; filename="report_{run_id}.pdf"`
+- Returns the rendered PDF document as a download.
+
+Every export records a `REPORT_EXPORTED` audit event carrying the report ID and requested format.

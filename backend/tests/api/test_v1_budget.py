@@ -171,7 +171,13 @@ class TestBudgetStatusEndpoint:
 
 class TestHypothesisBudgetEndpoint:
     def test_hypothesis_limit_persists_stop_reason_and_409(self, client):
-        run = _make_run(client, budget={"max_generated_hypotheses": 1})
+        # Budget enforcement only applies to nodus_remote runs; use that mode
+        # so this test exercises the enforcement path.
+        run = _make_run(
+            client,
+            execution_mode="nodus_remote",
+            budget={"max_generated_hypotheses": 1},
+        )
         run_id = run["run_id"]
 
         first = client.post(
@@ -198,7 +204,13 @@ class TestHypothesisBudgetEndpoint:
         assert budget["usage"]["generated_hypotheses"]["remaining"] == 0
 
     def test_zero_hypothesis_limit_blocks_the_first_proposal(self, client):
-        run = _make_run(client, budget={"max_generated_hypotheses": 0})
+        # Budget enforcement only applies to nodus_remote runs; use that mode
+        # so this test exercises the enforcement path.
+        run = _make_run(
+            client,
+            execution_mode="nodus_remote",
+            budget={"max_generated_hypotheses": 0},
+        )
         res = client.post(
             f"/api/v1/runs/{run['run_id']}/hypotheses",
             json={"model_family": "linear", "formula": "y = x"},
@@ -220,3 +232,30 @@ class TestHypothesisBudgetEndpoint:
         assert budget["usage"]["generated_hypotheses"]["limit"] is None
         assert budget["usage"]["generated_hypotheses"]["used"] == 3
         assert budget["is_exhausted"] is False
+
+    def test_local_mode_bypasses_budget_limit(self, client):
+        # Local execution mode should NOT enforce budget limits even when configured.
+        run = _make_run(
+            client,
+            execution_mode="local",
+            budget={"max_generated_hypotheses": 1},
+        )
+        run_id = run["run_id"]
+        # Creating 2 hypotheses should succeed on local mode (limit is 1)
+        res1 = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={"model_family": "linear", "formula": "y = x"},
+        )
+        assert res1.status_code == 201
+        res2 = client.post(
+            f"/api/v1/runs/{run_id}/hypotheses",
+            json={"model_family": "linear", "formula": "y = 2*x"},
+        )
+        assert res2.status_code == 201
+
+        run_after = client.get(f"/api/v1/runs/{run_id}").get_json()["run"]
+        assert run_after["status"] != "budget_exhausted"
+
+        budget = client.get(f"/api/v1/runs/{run_id}/budget").get_json()["budget"]
+        assert budget["is_exhausted"] is False
+        assert budget["usage"]["generated_hypotheses"]["used"] == 2

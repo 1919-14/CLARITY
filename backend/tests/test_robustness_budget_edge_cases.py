@@ -75,6 +75,7 @@ class TestExactLimitBoundaries:
                 name="Exact Limit Run",
                 run_id="run-boundary-01",
                 budget=RunBudgetConfig(max_oracle_queries=3),
+                execution_mode="nodus_remote",
             )
 
         budget_mgr = RunBudgetManager(db.session_scope, "run-boundary-01")
@@ -163,6 +164,7 @@ class TestZeroAndNegativeBudgetAllocations:
                 name="Zero Budget Run",
                 run_id="run-zero-budget",
                 budget=RunBudgetConfig(max_oracle_queries=0),
+                execution_mode="nodus_remote",
             )
 
         budget_mgr = RunBudgetManager(db.session_scope, "run-zero-budget")
@@ -282,6 +284,7 @@ class TestConcurrentBudgetDeductions:
                 name="Concurrent Budget Test",
                 run_id="run-concurrency-budget",
                 budget=RunBudgetConfig(max_oracle_queries=5),
+                execution_mode="nodus_remote",
             )
 
         budget_mgr = RunBudgetManager(db.session_scope, "run-concurrency-budget")

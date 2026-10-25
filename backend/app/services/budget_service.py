@@ -366,6 +366,12 @@ def _admission_denial(
     Terminal admission limits are re-checked atomically by the reservation
     itself; this function covers lifecycle, recorded exhaustion, runtime, and
     cost gates.
+
+    NOTE: When ``run.execution_mode`` is ``"local"`` or ``"mock"``, resource
+    budget limits (oracle queries, evaluations, runtime, compute cost) are
+    intentionally *not* enforced. Lifecycle guards (cancelled, failed,
+    not-running) still apply to all modes. Budget values stored in the DB are
+    informational only for local runs; enforcement happens on Nodus only.
     """
     if run.status == "cancelled":
         return _denial(
@@ -379,6 +385,18 @@ def _admission_denial(
             BudgetResource.ORACLE_QUERY,
             "The run has failed; no additional work may be admitted.",
         )
+    # Budget resource limits are only enforced when running on Nodus.
+    # Local/mock runs are never stopped for budget exhaustion; the values
+    # stored in the DB are informational only.
+    if run.execution_mode in ("local", "mock"):
+        if run.status not in RUNNING_RUN_STATUSES:
+            return _denial(
+                BudgetStopReason.FAILED,
+                BudgetResource.ORACLE_QUERY,
+                f"The run is not active (status '{run.status}'); no work may be admitted.",
+            )
+        return None
+
     if usage.is_exhausted:
         stored = BudgetStopReason.from_value(usage.stop_reason)
         if stored is None:
@@ -414,7 +432,7 @@ def _admission_denial(
         )
 
     ceiling = config.max_compute_spend_usd
-    if ceiling is not None and run.execution_mode not in {"local", "mock"}:
+    if ceiling is not None:
         if ceiling == 0.0:
             return _denial(
                 BudgetStopReason.COMPUTE_BUDGET_EXHAUSTED,
@@ -700,35 +718,60 @@ def _reserve(
     limit = config.limit_for(resource)
     run_id = run.run_id
 
+    # For local/mock runs, skip resource-limit predicates in the UPDATE.
+    # Counters are still incremented so usage is recorded, but the run is
+    # never stopped for hitting its configured limits.
+    local_mode = run.execution_mode in ("local", "mock")
+
     if resource is BudgetResource.ORACLE_QUERY:
-        assert limit is not None
-        stmt = (
-            update(RunBudgetUsageModel)
-            .where(
-                RunBudgetUsageModel.run_id == run_id,
-                RunBudgetUsageModel.queries_reserved + quantity <= limit,
-                RunBudgetUsageModel.is_exhausted.is_(False),
+        assert limit is not None or local_mode
+        if local_mode:
+            stmt = (
+                update(RunBudgetUsageModel)
+                .where(RunBudgetUsageModel.run_id == run_id)
+                .values(
+                    queries_reserved=RunBudgetUsageModel.queries_reserved + quantity,
+                    updated_at=now,
+                )
             )
-            .values(
-                queries_reserved=RunBudgetUsageModel.queries_reserved + quantity,
-                updated_at=now,
+        else:
+            stmt = (
+                update(RunBudgetUsageModel)
+                .where(
+                    RunBudgetUsageModel.run_id == run_id,
+                    RunBudgetUsageModel.queries_reserved + quantity <= limit,
+                    RunBudgetUsageModel.is_exhausted.is_(False),
+                )
+                .values(
+                    queries_reserved=RunBudgetUsageModel.queries_reserved + quantity,
+                    updated_at=now,
+                )
             )
-        )
         used_column = "queries_reserved"
     elif resource is BudgetResource.CANDIDATE_EVALUATION:
-        assert limit is not None
-        stmt = (
-            update(RunBudgetUsageModel)
-            .where(
-                RunBudgetUsageModel.run_id == run_id,
-                RunBudgetUsageModel.evaluations_reserved + quantity <= limit,
-                RunBudgetUsageModel.is_exhausted.is_(False),
+        assert limit is not None or local_mode
+        if local_mode:
+            stmt = (
+                update(RunBudgetUsageModel)
+                .where(RunBudgetUsageModel.run_id == run_id)
+                .values(
+                    evaluations_reserved=RunBudgetUsageModel.evaluations_reserved + quantity,
+                    updated_at=now,
+                )
             )
-            .values(
-                evaluations_reserved=RunBudgetUsageModel.evaluations_reserved + quantity,
-                updated_at=now,
+        else:
+            stmt = (
+                update(RunBudgetUsageModel)
+                .where(
+                    RunBudgetUsageModel.run_id == run_id,
+                    RunBudgetUsageModel.evaluations_reserved + quantity <= limit,
+                    RunBudgetUsageModel.is_exhausted.is_(False),
+                )
+                .values(
+                    evaluations_reserved=RunBudgetUsageModel.evaluations_reserved + quantity,
+                    updated_at=now,
+                )
             )
-        )
         used_column = "evaluations_reserved"
     elif resource is BudgetResource.REMOTE_TASK:
         assert limit is not None
@@ -746,13 +789,10 @@ def _reserve(
         )
         used_column = "active_remote_tasks"
     else:  # HYPOTHESIS (limit may be disabled)
-        if limit is None:
+        if limit is None or local_mode:
             stmt = (
                 update(RunBudgetUsageModel)
-                .where(
-                    RunBudgetUsageModel.run_id == run_id,
-                    RunBudgetUsageModel.is_exhausted.is_(False),
-                )
+                .where(RunBudgetUsageModel.run_id == run_id)
                 .values(
                     hypotheses_generated=RunBudgetUsageModel.hypotheses_generated + quantity,
                     updated_at=now,
@@ -777,6 +817,13 @@ def _reserve(
     current_used = int(getattr(usage, used_column))
     result = session.execute(stmt)
     if result.rowcount != 1:
+        if local_mode:
+            # For local runs a rowcount of 0 almost certainly means the
+            # RunBudgetUsageModel row is missing — not a budget denial.
+            raise RuntimeError(
+                f"Budget counter update returned 0 rows for run {run_id!r}; "
+                "the RunBudgetUsageModel row may be missing."
+            )
         raise _reservation_denial(
             resource,
             limit if limit is not None else current_used + quantity,

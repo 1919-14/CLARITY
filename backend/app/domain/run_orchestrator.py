@@ -365,6 +365,22 @@ def _persist_run_artifacts(session: Any, run_id: str, result: Any) -> None:
                     )
                 )
 
+        # Persist LLM Scientist history into audit events if present
+        scientist_history = getattr(result, "scientist_history", None) or ()
+        if scientist_history:
+            from ..adapters.persistence.models import AuditEventModel
+            for idx, rec in enumerate(scientist_history, start=1):
+                rec_dict = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
+                session.add(
+                    AuditEventModel(
+                        event_id=f"evt-llm-{run_id[:8]}-{idx}-{uuid.uuid4().hex[:6]}",
+                        run_id=run_id,
+                        event_type="LLM_SCIENTIST_ROUND",
+                        actor="llm_scientist",
+                        metadata_json=rec_dict,
+                    )
+                )
+
         session.flush()
     except Exception as exc:
         logger.warning("Could not persist discovery run artifacts for '%s': %s", run_id, exc)
