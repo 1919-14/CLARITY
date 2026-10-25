@@ -209,6 +209,9 @@ class RunOrchestrator:
                 session=session,
             )
 
+            # Persist scientific output artifacts (observations, candidate hypotheses, evaluations)
+            _persist_run_artifacts(session, run_id, result)
+
             if (
                 self.lifecycle_manager.is_cancellation_requested(run_id)
                 or getattr(result, "status", None) == DiscoveryLifecycleStatus.TERMINATED_CANCELLED
@@ -237,3 +240,92 @@ class RunOrchestrator:
                 session.close()
 
         return result
+
+
+def _persist_run_artifacts(session: Any, run_id: str, result: Any) -> None:
+    """Save generated observations, hypotheses, revisions, and evaluations into DB session."""
+    if not session or not result:
+        return
+    try:
+        from ..adapters.persistence.models import (
+            EvaluationResultModel,
+            HypothesisModel,
+            HypothesisRevisionModel,
+            ObservationModel,
+        )
+        from .contracts import thaw_payload
+
+        # Persist observations
+        observations = getattr(result, "observations", None) or ()
+        for seq, obs in enumerate(observations, start=1):
+            obs_id = getattr(obs, "observation_id", None)
+            if not obs_id:
+                continue
+            existing = session.query(ObservationModel).filter_by(observation_id=obs_id).first()
+            if not existing:
+                session.add(
+                    ObservationModel(
+                        observation_id=obs_id,
+                        run_id=run_id,
+                        input_id=getattr(obs, "input_id", f"inp-{seq}"),
+                        input_values=thaw_payload(getattr(obs, "input_values", {})),
+                        output_values=thaw_payload(getattr(obs, "output_values", None)) if getattr(obs, "output_values", None) else None,
+                        status=getattr(obs.status, "value", str(obs.status)),
+                        sequence_number=seq,
+                        is_held_out=bool(getattr(obs, "is_held_out", False)),
+                    )
+                )
+
+        # Persist hypotheses & revisions
+        hypotheses = getattr(result, "hypotheses", None) or ()
+        for hyp in hypotheses:
+            hyp_id = getattr(hyp, "hypothesis_id", None)
+            if not hyp_id:
+                continue
+            existing_h = session.query(HypothesisModel).filter_by(hypothesis_id=hyp_id).first()
+            rev_num = getattr(hyp, "revision", 1) or 1
+            if not existing_h:
+                session.add(
+                    HypothesisModel(
+                        hypothesis_id=hyp_id,
+                        run_id=run_id,
+                        model_family=getattr(hyp, "model_family", "polynomial"),
+                        current_revision=rev_num,
+                    )
+                )
+                session.add(
+                    HypothesisRevisionModel(
+                        revision_id=f"rev-{hyp_id}-{rev_num}",
+                        hypothesis_id=hyp_id,
+                        revision_number=rev_num,
+                        formula=getattr(hyp, "formula", str(hyp)),
+                        parameters=thaw_payload(getattr(hyp, "parameters", {})),
+                        complexity=getattr(hyp, "complexity", 1),
+                    )
+                )
+
+        # Persist evaluations
+        evaluations = getattr(result, "evaluations", None) or ()
+        for ev in evaluations:
+            ev_id = getattr(ev, "evaluation_id", None)
+            if not ev_id:
+                continue
+            existing_ev = session.query(EvaluationResultModel).filter_by(evaluation_id=ev_id).first()
+            if not existing_ev:
+                session.add(
+                    EvaluationResultModel(
+                        evaluation_id=ev_id,
+                        revision_id=f"rev-{getattr(ev, 'hypothesis_id', '')}-1",
+                        run_id=run_id,
+                        status=getattr(ev.status, "value", str(ev.status)),
+                        sample_count=getattr(ev, "sample_count", 0),
+                        dataset_version=getattr(ev, "dataset_version", 1) or 1,
+                        metrics=thaw_payload(getattr(ev, "metrics", {})),
+                        held_out_metrics=thaw_payload(getattr(ev, "held_out_metrics", None)) if getattr(ev, "held_out_metrics", None) else None,
+                    )
+                )
+
+        session.flush()
+    except Exception as exc:
+        logger.warning("Could not persist discovery run artifacts for '%s': %s", run_id, exc)
+

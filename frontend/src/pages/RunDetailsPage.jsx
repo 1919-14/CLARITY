@@ -2,13 +2,13 @@ import { useCallback, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 
 import { isCancellableRunState } from '../api/contracts.js';
-import { cancelRun } from '../api/runs.js';
+import { cancelRun, startRun } from '../api/runs.js';
 import { EmptyState } from '../components/feedback/EmptyState.jsx';
 import { ErrorState } from '../components/feedback/ErrorState.jsx';
 import { LoadingState } from '../components/feedback/LoadingState.jsx';
 import { Notice } from '../components/feedback/Notice.jsx';
 import { ConfirmDialog } from '../components/forms/ConfirmDialog.jsx';
-import { ArrowLeftIcon, BanIcon, ChartIcon, FlaskIcon, RefreshIcon, ScrollIcon } from '../components/icons.jsx';
+import { ArrowLeftIcon, BanIcon, ChartIcon, FlaskIcon, PlayIcon, RefreshIcon, ScrollIcon } from '../components/icons.jsx';
 import { OrnamentDivider, PageHeader } from '../components/layout/PageHeader.jsx';
 import { BudgetPanel } from '../components/status/BudgetPanel.jsx';
 import { Stat } from '../components/status/Stat.jsx';
@@ -75,8 +75,32 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelOutcome, setCancelOutcome] = useState(null);
+  const [starting, setStarting] = useState(false);
+  const [startOutcome, setStartOutcome] = useState(null);
 
   const createdRunId = location.state?.createdRunId;
+
+  const handleStart = useCallback(async () => {
+    setStarting(true);
+    setStartOutcome(null);
+    try {
+      await startRun(runId);
+      setStartOutcome({
+        tone: 'success',
+        title: 'Run started successfully',
+        body: 'Discovery execution dispatched. Live scientific queries and evaluations are in progress.',
+      });
+      refresh();
+    } catch (startError) {
+      setStartOutcome({
+        tone: 'danger',
+        title: 'The run could not be started',
+        body: startError?.message || 'An unexpected error occurred while starting the run.',
+      });
+    } finally {
+      setStarting(false);
+    }
+  }, [runId, refresh]);
 
   const handleCancel = useCallback(async () => {
     setCancelling(true);
@@ -170,6 +194,7 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
   }
 
   const canCancel = isCancellableRunState(run.status);
+  const canStart = run.status === 'queued' || run.status === 'pending';
 
   return (
     <div className="page-inner">
@@ -179,6 +204,18 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
         description={`${run.run_id} · ${formatDateTime(run.created_at)} · ${executionModeLabel(run.execution_mode)}`}
         actions={
           <>
+            {canStart ? (
+              <button
+                type="button"
+                className="button button--primary button--small"
+                onClick={handleStart}
+                disabled={starting || isRefreshing}
+                aria-busy={starting || undefined}
+              >
+                <PlayIcon size={16} />
+                <span>{starting ? 'Starting discovery…' : 'Start run'}</span>
+              </button>
+            ) : null}
             <button
               type="button"
               className="button button--secondary button--small"
@@ -210,12 +247,18 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
 
       <OrnamentDivider />
 
+      {startOutcome ? (
+        <Notice tone={startOutcome.tone} title={startOutcome.title}>
+          {startOutcome.body}
+        </Notice>
+      ) : null}
+
       {createdRunId === run.run_id ? (
         <Notice tone="success" title="Run created">
           The backend persisted run{' '}
           <code className="id-text">{run.run_id}</code> with status{' '}
-          <strong>{statusLabel(run.status)}</strong>. Configuration is recorded; discovery starts
-          only when the backend starts execution.
+          <strong>{statusLabel(run.status)}</strong>.{' '}
+          {canStart ? 'Click “Start run” above to begin discovery.' : 'Configuration is recorded.'}
         </Notice>
       ) : null}
 
@@ -284,6 +327,34 @@ export function RunDetailsView({ runId, pollIntervalMs }) {
             value={progress?.last_updated_at ? formatTime(progress.last_updated_at) : UNAVAILABLE}
           />
         </dl>
+
+        {(() => {
+          const queriesUsed = Number(progress?.queries_used ?? 0);
+          const queriesRemaining = Number(progress?.queries_remaining ?? 0);
+          const totalQueries = queriesUsed + queriesRemaining;
+          const queryPct = totalQueries > 0 ? Math.min(100, Math.round((queriesUsed / totalQueries) * 100)) : 0;
+
+          return (
+            <div style={{ margin: '1.25rem 0 0.5rem', padding: '1rem', background: 'rgba(212, 175, 55, 0.05)', borderRadius: '4px', border: '1px solid rgba(212, 175, 55, 0.2)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.85rem' }}>
+                <span style={{ color: 'var(--color-brass-400, #d4af37)', fontWeight: 600 }}>Discovery Progress</span>
+                <span style={{ color: 'var(--color-text-secondary, #a0a0a0)' }}>
+                  {queriesUsed} / {totalQueries || '10'} queries ({queryPct}%)
+                </span>
+              </div>
+              <div style={{ height: '8px', background: 'rgba(255, 255, 255, 0.08)', borderRadius: '4px', overflow: 'hidden' }}>
+                <div
+                  style={{
+                    height: '100%',
+                    width: `${queryPct}%`,
+                    background: 'linear-gradient(90deg, #d4af37, #f3e5ab)',
+                    transition: 'width 0.4s ease',
+                  }}
+                />
+              </div>
+            </div>
+          );
+        })()}
 
         <div className="panel__footer">
           <span className="poll-indicator" role="status">

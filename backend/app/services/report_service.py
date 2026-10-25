@@ -35,6 +35,7 @@ from ..domain.contracts import (
     Observation,
     ObservationStatus,
     StructuredError,
+    thaw_payload,
 )
 from ..domain.ranking_contracts import RankingPolicyConfig
 from ..domain.report_contracts import (
@@ -385,16 +386,19 @@ def generate_report_service(
     )
 
     # 3. Save ReportModel in DB
+    # thaw_payload converts any MappingProxyType / tuple snapshots produced by
+    # freeze_payload back to plain dict/list values so that SQLAlchemy's JSON
+    # column serializer can handle them without raising TypeError.
     report_model = ReportModel(
         report_id=report_id,
         run_id=run.run_id,
         status="generated",
-        ranked_candidates=[h.to_dict() for h in scientific_report.ranked_hypotheses],
+        ranked_candidates=thaw_payload([h.to_dict() for h in scientific_report.ranked_hypotheses]),
         stop_reason=run.stop_reason,
         limitations="; ".join(scientific_report.limitations),
         artifact_uri=artifact_uri,
         generated_at=datetime.now(timezone.utc),
-        report_json=scientific_report.to_dict(),
+        report_json=thaw_payload(scientific_report.to_dict()),
     )
     repo.save_report(report_model)
 

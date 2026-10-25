@@ -39,6 +39,11 @@ export function getRunBudget(runId, { signal } = {}) {
   return apiGet(`/runs/${enc(runId)}/budget`, { signal });
 }
 
+/** POST /runs/<run_id>/start */
+export function startRun(runId, { signal } = {}) {
+  return apiPost(`/runs/${enc(runId)}/start`, undefined, { signal });
+}
+
 /** POST /runs/<run_id>/cancel */
 export function cancelRun(runId, { reason, signal } = {}) {
   return apiPost(

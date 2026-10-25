@@ -997,3 +997,212 @@ class TestReportArtifactPathSafety:
         assert _load_report_artifact("../../etc/passwd") is None
         assert _load_report_artifact("reports/../../../etc/passwd") is None
 
+
+
+class TestReportSerializationRegression:
+    """Regression tests for the MappingProxyType JSON serialization bug.
+
+    Covers:
+    - Report generation with no hypotheses.
+    - Report generation with nested immutable parameters (freeze_payload -> thaw_payload round-trip).
+    - Successful persistence and retrieval retaining scientific content.
+    - POST /api/v1/runs/<run_id>/report generates and persists without 500.
+    - GET /api/v1/runs/<run_id>/report/export returns valid JSON and Markdown exports.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Empty run - no hypotheses, no ranked_candidates
+    # ------------------------------------------------------------------
+    def test_report_generation_with_no_hypotheses_does_not_raise(self, db_session):
+        """generate_report_service must not raise when the run has zero hypotheses."""
+        run = RunModel(
+            run_id="run-empty-hyp-01",
+            name="Empty Hypotheses Run",
+            domain="1d_polynomial",
+            status="completed",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+            stop_reason="max_evaluations_reached",
+        )
+        db_session.add(run)
+        db_session.flush()
+
+        report_model, scientific_report = generate_report_service(db_session, run.run_id)
+
+        assert report_model.status == "generated"
+        assert report_model.ranked_candidates == []
+        assert len(scientific_report.ranked_hypotheses) == 0
+
+        # report_json must be plain-Python-serializable (no MappingProxyType)
+        serialized = json.dumps(report_model.report_json)
+        payload = json.loads(serialized)
+        assert payload["ranked_hypotheses"] == []
+
+    # ------------------------------------------------------------------
+    # 2. Nested immutable parameters - freeze_payload -> thaw_payload round-trip
+    # ------------------------------------------------------------------
+    def test_report_generation_with_nested_frozen_hypothesis_parameters(self, db_session):
+        """Hypotheses with deeply nested parameters survive the freeze/thaw round-trip."""
+        run = RunModel(
+            run_id="run-nested-01",
+            name="Nested Params Run",
+            domain="1d_polynomial",
+            status="completed",
+            execution_mode="local",
+            sampling_strategy="active_disagreement",
+        )
+        db_session.add(run)
+
+        h = HypothesisModel(
+            hypothesis_id="hyp-nested-1",
+            run_id=run.run_id,
+            model_family="polynomial",
+            current_revision=1,
+        )
+        db_session.add(h)
+        nested_params = {
+            "coefficients": [1.0, 2.0],
+            "degree": 1,
+            "meta": {"source": "auto", "tags": ["regression", "linear"]},
+        }
+        r = HypothesisRevisionModel(
+            revision_id="rev-nested-1",
+            hypothesis_id=h.hypothesis_id,
+            revision_number=1,
+            formula="y = 2.0*x + 1.0",
+            parameters=nested_params,
+            complexity=2,
+        )
+        db_session.add(r)
+        ev = EvaluationResultModel(
+            evaluation_id="ev-nested-1",
+            revision_id=r.revision_id,
+            run_id=run.run_id,
+            status="completed",
+            sample_count=3,
+            dataset_version=3,
+            metrics={"mae": 0.05, "rmse": 0.07, "r2": 0.99},
+            held_out_metrics={"mae": 0.06, "rmse": 0.08, "r2": 0.98},
+        )
+        db_session.add(ev)
+        db_session.flush()
+
+        report_model, scientific_report = generate_report_service(db_session, run.run_id)
+
+        assert report_model.status == "generated"
+
+        serialized = json.dumps(report_model.report_json)
+        payload = json.loads(serialized)
+
+        assert len(payload["ranked_hypotheses"]) == 1
+        hyp_payload = payload["ranked_hypotheses"][0]
+        params = hyp_payload.get("parameters")
+        assert isinstance(params, dict), f"parameters must be dict, got {type(params)}"
+        assert params["degree"] == 1
+        assert isinstance(params.get("meta"), dict)
+        assert params["meta"]["source"] == "auto"
+
+    # ------------------------------------------------------------------
+    # 3. Persistence and retrieval - no field loss
+    # ------------------------------------------------------------------
+    def test_persisted_report_retrieved_retains_scientific_content(self, db_session):
+        """A persisted report retrieved via get_report_service retains all key fields."""
+        run = _populate_completed_run(db_session, "run-persist-01")
+        report_model_saved, _ = generate_report_service(db_session, run.run_id)
+
+        report_model_fetched = get_report_service(db_session, run.run_id)
+
+        assert report_model_fetched is not None
+        assert report_model_fetched.report_id == report_model_saved.report_id
+        assert report_model_fetched.status == "generated"
+        assert report_model_fetched.run_id == run.run_id
+
+        stored_json = report_model_fetched.report_json
+        assert stored_json is not None
+        assert isinstance(stored_json, dict)
+
+        assert stored_json["run_id"] == run.run_id
+        assert len(stored_json["ranked_hypotheses"]) == 3
+
+        top = stored_json["ranked_hypotheses"][0]
+        assert "hypothesis_id" in top
+        assert "formula" in top
+        assert "parameters" in top
+        assert isinstance(top["parameters"], dict)
+
+    # ------------------------------------------------------------------
+    # 4. REST API: POST /api/v1/runs/<run_id>/report
+    # ------------------------------------------------------------------
+    def test_post_report_endpoint_succeeds_and_returns_json(self, app, db_session):
+        """POST /api/v1/runs/<run_id>/report must return 200, not 500."""
+        run = _populate_completed_run(db_session, "run-api-post-01")
+        db_session.flush()
+
+        with app.test_client() as client:
+            resp = client.post(f"/api/v1/runs/{run.run_id}/report")
+
+        assert resp.status_code == 201, (
+            f"Expected 201 from POST /report, got {resp.status_code}: {resp.data[:500]}"
+        )
+        data = resp.get_json()
+        assert data is not None
+        assert "report" in data
+        assert data["report"].get("run_id") == run.run_id
+        assert "report_id" in data["report"]
+
+    # ------------------------------------------------------------------
+    # 5. REST API: GET /api/v1/runs/<run_id>/report/export?format=json
+    # ------------------------------------------------------------------
+    def test_export_report_endpoint_json_format(self, app, db_session):
+        """GET export endpoint returns valid JSON export of the scientific report."""
+        run = _populate_completed_run(db_session, "run-api-export-json-01")
+        db_session.flush()
+
+        with app.test_client() as client:
+            gen_resp = client.post(f"/api/v1/runs/{run.run_id}/report")
+            assert gen_resp.status_code == 201, gen_resp.data[:300]
+
+            export_resp = client.get(
+                f"/api/v1/runs/{run.run_id}/report/export?format=json"
+            )
+
+        assert export_resp.status_code == 200, (
+            f"Expected 200 from GET /report/export?format=json, got {export_resp.status_code}: "
+            f"{export_resp.data[:500]}"
+        )
+        content_type = export_resp.content_type
+        assert "json" in content_type.lower(), f"Expected JSON content-type, got: {content_type}"
+
+        body = json.loads(export_resp.data)
+        assert body.get("run_id") == run.run_id
+        assert "ranked_hypotheses" in body
+        assert isinstance(body["ranked_hypotheses"], list)
+
+    # ------------------------------------------------------------------
+    # 6. REST API: GET /api/v1/runs/<run_id>/report/export?format=markdown
+    # ------------------------------------------------------------------
+    def test_export_report_endpoint_markdown_format(self, app, db_session):
+        """GET export endpoint with format=markdown returns text with expected headings."""
+        run = _populate_completed_run(db_session, "run-api-export-md-01")
+        db_session.flush()
+
+        with app.test_client() as client:
+            gen_resp = client.post(f"/api/v1/runs/{run.run_id}/report")
+            assert gen_resp.status_code == 201, gen_resp.data[:300]
+
+            export_resp = client.get(
+                f"/api/v1/runs/{run.run_id}/report/export?format=markdown"
+            )
+
+        assert export_resp.status_code == 200, (
+            f"Expected 200 from GET /report/export?format=markdown, got "
+            f"{export_resp.status_code}: {export_resp.data[:500]}"
+        )
+        content_type = export_resp.content_type
+        assert "markdown" in content_type.lower() or "text" in content_type.lower(), (
+            f"Unexpected content-type: {content_type}"
+        )
+
+        md_text = export_resp.data.decode("utf-8")
+        assert run.run_id in md_text
+        assert "#" in md_text
